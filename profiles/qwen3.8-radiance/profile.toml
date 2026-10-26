@@ -123,3 +123,17 @@ user_command = "[The user ran this command in the workspace: `{command}`. It {st
 # A text file the user's message mentions with @path, after the message: {path} is the path and
 # {content} the file as read shows it, numbered lines and all, so that it needs no read of its own.
 attached_file = "[The user attached {path}, shown as read shows it:]\n{content}"
+# Added to the result of an edit or write that altered tests of the project's last commit; {tests}
+# names them. In the July SWE-rebench baseline, three of six failures were the agent changing the
+# project's tests until its change passed them (DESIGN.md §16.5).
+changed_tests = "\n\n[This changed tests the project already had: {tests}. They say what the code must go on doing. Unless the task asks for the behaviour they check to change, put them back as they were and change the code instead.]"
+# Added to the last tool result once an unattended run has 15% of its requests or time left; {left}
+# says how much. In the baseline one attempt ran into both limits still editing code.
+budget = "\n\n[Only {left} left for this task. Leave the work in a finished, tested state, and call finish before then.]"
+# Added to the system prompt's mode when the agent has no network but the model (the evals' vacuum).
+# In the baseline, 14 tool results were network failures, each costing a step or three.
+no_network = """
+
+# Network
+There is no network here, except to reach you: anything that downloads fails. Installing packages, `uv sync`, and `uv run` without `--no-sync` fail, and so do tests that reach the internet. Work with what is installed, as it is: run the tests with the project's environment, such as `.venv/bin/python -m pytest` or `uv run --no-sync pytest`.
+"""

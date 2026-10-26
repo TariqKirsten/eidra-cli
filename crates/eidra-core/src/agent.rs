@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use eidra_llm::{
@@ -96,6 +96,10 @@ pub struct Agent {
     /// A summary came back empty, so this conversation runs on to the limit instead of asking for
     /// one after every reply.
     uncompactable: bool,
+    /// When an unattended run's time is up, if it has a limit (see [`Agent::set_time_limit`]).
+    deadline: Option<(Instant, Duration)>,
+    /// The model has been told its budget is nearly spent.
+    warned: bool,
 }
 
 /// A subagent started by a `task` call with `background`. The call returns at once, and the
@@ -194,10 +198,13 @@ impl Agent {
         } else {
             &profile.prompts.interactive
         };
+        // Reaching the model through a socket means there is no network otherwise (§13).
+        let network =
+            if options.model_socket.is_some() { &profile.prompts.no_network[..] } else { "" };
         let system = profile.system_prompt(&[
             ("workspace", &workspace.display().to_string()),
             ("date", &date),
-            ("mode", mode),
+            ("mode", &format!("{mode}{network}")),
             ("agents", &agents_md(&workspace)),
         ]);
         session.push(Message::system(system), None)?;
@@ -222,6 +229,8 @@ impl Agent {
             background: Arc::new(AtomicUsize::new(0)),
             used: 0,
             uncompactable: false,
+            deadline: None,
+            warned: false,
         })
     }
 
@@ -309,6 +318,8 @@ impl Agent {
             background: Arc::new(AtomicUsize::new(0)),
             used,
             uncompactable: false,
+            deadline: None,
+            warned: false,
         })
     }
 
@@ -318,6 +329,40 @@ impl Agent {
         let listing = self.tools.read_mentioned(path)?;
         let template = &self.profile.prompts.attached_file;
         Ok(template.replace("{path}", path).replace("{content}", listing.trim_end()))
+    }
+
+    /// The time an unattended run has, from now. Near its end, and near the end of a run's
+    /// requests, the model is told what is left (`[prompts] budget`); eidra does not stop at it.
+    pub fn set_time_limit(&mut self, limit: Duration) {
+        self.deadline = Some((Instant::now() + limit, limit));
+    }
+
+    /// What is left of the run's budget, once 85% of its requests or time are spent: the text for
+    /// the profile's `budget` note. Said once, and only to an unattended agent, which has
+    /// `finish`.
+    fn budget_left(&mut self, requests_left: usize, max_requests: usize) -> Option<String> {
+        if self.warned || !self.headless {
+            return None;
+        }
+        let mut left = Vec::new();
+        if requests_left * 100 <= max_requests * 15 {
+            let plural = if requests_left == 1 { "" } else { "s" };
+            left.push(format!("{requests_left} request{plural}"));
+        }
+        if let Some((deadline, limit)) = self.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.as_secs_f64() <= limit.as_secs_f64() * 0.15 {
+                left.push(match remaining.as_secs().div_ceil(60) {
+                    0 | 1 => "a minute".to_owned(),
+                    minutes => format!("{minutes} minutes"),
+                });
+            }
+        }
+        if left.is_empty() {
+            return None;
+        }
+        self.warned = true;
+        Some(self.profile.prompts.budget.replace("{left}", &left.join(" and ")))
     }
 
     /// Whether the profile differs from the one the session began with. The session keeps its
@@ -403,7 +448,7 @@ impl Agent {
     ) -> Result<Outcome> {
         // An interrupt from before this run is not for it.
         self.interrupt.send_replace(false);
-        for _ in 0..max_requests {
+        for step in 0..max_requests {
             if self.profile.context.compact_at.is_some_and(|at| self.used > at)
                 && !self.uncompactable
                 && let Some(outcome) = self.compact(frontend).await?
@@ -526,13 +571,22 @@ impl Agent {
                     }
                     return Ok(Outcome::Interrupted);
                 };
-                for (call, output) in batch.iter().zip(outputs) {
+                for (call, mut output) in batch.iter().zip(outputs) {
                     frontend.event(Event::ToolResult {
                         id: call.id.clone(),
                         name: call.function.name.clone(),
                         output: output.text.clone(),
                         is_error: output.is_error,
                     });
+                    // The end of the reply's last result says when the budget is nearly spent:
+                    // the prompt only grows at its end.
+                    let last = calls.last().is_some_and(|c| c.id == call.id);
+                    if last
+                        && output.finish.is_none()
+                        && let Some(note) = self.budget_left(max_requests - step - 1, max_requests)
+                    {
+                        output.text.push_str(&note);
+                    }
                     let message = tool_message(&call.id, output.text, output.images);
                     self.session.push(message, None)?;
                     if output.finish.is_some() {

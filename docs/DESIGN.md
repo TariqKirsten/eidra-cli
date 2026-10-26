@@ -186,7 +186,7 @@ Initial set (M1):
 | tool | parameters | notes |
 |---|---|---|
 | `bash` | `command`, `timeout_s?`, `background?` | §6 |
-| `bash_output`, `bash_kill` | `id` | background jobs |
+| `bash_output`, `bash_kill` | `id`, `wait_s?` | background jobs; `wait_s` waits for new output or the end |
 | `read` | `path`, `offset?`, `limit?` | text with line numbers; images as image parts; PDFs as text, with page images on request; `.ipynb` as cells |
 | `edit` | `path`, `old`, `new`, `replace_all?` | exact match, which must be unique unless `replace_all`; tolerates a differing leading or trailing newline and CRLF endings; needs no read first |
 | `write` | `path`, `content` | an existing file not read this session, or changed since, is shown instead of replaced, and the same call then goes through |
@@ -253,8 +253,13 @@ work up.
 - **Non-interactive environment:** `PAGER=cat GIT_PAGER=cat GIT_EDITOR=true EDITOR=true
   PIP_NO_INPUT=1 DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 NO_COLOR=1`.
 - **Timeouts:** 120 s by default, 600 s at most. On a timeout or Esc, the process group gets
-  SIGTERM, then SIGKILL.
+  SIGTERM, then SIGKILL. `timeout` is taken for `timeout_s` (the model wrote it 23 times in the
+  July baseline, and it was ignored), a value over 600 runs with 600 and the result says so, and
+  a default timeout says how to raise it.
 - **Background jobs** for servers and watchers: start one, read its output later, kill it.
+  `bash_output` names the job's command and how long it has run, and `wait_s` waits up to 600 s
+  for new output or the job's end. In the July baseline the model waited for jobs with `sleep`
+  instead: up to 971 s of one attempt, polling a job whose output a `| tail` held back.
 - **Output:** stdout and stderr merged in order, ANSI codes stripped, and capped (head and tail).
   The full output is saved under the session directory.
 
@@ -346,6 +351,12 @@ Built in M5 (2026-10-26):
   rarely have ruff or ty, so `eidra eval run --tools DIR` mounts a directory of them into every
   attempt, off the agent's own `PATH`.
 - **Languages are entries in `[diagnostics]`**: adding one is a key and the code for its checks.
+- **A change to the project's tests is pointed out** (2026-10-27): an edit or write to a Python
+  test file that alters or removes a test function of the last commit (`git show HEAD:`) gets the
+  profile's `changed_tests` note, naming them. Tests the session added do not count, nor helpers,
+  imports or blank lines. It only says so: some tasks do ask for a tested behaviour to change. In
+  the July baseline three of six failures were the agent rewriting existing tests until its
+  change passed them (§16.5).
 
 Not done yet:
 - **Formatting at the end of a turn.** It rewrites whole files in projects that do not use ruff's
@@ -775,6 +786,35 @@ A near-full retrieval test, as in radiance's October context tests: a 261,064-to
 three access codes at 5%, 50% and 95%, sent cold. All three came back right. Prefill ran at
 4,218 tok/s, and the answer started after 62 s. (October's 224K test took 5 min 18 s, with
 512-token chunks on an older radiance.)
+
+### 16.5 The July 2026 SWE-rebench suite (2026-10-27)
+
+Sixteen Python tasks from SWE-rebench's July 2026 snapshot, from issues of 2026-05-15 to
+2026-06-15, in Harbor's format, run in the vacuum one attempt each, two at a time, with the
+binary of e659b8a (M4: no diagnostics, compaction or the changes below).
+
+**Baseline: 8 of the first 14 passed** (the last two were still running when this was written).
+Attempts took 6 to 50 minutes and 51 to 200 requests, with 97–99% of prompt tokens from the
+cache. None of the six failures ran into a limit, and every one ended with `finish` after long,
+lint-clean testing, so the diagnostics of §9 would not have changed them. Why they failed, from
+their logs (a background agent read every session):
+- three changed existing tests until their own design passed them, where the hidden tests keep
+  the old ones: Soju06/codex-lb-744 rewrote a test file, HKUDS/nanobot-4274 changed four tests'
+  setup, marimo-9754 changed a public method's return type and two tests;
+- three made a choice the instruction does not state and the hidden tests pin (agno-8148,
+  livekit-5944, apm-1553), which nothing in the harness can know.
+
+The model also passed `timeout` for `timeout_s` 23 times, asked for more than 600 s 27 times,
+spent up to 971 s of an attempt in `sleep` waiting on background jobs, hit 14 network failures in
+10 sessions, and was never told its request or time budget (marimo-9766 passed while running
+into both).
+
+**Changes made for the next run (v2):** the system prompt says to fix the code and keep the
+project's tests and signatures as they are unless the task asks otherwise, and an edit that
+changes a committed test says so (§9); `timeout` is taken for `timeout_s`, and capped or default
+timeouts are explained (§6); `bash_output` shows the job's command and run time and can wait
+(§6); an unattended run hears once when 15% of its requests or of the time the eval gives it
+(`--time-limit`) are left; and an agent in the vacuum is told there is no network.
 
 ## 17. Open questions
 

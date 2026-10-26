@@ -184,6 +184,15 @@ pub struct Prompts {
     /// A text file the user's message mentions with `@path`, after the message; `{path}` and
     /// `{content}`, as `read` shows it, are replaced.
     pub attached_file: String,
+    /// Added to the result of an edit or write that altered tests of the project's last commit;
+    /// `{tests}` names them.
+    pub changed_tests: String,
+    /// Added to the last tool result once an unattended run has 15% of its requests or time left;
+    /// `{left}` says how much.
+    pub budget: String,
+    /// Added to the system prompt's mode when the agent reaches the model through a socket, and so
+    /// has no network otherwise (DESIGN.md §13).
+    pub no_network: String,
 }
 
 impl Profile {

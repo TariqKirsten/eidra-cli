@@ -413,6 +413,7 @@ async fn run_attempt(context: &RunContext, task: &Task, repeat: u32) -> Result<A
     fs::create_dir_all(&sessions)?;
 
     let max_requests = max_requests.to_string();
+    let seconds = task.spec.timeout_s.to_string();
     let mut command = vec![
         "eidra",
         "exec",
@@ -421,6 +422,8 @@ async fn run_attempt(context: &RunContext, task: &Task, repeat: u32) -> Result<A
         "/sessions",
         "--max-requests",
         &max_requests,
+        "--time-limit",
+        &seconds,
     ];
     let agent = agent_container(
         &task.spec.image,

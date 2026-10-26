@@ -69,6 +69,8 @@ pub struct Shell {
 
 struct Job {
     pgid: i32,
+    command: String,
+    started: Instant,
     log: Arc<Mutex<JobLog>>,
     /// Bytes of output already shown.
     shown: usize,
@@ -142,9 +144,17 @@ impl Shell {
         if background {
             return self.start_job(command);
         }
-        let timeout =
-            Duration::from_secs(timeout_s.unwrap_or(DEFAULT_TIMEOUT_S).clamp(1, MAX_TIMEOUT_S));
-        self.run_foreground(command, timeout).await
+        let asked = timeout_s.unwrap_or(DEFAULT_TIMEOUT_S);
+        let timeout = Duration::from_secs(asked.clamp(1, MAX_TIMEOUT_S));
+        let mut output = self.run_foreground(command, timeout, timeout_s.is_none()).await?;
+        // A longer timeout than allowed is not refused, but the model should know it was cut.
+        if asked > MAX_TIMEOUT_S {
+            output.push_str(&format!(
+                "\n[timeout_s is at most {MAX_TIMEOUT_S}, so it ran with {MAX_TIMEOUT_S}; run \
+                 longer commands with background set]"
+            ));
+        }
+        Ok(output)
     }
 
     fn command(&self, command: &str, state: &Path) -> Command {
@@ -165,7 +175,12 @@ impl Shell {
         cmd
     }
 
-    async fn run_foreground(&mut self, command: &str, timeout: Duration) -> Result<String, String> {
+    async fn run_foreground(
+        &mut self,
+        command: &str,
+        timeout: Duration,
+        default: bool,
+    ) -> Result<String, String> {
         let _ = fs::remove_file(self.state.join("cwd"));
         let _ = fs::remove_file(self.state.join("env"));
         let mut child = self
@@ -192,8 +207,17 @@ impl Shell {
                         stop_group(pgid).await;
                     }
                     let _ = child.wait().await;
+                    let default = if default {
+                        format!(
+                            ", the default (timeout_s allows up to {MAX_TIMEOUT_S}, and background \
+                             has no limit)"
+                        )
+                    } else {
+                        String::new()
+                    };
                     Some(format!(
-                        "timed out after {} s; the command and everything it started were stopped",
+                        "timed out after {} s{default}; the command and everything it started \
+                         were stopped",
                         timeout.as_secs()
                     ))
                 }
@@ -259,14 +283,28 @@ impl Shell {
             };
             task_log.lock().unwrap().exit = Some(exit);
         });
-        self.jobs.insert(id, Job { pgid, log, shown: 0 });
+        let (command, started) = (command.to_owned(), Instant::now());
+        self.jobs.insert(id, Job { pgid, command, started, log, shown: 0 });
         Ok(format!(
             "Started job {id} in the background. Read its output with bash_output (id {id}), and stop it with bash_kill."
         ))
     }
 
-    pub fn job_output(&mut self, id: u64) -> Result<String, String> {
+    /// What a background job printed since it was last asked, after waiting up to `wait` for
+    /// something new: more output, or its end.
+    pub async fn job_output(&mut self, id: u64, wait: Duration) -> Result<String, String> {
         let job = self.jobs.get_mut(&id).ok_or_else(|| format!("there is no job {id}"))?;
+        let until = Instant::now() + wait.min(Duration::from_secs(MAX_TIMEOUT_S));
+        loop {
+            let news = {
+                let log = job.log.lock().unwrap();
+                log.exit.is_some() || log.dropped + log.bytes.len() > job.shown
+            };
+            if news || Instant::now() >= until {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         let log = job.log.lock().unwrap();
         let total = log.dropped + log.bytes.len();
         let mut text = String::new();
@@ -279,9 +317,12 @@ impl Shell {
         let start = job.shown.saturating_sub(log.dropped);
         text.push_str(&String::from_utf8_lossy(&log.bytes[start..]));
         job.shown = total;
+        // What the job is and how long it has run, so a wait is judged against the command's own.
+        let what = format!("job {id} (`{}`)", crate::display::clip(&job.command, 60));
+        let took = crate::display::duration(job.started.elapsed().as_secs_f64());
         let status = match &log.exit {
-            Some(exit) => format!("job {id} has ended ({exit})"),
-            None => format!("job {id} is running"),
+            Some(exit) => format!("{what} has ended ({exit})"),
+            None => format!("{what} has been running for {took}"),
         };
         let text = clean_terminal_output(&text);
         let text = text.trim_end();
@@ -544,11 +585,32 @@ mod tests {
             .await
             .unwrap();
         assert!(started.starts_with("Started job 1"));
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(shell.job_output(1).unwrap(), "[job 1 is running]\nready");
-        assert_eq!(shell.job_output(1).unwrap(), "[job 1 is running; no new output]");
+        let none = Duration::ZERO;
+        // Waiting returns as soon as there is output, long before the wait is up.
+        let asked = std::time::Instant::now();
+        let first = shell.job_output(1, Duration::from_secs(20)).await.unwrap();
+        assert!(asked.elapsed() < Duration::from_secs(5));
+        assert_eq!(first, "[job 1 (`echo ready; sleep 30`) has been running for 0 s]\nready");
+        let next = shell.job_output(1, none).await.unwrap();
+        assert!(next.ends_with("has been running for 0 s; no new output]"), "{next}");
         assert_eq!(shell.kill_job(1).await.unwrap(), "Stopped job 1.");
-        assert!(shell.job_output(9).is_err());
+        // A job that ends is news too.
+        shell.run("sleep 1; exit 3", None, true, &mut policy, &mut Headless).await.unwrap();
+        let ended = shell.job_output(2, Duration::from_secs(20)).await.unwrap();
+        assert_eq!(ended, "[job 2 (`sleep 1; exit 3`) has ended (exit code 3); no new output]");
+        assert!(shell.job_output(9, none).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn says_when_a_timeout_was_cut() {
+        let (mut shell, _dir) = shell("timeouts");
+        let mut policy = ConfirmPolicy::new::<&str>(&[]);
+        let out = shell.run("echo hi", Some(5_000), false, &mut policy, &mut Headless).await;
+        assert_eq!(
+            out.unwrap(),
+            "hi\n[timeout_s is at most 600, so it ran with 600; run longer commands with \
+             background set]"
+        );
     }
 
     #[tokio::test]

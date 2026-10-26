@@ -33,6 +33,11 @@ pub struct ExecArgs {
     #[arg(long, default_value_t = 150)]
     max_requests: usize,
 
+    /// Seconds the run has, as whoever runs it allows: near the end the model is told to finish.
+    /// eidra does not stop at it
+    #[arg(long, value_name = "SECONDS")]
+    time_limit: Option<u64>,
+
     /// Print events as JSON lines on stdout
     #[arg(long)]
     json: bool,
@@ -160,6 +165,9 @@ pub async fn run(args: ExecArgs) -> Result<i32> {
         None => Agent::start(profile, options)?,
     };
 
+    if let Some(seconds) = args.time_limit {
+        agent.set_time_limit(std::time::Duration::from_secs(seconds));
+    }
     let mut output = Output::new(args.json);
     output.start(&agent);
     agent.push_user(&task)?;

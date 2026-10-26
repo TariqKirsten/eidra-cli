@@ -626,13 +626,20 @@ pub async fn give_back(dir: &Path, image: &str) {
     .await;
 }
 
-/// The run command for the agent: `eidra exec` with the run's settings.
-pub fn agent_command(setup: &AgentSetup<'_>, max_requests: usize, prompt: &str) -> Vec<String> {
+/// The run command for the agent: `eidra exec` with the run's settings, and the time the task
+/// gives it.
+pub fn agent_command(
+    setup: &AgentSetup<'_>,
+    max_requests: usize,
+    seconds: f64,
+    prompt: &str,
+) -> Vec<String> {
     let mut command: Vec<String> =
         ["eidra", "exec", "--json", "--session-dir", "/sessions", "--max-requests"]
             .map(String::from)
             .to_vec();
     command.push(max_requests.to_string());
+    command.extend(["--time-limit".into(), (seconds as u64).to_string()]);
     if setup.profile_dir.is_some() {
         command.extend(["--profile".into(), "/profile".into()]);
     }
@@ -731,7 +738,7 @@ async fn agent_then_verifier(
     if matches!(setup.route, Route::Socket(_)) {
         env.set_network(false).await?;
     }
-    let command = agent_command(setup, max_requests, &task.spec.prompt);
+    let command = agent_command(setup, max_requests, config.agent_timeout_s, &task.spec.prompt);
     let command: Vec<&str> = command.iter().map(String::as_str).collect();
     let vars: Vec<String> = setup.api_key_env.map(str::to_owned).into_iter().collect();
     let timeout = Duration::from_secs_f64(config.agent_timeout_s);

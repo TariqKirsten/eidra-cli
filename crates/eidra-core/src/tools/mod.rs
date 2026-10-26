@@ -8,9 +8,11 @@ pub use bash::run_command;
 mod diagnostics;
 mod files;
 mod search;
+mod test_changes;
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use eidra_llm::{Tool, ToolCall};
@@ -48,6 +50,8 @@ pub struct Toolbox {
     shell: bash::Shell,
     diagnostics: diagnostics::Diagnostics,
     nested: agents::Nested,
+    /// The note for a change to the project's tests (`[prompts] changed_tests`).
+    changed_tests_note: String,
 }
 
 enum Reply {
@@ -102,6 +106,7 @@ impl Toolbox {
             files: files::Files::new(workspace),
             diagnostics: diagnostics::Diagnostics::new(workspace, profile.diagnostics.clone()),
             nested: agents::Nested::new(workspace),
+            changed_tests_note: profile.prompts.changed_tests.clone(),
             shell: bash::Shell::new(
                 workspace,
                 &session_dir.join("shell"),
@@ -155,11 +160,18 @@ impl Toolbox {
         let text = match name {
             "bash" => {
                 let command = string(args, "command")?;
-                let timeout = number(args, "timeout_s")?;
+                // Models often say timeout; it means the same.
+                let timeout = match number(args, "timeout_s")? {
+                    Some(seconds) => Some(seconds),
+                    None => number(args, "timeout")?,
+                };
                 let background = boolean(args, "background")?.unwrap_or(false);
                 self.shell.run(command, timeout, background, confirm, frontend).await?
             }
-            "bash_output" => self.shell.job_output(required_number(args, "id")?)?,
+            "bash_output" => {
+                let wait = Duration::from_secs(number(args, "wait_s")?.unwrap_or(0));
+                self.shell.job_output(required_number(args, "id")?, wait).await?
+            }
             "bash_kill" => self.shell.kill_job(required_number(args, "id")?).await?,
             "read" => {
                 let path = string(args, "path")?;
@@ -180,7 +192,14 @@ impl Toolbox {
             "write" | "edit" => {
                 // The file's problems before the change, so that the result names only new ones.
                 let path = string(args, "path")?;
-                let before = self.diagnostics.before(&resolve(&self.workspace, path)).await;
+                let abs = resolve(&self.workspace, path);
+                let before = self.diagnostics.before(&abs).await;
+                // A test file as it was, to see which of the project's tests the change touches.
+                let tests_before = if test_changes::is_test_file(&abs) {
+                    fs::read_to_string(&abs).ok()
+                } else {
+                    None
+                };
                 let mut text = if name == "write" {
                     self.files.write(path, string(args, "content")?)?
                 } else {
@@ -197,6 +216,12 @@ impl Toolbox {
                         text.truncate(text.trim_end().len());
                         text.push_str(&problems);
                     }
+                }
+                if let Some(tests_before) = tests_before
+                    && let Some(note) = self.changed_tests(&abs, &tests_before).await
+                {
+                    text.truncate(text.trim_end().len());
+                    text.push_str(&note);
                 }
                 text
             }
@@ -220,6 +245,22 @@ impl Toolbox {
             _ => return Err(format!("{name} is not implemented")),
         };
         Ok(Reply::Text(text))
+    }
+
+    /// The note for a change to a test file that altered tests of the project's last commit.
+    async fn changed_tests(&self, path: &Path, before: &str) -> Option<String> {
+        const MOST: usize = 8;
+        let after = fs::read_to_string(path).ok()?;
+        let head = test_changes::at_head(path).await?;
+        let changed = test_changes::changed(&head, before, &after);
+        if changed.is_empty() {
+            return None;
+        }
+        let mut names = changed.iter().take(MOST).cloned().collect::<Vec<_>>().join(", ");
+        if changed.len() > MOST {
+            names.push_str(&format!(" and {} more", changed.len() - MOST));
+        }
+        Some(self.changed_tests_note.replace("{tests}", &names))
     }
 
     /// A file the user's message mentions, as `read` shows it, with any nested AGENTS.md it is
@@ -363,7 +404,9 @@ fn definition(name: &str, description: Option<&String>, interactive: bool) -> Re
             "Run a bash command and return its output (stdout and stderr together) and exit code. The \
              working directory and exported variables carry over to the next command. Commands run \
              without a terminal, so nothing can prompt for input. Run servers, watchers and other \
-             long-running processes with background set to true.",
+             long-running processes with background set to true. Long output is cut for you, \
+             keeping its start and end, so there is no need to pipe it into head or tail: in the \
+             background that would also hide the job's progress until it ends.",
             json!({
                 "command": {"type": "string", "description": "The command to run."},
                 "timeout_s": {"type": "integer", "description": "Seconds before the command is stopped: 120 if unset, at most 600."},
@@ -372,8 +415,13 @@ fn definition(name: &str, description: Option<&String>, interactive: bool) -> Re
             &["command"],
         ),
         "bash_output" => (
-            "Return the output a background job has produced since you last asked, and whether it is still running.",
-            json!({"id": {"type": "integer", "description": "The job id bash returned."}}),
+            "Return the output a background job has produced since you last asked, and whether it is \
+             still running. To wait for a job, set wait_s rather than running sleep: it returns as \
+             soon as there is new output or the job ends.",
+            json!({
+                "id": {"type": "integer", "description": "The job id bash returned."},
+                "wait_s": {"type": "integer", "description": "Seconds to wait for new output or the job's end, at most 600; 0 if unset."}
+            }),
             &["id"],
         ),
         "bash_kill" => (
