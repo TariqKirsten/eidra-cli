@@ -331,6 +331,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "eidra-core",
+ "eidra-llm",
  "futures-util",
  "image",
  "pulldown-cmark",
