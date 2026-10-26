@@ -439,8 +439,9 @@ A step's reasoning, calls and results stay together; a blank line separates ever
 - Ctrl+T shows reasoning whole or as one line.
 - An approval takes y (once), a (this command, for the rest of the session) or n. Keys that arrive
   in the first 0.4 s are ignored, so that typing meant for the input box does not answer it.
-- Commands: `/help`, `/new`, `/tasks` and `/stop [n]` for background tasks, `/reasoning`, `/quit`
-  (or `/exit`). Quitting stops the turn and the background tasks first.
+- Commands: `/help`, `/new`, `/tasks` and `/stop [n]` for background tasks, `/undo` and
+  `/diff [all]` (§14), `/reasoning`, `/quit` (or `/exit`). Quitting stops the turn and the
+  background tasks first, and waits for an undo under way.
 
 **Interrupts.** The agent runs in a future that owns it and hands it back when the turn ends; it
 sends events and approval requests to the UI loop through a channel. Esc stops the run:
@@ -503,9 +504,33 @@ Reference: codex-rs `tui`.
 ## 14. Sessions, checkpoints, observability
 
 - **Sessions:** `--continue`, `--resume` and fork all work from the session log.
-- **Checkpoints:** a shadow git repository per workspace, with its own `GIT_DIR` under
-  `~/.local/share/eidra`, snapshots the tree after each turn. It catches changes made through
-  bash too. `/undo` and `/diff` use it.
+- **Checkpoints** (M6, 2026-10-27): in an interactive session, a git repository of eidra's own
+  records the workspace before and after each turn. It is bare, one per workspace, under
+  `~/.local/share/eidra/checkpoints`, and runs with the workspace as its work tree and an index
+  per session, so it never touches the project's repository, index or branches, and sees what
+  commands changed as well as what the file tools did. Each snapshot is a commit on
+  `refs/eidra/<session>` whose subject names its turn (`before 3: <message>`, `after 3`,
+  `undid 3`), so a resumed session finds its turns again.
+  - **What it leaves out:** whatever the project's ignore files and the user's global one ignore;
+    `.venv`, `node_modules`, `__pycache__` and other caches, and a root `target/`; and any new file
+    over 8 MiB, for good. The home and root directories get no checkpoints, and neither does a
+    workspace with over 20,000 new files at once. A nested git repository is recorded as its
+    commit, not its files.
+  - **`/undo`** puts back what the latest turn that changed files changed: files it modified or
+    deleted come back as they were before it, and files it made are removed, with any directories
+    it made for them. A file changed again after the turn, by the user or anything else, is left
+    as it is and listed. Undo again for the turn before. The agent's next message starts with a
+    note of what was undone (`[prompts] undone`); without it the model believes its changes are
+    still there. The conversation itself stays as it was: the model keeps what it tried, and the
+    prompt stays append-only.
+  - **`/diff`** shows what changed since the last turn began, a summary of files and then the
+    patch, coloured; `/diff all`, since the session's first turn began. During a turn it shows
+    the turn's changes so far.
+  - A git command that fails or takes over 20 s turns checkpoints off for the session, with a
+    notice; the turn goes on. Background subagents' changes count towards whichever turn they
+    happen in.
+  - Snapshots cost a few git commands per turn, about 10 ms each on a small project. Old
+    objects are never pruned yet.
 - **Observability:** `tracing` writes to a file. Optionally, OTLP traces go to the local
   Langfuse.
 
@@ -570,7 +595,7 @@ Reference: codex-rs `tui`.
 | M3 | subagents, measured against the M2 suite | the suite shows whether they help, and in which form |
 | M4 | inline TUI | it's usable day to day |
 | M5 | uv, ty, ruff, post-edit diagnostics | the agent hears of the problems its edits introduce (done, §9) |
-| M6 | images, PDFs, nested AGENTS.md, compaction, checkpoints | |
+| M6 | images, PDFs, nested AGENTS.md, compaction, checkpoints | the agent reads images and PDFs, a long session goes on past its context, and a turn can be undone (done, §8, §10, §11, §14) |
 | M7 | runtime image and wrapper | |
 
 Evals come first so that every later change, subagents included, is measured. Subagents share

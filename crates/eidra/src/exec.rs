@@ -150,14 +150,19 @@ fn read_task(args: &ExecArgs) -> Result<String> {
 /// $XDG_DATA_HOME/eidra/sessions, else ~/.local/share/eidra/sessions, else .eidra/sessions in the
 /// workspace (a container user without a home).
 fn default_session_dir(workspace: &Path) -> PathBuf {
+    data_dir(workspace).join("sessions")
+}
+
+/// eidra's data: $XDG_DATA_HOME/eidra, else ~/.local/share/eidra, else .eidra in the workspace.
+pub fn data_dir(workspace: &Path) -> PathBuf {
     if let Some(data) = std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
-        return PathBuf::from(data).join("eidra/sessions");
+        return PathBuf::from(data).join("eidra");
     }
     match std::env::var_os("HOME") {
         Some(home) if !home.is_empty() && home != "/" => {
-            PathBuf::from(home).join(".local/share/eidra/sessions")
+            PathBuf::from(home).join(".local/share/eidra")
         }
-        _ => workspace.join(".eidra/sessions"),
+        _ => workspace.join(".eidra"),
     }
 }
 

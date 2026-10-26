@@ -2,6 +2,7 @@
 //! (docs/DESIGN.md §4–§7). It never prints; frontends render its events.
 
 mod agent;
+pub mod checkpoint;
 mod confirm;
 pub mod display;
 mod event;

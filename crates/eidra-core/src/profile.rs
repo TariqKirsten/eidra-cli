@@ -175,6 +175,9 @@ pub struct Prompts {
     pub compact: String,
     /// Starts the conversation after a compaction; `{tokens}` and `{summary}` are replaced.
     pub compacted: String,
+    /// Starts the user's next message after /undo put back what a turn changed. `{turn}` is the
+    /// start of the message that began the turn; `{restored}`, `{removed}` and `{kept}` list files.
+    pub undone: String,
 }
 
 impl Profile {

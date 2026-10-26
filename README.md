@@ -58,7 +58,7 @@ What it mounts and passes in:
 | on the host | in the container | why |
 |---|---|---|
 | the current directory | the same path, as the working directory | the agent's workspace; paths read the same inside and out |
-| `~/.local/share/eidra` | the same path, with `XDG_DATA_HOME` | session logs, kept after the container is gone |
+| `~/.local/share/eidra` | the same path, with `XDG_DATA_HOME` | session logs and checkpoints, kept after the container is gone |
 | `~/.cache/uv` | the same path, with `UV_CACHE_DIR` | Python packages are downloaded once |
 | `~/.gitconfig`, if there is one | `/home/eidra/.gitconfig`, read-only | your name and email on the agent's commits |
 | `$EIDRA_PROFILE`, if set | the same path, read-only | a profile of your own |
@@ -106,14 +106,20 @@ terminal's own scrollback; at the bottom are the reply streaming in, the input b
 - Up and Down walk the history. Ctrl+T shows the model's reasoning whole instead of as one line.
 - A command on the confirm list asks first: y runs it once, a for the rest of the session, n not.
 - `/help`, `/new` (a new session), `/tasks` and `/stop` (subagents in the background),
-  `/reasoning`, `/quit`.
+  `/undo` and `/diff` (below), `/reasoning`, `/quit`.
 
 Ask the agent to do something in the background, such as "start a subagent to build a calculator
 while we chat", and a subagent works on it while you go on talking; its report comes back to the
 agent when it ends.
 
-A session stops when its conversation reaches the profile's context limit (256K tokens of the
-server's 262,144); `/new` starts another. Each session is logged as JSON lines under
+Each turn is checkpointed in a git repository of eidra's own, apart from the project's:
+`/undo` puts back the files the last turn changed (again for the turn before), and `/diff` shows
+what changed since the last turn began (`/diff all`, since the session's first). A file you
+changed after the turn is left alone.
+
+Past 200K tokens the conversation is summarised and goes on from the summary, so a session does not
+stop at the context window. If no summary can be made, it stops at the profile's limit (256K
+tokens of the server's 262,144), and `/new` starts another. Each session is logged as JSON lines under
 `~/.local/share/eidra/sessions`, or wherever `--session-dir` says, and the path is printed when you
 quit.
 

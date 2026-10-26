@@ -142,6 +142,8 @@ pub mod theme {
     pub const ERROR: Style = Style::PLAIN.fg(Color::DarkRed);
     pub const NOTICE: Style = Style::PLAIN.fg(Color::DarkYellow);
     pub const CODE: Style = Style::PLAIN.fg(Color::DarkCyan);
+    pub const ADDED: Style = Style::PLAIN.fg(Color::DarkGreen);
+    pub const REMOVED: Style = Style::PLAIN.fg(Color::DarkRed);
     pub const REASONING: Style = Style::PLAIN.dim().italic();
     pub const SPINNER: Style = Style::PLAIN.fg(Color::DarkMagenta);
     pub const CARET: Style = Style::PLAIN.reverse();

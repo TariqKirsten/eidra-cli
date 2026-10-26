@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::Duration;
@@ -25,6 +26,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
+use eidra_core::checkpoint::{Checkpoints, Undone};
 use eidra_core::display::{clip, compact, describe_call, duration, summarise, thousands};
 use eidra_core::{
     Agent, AgentOptions, Approval, Background, Decision, Event, Frontend, Interrupter, Outcome,
@@ -32,7 +34,7 @@ use eidra_core::{
 };
 use futures_util::StreamExt;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 
 use crate::attach;
@@ -49,6 +51,8 @@ pub struct Options {
     pub session_root: PathBuf,
     /// Commands that need approval, on top of the profile's.
     pub confirm: Vec<String>,
+    /// Where the checkpoint repositories go, one per workspace; None turns checkpoints off.
+    pub checkpoints: Option<PathBuf>,
 }
 
 /// Requests one turn may make before the turn goes back to the user.
@@ -60,6 +64,8 @@ const FRAME: Duration = Duration::from_millis(16);
 /// How long an approval ignores y, a and n after it appears, so that keys typed for the input box
 /// do not answer it.
 const APPROVAL_GRACE: Duration = Duration::from_millis(400);
+/// Lines of a diff /diff shows; the rest are counted.
+const DIFF_LINES: usize = 400;
 
 const HELP: &[(&str, &str)] = &[
     ("enter", "send; while the agent works, queue it for when the turn ends"),
@@ -69,6 +75,8 @@ const HELP: &[(&str, &str)] = &[
     ("ctrl+d", "quit, when the input is empty"),
     ("up, down", "move between rows; from the first or last, walk the history"),
     ("ctrl+t", "show reasoning in full, or as one line"),
+    ("/undo", "put back the files the last turn changed; again for the turn before"),
+    ("/diff [all]", "what changed since the last turn began, or since the session's first"),
     ("/new", "start a new session"),
     ("/tasks", "list the subagents working in the background"),
     ("/stop [n]", "stop them, or the nth; the agent gets their reports"),
@@ -137,6 +145,18 @@ impl Frontend for Channel {
 }
 
 type Run = Pin<Box<dyn Future<Output = (Agent, Result<Outcome>)>>>;
+
+/// A /diff or /undo, while git works.
+type Job = Pin<Box<dyn Future<Output = Done>>>;
+
+enum Done {
+    /// With `all`, the changes since the session's first turn began.
+    Diff {
+        all: bool,
+        diff: Result<Option<(usize, String)>, String>,
+    },
+    Undo(Result<Option<Undone>, String>),
+}
 
 /// A turn of the agent's, while it runs.
 struct Turn {
@@ -232,6 +252,11 @@ struct App<W: Write> {
     tasks: Vec<Task>,
     /// Reports of background subagents that have ended, for the agent's next message.
     reports: Vec<Report>,
+    /// Notes for the agent's next message, such as what /undo put back.
+    notes: Vec<String>,
+    /// The session's checkpoints, or why it has none.
+    checkpoints: Result<Arc<Mutex<Checkpoints>>, String>,
+    job: Option<Job>,
     /// Counts the sessions started, so that a task reports only to its own.
     session: u64,
     /// The last request's numbers, for the status line.
@@ -253,6 +278,7 @@ struct App<W: Write> {
 impl<W: Write> App<W> {
     fn new(options: Options, agent: Agent, screen: Screen<W>) -> Self {
         let (sender, inbox) = mpsc::unbounded_channel();
+        let checkpoints = checkpoints(&options, &agent);
         let mut app = App {
             options,
             screen,
@@ -266,6 +292,9 @@ impl<W: Write> App<W> {
             queued: Vec::new(),
             tasks: Vec::new(),
             reports: Vec::new(),
+            notes: Vec::new(),
+            checkpoints,
+            job: None,
             session: 0,
             stats: None,
             show_reasoning: false,
@@ -312,6 +341,7 @@ impl<W: Write> App<W> {
                 (i, report) = next_report(&mut self.tasks), if !self.tasks.is_empty() => {
                     self.task_ended(i, report);
                 }
+                done = job_done(&mut self.job), if self.job.is_some() => self.job_ended(done),
                 _ = tick.tick(), if self.turn.is_some() => self.dirty = true,
                 () = sleep_until(frame.unwrap_or_else(Instant::now)), if frame.is_some() => {}
                 _ = hangup.recv() => self.request_quit(),
@@ -551,7 +581,7 @@ impl<W: Write> App<W> {
         self.commit(Block::Tools, lines);
         if task.session == self.session && !self.quitting {
             self.reports.push(report);
-            if self.turn.is_none() {
+            if !self.busy() {
                 self.send(String::new());
             }
         }
@@ -566,6 +596,9 @@ impl<W: Write> App<W> {
         let Some(turn) = self.turn.take() else {
             return;
         };
+        // The busy line goes, even when nothing else changes: the snapshot after a turn can end
+        // it a while after its last event was drawn.
+        self.dirty = true;
         self.agent = Some(agent);
         // A reply cut short never reached the conversation, but show what there was of it.
         let partial = !turn.reasoning.trim().is_empty() || !turn.reply.trim().is_empty();
@@ -729,9 +762,15 @@ impl<W: Write> App<W> {
     }
 
     fn check_quit(&mut self) {
-        if self.quitting && self.turn.is_none() && self.tasks.is_empty() {
+        // An undo stopped halfway would leave the workspace neither as it was nor as it is.
+        if self.quitting && self.turn.is_none() && self.tasks.is_empty() && self.job.is_none() {
             self.quit = true;
         }
+    }
+
+    /// The agent's turn or a /diff or /undo is under way: a message waits for it.
+    fn busy(&self) -> bool {
+        self.turn.is_some() || self.job.is_some()
     }
 
     fn toggle_reasoning(&mut self) {
@@ -752,7 +791,7 @@ impl<W: Write> App<W> {
         if let Some(command) = command(text) {
             let rest = text[command.len()..].trim().to_owned();
             self.command(command, &rest);
-        } else if self.turn.is_some() {
+        } else if self.busy() {
             self.queued.push(text.to_owned());
         } else {
             self.send(text.to_owned());
@@ -776,6 +815,8 @@ impl<W: Write> App<W> {
             "/new" => self.new_session(),
             "/tasks" => self.list_tasks(),
             "/stop" => self.stop_tasks(rest),
+            "/undo" => self.undo(),
+            "/diff" => self.diff(rest),
             "/reasoning" => self.toggle_reasoning(),
             _ => self.notice(&format!("{command} is not a command; /help lists them")),
         }
@@ -791,6 +832,8 @@ impl<W: Write> App<W> {
                 }
                 self.session += 1;
                 self.reports.clear();
+                self.notes.clear();
+                self.checkpoints = checkpoints(&self.options, &agent);
                 self.log = agent.session_log().to_path_buf();
                 self.agent = Some(agent);
                 self.stats = None;
@@ -839,6 +882,111 @@ impl<W: Write> App<W> {
         }
     }
 
+    /// Puts back the files the last turn that changed any changed, through the checkpoints.
+    fn undo(&mut self) {
+        if self.turn.is_some() {
+            self.notice("the agent is working: /undo once its turn ends, or press esc to stop it");
+            return;
+        }
+        if let Some(checkpoints) = self.checkpoints_for_a_job() {
+            self.job =
+                Some(Box::pin(async move { Done::Undo(checkpoints.lock().await.undo().await) }));
+        }
+    }
+
+    fn diff(&mut self, rest: &str) {
+        let all = match rest {
+            "" => false,
+            "all" => true,
+            _ => {
+                self.notice("/diff shows what changed since the last turn began; /diff all, since the session's first");
+                return;
+            }
+        };
+        if let Some(checkpoints) = self.checkpoints_for_a_job() {
+            self.job = Some(Box::pin(async move {
+                Done::Diff { all, diff: checkpoints.lock().await.diff(all).await }
+            }));
+        }
+    }
+
+    fn checkpoints_for_a_job(&mut self) -> Option<Arc<Mutex<Checkpoints>>> {
+        if self.job.is_some() {
+            self.notice("the last /diff or /undo has not finished yet");
+            return None;
+        }
+        match &self.checkpoints {
+            Ok(checkpoints) => Some(Arc::clone(checkpoints)),
+            Err(why) => {
+                let why = format!("checkpoints are off: {why}");
+                self.notice(&why);
+                None
+            }
+        }
+    }
+
+    fn job_ended(&mut self, done: Done) {
+        self.job = None;
+        self.dirty = true;
+        match done {
+            Done::Diff { diff: Ok(None), .. } => self.info("no turn has run in this session yet"),
+            Done::Diff { all, diff: Ok(Some((turn, diff))) } => {
+                let since = if all { "the session's first turn" } else { "the last turn" };
+                if diff.trim().is_empty() {
+                    self.info(&format!("nothing has changed since {since} (turn {turn}) began"));
+                } else {
+                    let head = format!("changes since {since} (turn {turn}) began");
+                    let mut lines = vec![Line::styled(head, theme::BOLD)];
+                    lines.extend(diff_lines(&diff, DIFF_LINES));
+                    self.commit(Block::Info, lines);
+                }
+            }
+            Done::Undo(Ok(None)) => self.info("no turn of this session is left that changed files"),
+            Done::Undo(Ok(Some(undone))) => self.undone(undone),
+            Done::Diff { diff: Err(why), .. } => self.error(&format!("/diff: {why}")),
+            Done::Undo(Err(why)) => self.error(&format!("/undo: {why}")),
+        }
+        self.check_quit();
+        if !self.quitting && self.turn.is_none() {
+            // Messages and reports that waited for it.
+            let queued = mem::take(&mut self.queued).join("\n\n");
+            self.send(queued);
+        }
+    }
+
+    /// Shows what an undo did, and keeps a note of it for the agent's next message: without one,
+    /// the model believes its changes are still there.
+    fn undone(&mut self, undone: Undone) {
+        let width = self.width();
+        let head = format!("undid turn {} · {}", undone.turn, undone.label);
+        let mut lines = hanging(Line::styled("↶ ", theme::NOTICE), &head, Style::PLAIN, width);
+        let groups = [
+            ("put back", &undone.restored),
+            ("removed, since the turn made them", &undone.removed),
+            ("left as they are, since they changed after the turn", &undone.kept),
+        ];
+        for (what, files) in groups {
+            if !files.is_empty() {
+                let text = format!("{what}: {}", files.join(", "));
+                lines.extend(hanging(Line::styled("  ⎿ ", theme::DIM), &text, theme::DIM, width));
+            }
+        }
+        self.commit(Block::Info, lines);
+        let list = |files: &[String]| {
+            if files.is_empty() { "none".to_owned() } else { files.join(", ") }
+        };
+        let note = self
+            .options
+            .profile
+            .prompts
+            .undone
+            .replace("{turn}", &undone.label)
+            .replace("{restored}", &list(&undone.restored))
+            .replace("{removed}", &list(&undone.removed))
+            .replace("{kept}", &list(&undone.kept));
+        self.notes.push(note);
+    }
+
     /// Sends a message, after the reports of background subagents that have ended, and starts
     /// the agent's turn.
     fn send(&mut self, text: String) {
@@ -848,6 +996,8 @@ impl<W: Write> App<W> {
         let Some(mut agent) = self.agent.take() else {
             return;
         };
+        let label =
+            if text.is_empty() { "(reports of background tasks)".into() } else { text.clone() };
         let mut images = Vec::new();
         if !text.is_empty() {
             let user = Line::styled("› ", theme::USER);
@@ -865,7 +1015,8 @@ impl<W: Write> App<W> {
             }
             self.commit(Block::User, lines);
         }
-        let mut parts: Vec<String> = self.reports.iter().map(|r| agent.report_message(r)).collect();
+        let mut parts = self.notes.clone();
+        parts.extend(self.reports.iter().map(|r| agent.report_message(r)));
         if !text.is_empty() {
             parts.push(text);
         }
@@ -875,10 +1026,23 @@ impl<W: Write> App<W> {
             return;
         }
         self.reports.clear();
+        self.notes.clear();
         let interrupter = agent.interrupter();
         let mut channel = Channel(self.sender.clone());
+        let checkpoints = self.checkpoints.clone().ok();
         let run: Run = Box::pin(async move {
+            // The workspace before the turn and after it, for /undo and /diff.
+            if let Some(checkpoints) = &checkpoints
+                && let Err(why) = checkpoints.lock().await.begin(&label).await
+            {
+                channel.event(Event::Notice { text: format!("checkpoints are off: {why}") });
+            }
             let outcome = agent.run(&mut channel, MAX_REQUESTS).await;
+            if let Some(checkpoints) = &checkpoints
+                && let Err(why) = checkpoints.lock().await.end().await
+            {
+                channel.event(Event::Notice { text: format!("checkpoints are off: {why}") });
+            }
             (agent, outcome)
         });
         self.turn = Some(Turn::new(run, interrupter));
@@ -996,6 +1160,50 @@ async fn finished(turn: &mut Option<Turn>) -> (Agent, Result<Outcome>) {
         Some(turn) => turn.run.as_mut().await,
         None => std::future::pending().await,
     }
+}
+
+async fn job_done(job: &mut Option<Job>) -> Done {
+    match job {
+        Some(job) => job.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The session's checkpoints, if the options have a place for them and the workspace allows them.
+fn checkpoints(options: &Options, agent: &Agent) -> Result<Arc<Mutex<Checkpoints>>, String> {
+    let root = options.checkpoints.as_ref().ok_or("this session has none")?;
+    let checkpoints = Checkpoints::new(root, agent.workspace(), agent.session_id())?;
+    Ok(Arc::new(Mutex::new(checkpoints)))
+}
+
+/// A diff's lines, coloured as git colours them, the first `most` of them.
+fn diff_lines(diff: &str, most: usize) -> Vec<Line> {
+    let mut lines: Vec<Line> = diff
+        .lines()
+        .take(most)
+        .map(|line| {
+            let style = if line.starts_with("diff --git")
+                || line.starts_with("+++ ")
+                || line.starts_with("--- ")
+            {
+                theme::BOLD
+            } else if line.starts_with('+') {
+                theme::ADDED
+            } else if line.starts_with('-') {
+                theme::REMOVED
+            } else if line.starts_with("@@") {
+                theme::CODE
+            } else {
+                Style::PLAIN
+            };
+            Line::styled(style::expand_tabs(line), style)
+        })
+        .collect();
+    let rest = diff.lines().count().saturating_sub(most);
+    if rest > 0 {
+        lines.push(Line::styled(format!("… {} more lines", thousands(rest as u64)), theme::DIM));
+    }
+    lines
 }
 
 /// The first background subagent to end: where it is in `tasks`, and its report.
@@ -1192,6 +1400,7 @@ mod tests {
                 workspace: dir.join("work"),
                 session_root: dir.join("sessions"),
                 confirm: Vec::new(),
+                checkpoints: Some(dir.join("checkpoints")),
             };
             std::fs::create_dir_all(&options.workspace).unwrap();
             let agent = start(&options).unwrap();
@@ -1501,6 +1710,75 @@ mod tests {
         assert!(t.app.editor.is_empty() && !t.app.quit);
         t.app.key(ctrl_c);
         assert!(t.app.quit);
+    }
+
+    #[test]
+    fn the_end_of_a_quiet_turn_is_drawn() {
+        let mut t = Test::new();
+        let agent = t.begin();
+        t.app.draw().unwrap();
+        assert!(!t.app.dirty);
+        t.app.turn_ended(agent, Ok(Outcome::Replied));
+        assert!(t.app.dirty, "the busy line would stay on the screen");
+        assert!(!t.live().iter().any(|row| row.contains("esc to interrupt")));
+    }
+
+    /// Runs the /diff or /undo the app started, to its end.
+    async fn finish_job(test: &mut Test) {
+        let done = job_done(&mut test.app.job).await;
+        test.app.job_ended(done);
+    }
+
+    #[tokio::test]
+    async fn undo_puts_files_back_and_tells_the_agent() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return eprintln!("no git: skipped");
+        }
+        let mut t = Test::new();
+        let work = t.dir.join("work");
+        std::fs::write(work.join("a.py"), "a = 1\n").unwrap();
+        let checkpoints = Arc::clone(t.app.checkpoints.as_ref().unwrap());
+        // A turn, as send() runs one: a snapshot before and after.
+        checkpoints.lock().await.begin("make a two\nplease").await.unwrap();
+        std::fs::write(work.join("a.py"), "a = 2\n").unwrap();
+        std::fs::write(work.join("b.py"), "b = 1\n").unwrap();
+        checkpoints.lock().await.end().await.unwrap();
+
+        t.submit("/diff");
+        finish_job(&mut t).await;
+        let shown = t.finished();
+        assert_eq!(shown[0], "changes since the last turn (turn 1) began");
+        assert!(shown.contains(&"-a = 1".to_owned()) && shown.contains(&"+b = 1".to_owned()));
+
+        t.submit("/undo");
+        // A message sent meanwhile waits for it.
+        t.submit("now make it three");
+        assert_eq!(t.app.queued, ["now make it three"]);
+        finish_job(&mut t).await;
+        assert_eq!(std::fs::read_to_string(work.join("a.py")).unwrap(), "a = 1\n");
+        assert!(!work.join("b.py").exists());
+        let shown = t.finished();
+        assert_eq!(shown[1], "↶ undid turn 1 · make a two");
+        assert_eq!(shown[2], "  ⎿ put back: a.py");
+        assert_eq!(shown[3], "  ⎿ removed, since the turn made them: b.py");
+        // The queued message went, after the note.
+        let message = t.last_message();
+        assert!(
+            message.starts_with("[The user undid what your turn that began with \"make a two\"")
+                && message.contains("put back as they were before it: a.py.")
+                && message.ends_with("]\n\nnow make it three"),
+            "{message}"
+        );
+        assert!(t.app.notes.is_empty());
+
+        t.app.turn = None;
+        t.app.agent.get_or_insert_with(|| start(&t.app.options).unwrap());
+        t.submit("/undo");
+        finish_job(&mut t).await;
+        assert_eq!(
+            t.finished().last().unwrap(),
+            "no turn of this session is left that changed files"
+        );
     }
 
     #[test]

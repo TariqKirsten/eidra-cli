@@ -57,7 +57,8 @@ class Case:
         url = server.url if server else f"http://127.0.0.1:{free_port()}/v1"
         argv = [str(self.binary), "-C", str(self.workspace), "--base-url", url]
         argv += ["--session-dir", str(self.dir / "sessions"), *args]
-        env = dict(os.environ, TERM="xterm-256color")
+        # Checkpoints go under the data directory: the scenario's own, not the user's.
+        env = dict(os.environ, TERM="xterm-256color", XDG_DATA_HOME=str(self.dir / "data"))
         env.pop("RADIANCE_API_KEY", None)
         s = Session(argv, cols=cols, rows=rows, env=env)
         self.sessions.append(s)
@@ -295,6 +296,38 @@ def pdf_pages(case):
         text = result["content"][0]["text"]
         assert "a PDF of 1 page" in text and "no text layer" in text, text
         assert result["content"][1]["type"] == "image_url", result["content"]
+        quit_cleanly(s)
+
+
+@scenario
+def undo(case):
+    """/diff shows what a turn changed, through bash too; /undo puts it back and the next message
+    tells the model."""
+    if not shutil.which("git"):
+        print("      (skipped: needs git)")
+        return
+    (case.workspace / "a.py").write_text("a = 1\n")
+    calls = [("bash", {"command": "echo 'a = 2' > a.py"}),
+             ("write", {"path": "b.py", "content": "b = 1\n"})]
+    replies = [reply(calls=calls), reply(text="Changed both."), reply(text="Back to one.")]
+    with Server(replies) as server:
+        s = case.start(server=server)
+        s.type("change things\r")
+        s.wait_for(lambda s: s.contains("Changed both.") and idle(s), 10, "the reply")
+        s.type("/diff\r")
+        s.wait_for(lambda s: s.contains("+a = 2"), 10, "the diff")
+        assert s.contains("changes since the last turn (turn 1) began") and s.contains("+b = 1")
+        s.type("/undo\r")
+        s.wait_for(lambda s: s.contains("undid turn 1 · change things"), 10, "the undo")
+        case.show(s, "after the undo")
+        assert s.contains("⎿ put back: a.py") and s.contains("⎿ removed, since the turn made them:")
+        assert (case.workspace / "a.py").read_text() == "a = 1\n"
+        assert not (case.workspace / "b.py").exists()
+        s.type("what now?\r")
+        s.wait_for(lambda s: s.contains("Back to one.") and idle(s), 10, "the reply")
+        message = server.requests[2]["messages"][-1]["content"]
+        assert message.startswith("[The user undid what your turn that began with \"change things\"")
+        assert message.endswith("]\n\nwhat now?"), message
         quit_cleanly(s)
 
 
