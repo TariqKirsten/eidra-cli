@@ -21,6 +21,8 @@ futures-util = { version = "0.3.34", default-features = false, features = ["allo
 globset = "0.4.20"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
+# Images for the model: their size, and a smaller copy of one too large (DESIGN.md §10).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 ignore = "0.4.33"
 libc = "0.2.191"
 pulldown-cmark = { version = "0.13.5", default-features = false }

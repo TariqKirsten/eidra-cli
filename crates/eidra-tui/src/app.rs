@@ -35,6 +35,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 
+use crate::attach;
 use crate::editor::Editor;
 use crate::markdown;
 use crate::screen::Screen;
@@ -221,6 +222,8 @@ struct App<W: Write> {
     agent: Option<Agent>,
     turn: Option<Turn>,
     log: PathBuf,
+    /// The agent's working directory, which relative `@path` mentions start from.
+    workspace: PathBuf,
     sender: mpsc::UnboundedSender<Message>,
     inbox: mpsc::UnboundedReceiver<Message>,
     /// Messages sent during the agent's turn, for when it ends.
@@ -255,6 +258,7 @@ impl<W: Write> App<W> {
             screen,
             editor: Editor::new(),
             log: agent.session_log().to_path_buf(),
+            workspace: agent.workspace().to_path_buf(),
             agent: Some(agent),
             turn: None,
             sender,
@@ -844,16 +848,28 @@ impl<W: Write> App<W> {
         let Some(mut agent) = self.agent.take() else {
             return;
         };
+        let mut images = Vec::new();
         if !text.is_empty() {
             let user = Line::styled("› ", theme::USER);
-            let lines = hanging(user, &text, Style::PLAIN, self.width());
+            let mut lines = hanging(user, &text, Style::PLAIN, self.width());
+            for attachment in attach::attachments(&text, &self.workspace) {
+                let (what, style) = match attachment.image {
+                    Ok(image) => {
+                        let what = format!("attached {}: {}", attachment.name, image.describe());
+                        images.push(image);
+                        (what, theme::DIM)
+                    }
+                    Err(why) => (format!("not attached {}: {why}", attachment.name), theme::ERROR),
+                };
+                lines.extend(hanging(Line::styled("  ⎿ ", theme::DIM), &what, style, self.width()));
+            }
             self.commit(Block::User, lines);
         }
         let mut parts: Vec<String> = self.reports.iter().map(|r| agent.report_message(r)).collect();
         if !text.is_empty() {
             parts.push(text);
         }
-        if let Err(e) = agent.push_user(&parts.join("\n\n")) {
+        if let Err(e) = agent.push_user_with(&parts.join("\n\n"), images) {
             self.agent = Some(agent);
             self.error(&causes(&e));
             return;

@@ -12,10 +12,12 @@ Each scenario prints one line, and the script exits non-zero if any failed. Stan
 """
 
 import argparse
+import base64
 import os
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -251,6 +253,48 @@ def background(case):
         report = server.requests[3]["messages"][-1]["content"]
         assert "write hello.py" in report and "\n\nWrote hello.py.\n\n" in report, report
         assert not s.on_screen("task running"), s.dump()
+        quit_cleanly(s)
+
+
+# A 1 × 1 PNG.
+PIXEL = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+@scenario
+def attachments(case):
+    """An image the message mentions goes to the model with it."""
+    (case.workspace / "chart.png").write_bytes(PIXEL)
+    with Server([reply(text="One pixel.")]) as server:
+        s = case.start(server=server)
+        s.type("what is in @chart.png?\r")
+        s.wait_for(lambda s: s.contains("One pixel.") and idle(s), 10, "the reply")
+        assert s.contains("⎿ attached chart.png: a 1 × 1 PNG image"), s.dump()
+        content = server.requests[0]["messages"][-1]["content"]
+        assert isinstance(content, list) and content[0]["text"] == "what is in @chart.png?", content
+        assert content[1]["image_url"]["url"].startswith("data:image/png;base64,"), content
+        quit_cleanly(s)
+
+
+@scenario
+def pdf_pages(case):
+    """read gives a PDF's pages as their text layer and their images."""
+    if not all(shutil.which(t) for t in ("pdftoppm", "pdfinfo", "pdftotext", "magick")):
+        print("      (skipped: needs poppler and ImageMagick)")
+        return
+    subprocess.run(["magick", "-size", "200x100", "xc:white", str(case.workspace / "scan.pdf")],
+                   check=True)
+    replies = [reply(calls=[("read", {"path": "scan.pdf"})]), reply(text="A blank page.")]
+    with Server(replies) as server:
+        s = case.start(server=server)
+        s.type("what is in scan.pdf?\r")
+        s.wait_for(lambda s: s.contains("A blank page.") and idle(s), 15, "the reply")
+        result = server.requests[1]["messages"][-1]
+        assert result["role"] == "tool" and isinstance(result["content"], list), result
+        text = result["content"][0]["text"]
+        assert "a PDF of 1 page" in text and "no text layer" in text, text
+        assert result["content"][1]["type"] == "image_url", result["content"]
         quit_cleanly(s)
 
 

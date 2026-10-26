@@ -17,4 +17,5 @@ tokio = { workspace = true, features = ["signal"] }
 unicode-width.workspace = true
 
 [dev-dependencies]
+image.workspace = true
 serde_json.workspace = true

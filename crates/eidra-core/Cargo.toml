@@ -13,6 +13,7 @@ futures-util.workspace = true
 globset.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true
+image.workspace = true
 ignore.workspace = true
 libc.workspace = true
 serde.workspace = true

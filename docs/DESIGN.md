@@ -337,14 +337,28 @@ Not done yet:
 
 ## 10. Images and PDFs
 
-- **Image limits:** `qwen-assistant` takes OpenAI `image_url` parts up to 2048 × 2048, about
-  1,000 prompt tokens per 1024². Larger images are downscaled to fit. Don't go smaller, or small
-  text gets misread.
-- **Image input:** pasted or dragged file paths (via bracketed paste) and `@path` mentions attach
-  images. `read` on an image returns it.
-- **PDFs:** text per page range (`pdftotext -layout`), and page images (`pdftoppm`) on request.
-- **Open question:** does radiance accept image parts in `tool` messages? If not, the image
-  follows in a `user` message.
+Built in M6 (2026-10-27):
+- **`read` shows images.** PNG, JPEG, GIF and WebP go to the model as image parts of the tool's
+  result: as they are if they fit in 2048 × 2048, the largest radiance takes, or else as a smaller
+  copy (a JPEG stays a JPEG; anything else becomes a PNG). Each costs about 1,000 prompt tokens
+  per 1024². Radiance takes image parts in `tool` messages (checked 2026-10-26: shown a green
+  square that way, the model said so), so a tool's result carries its own images.
+- **`read` gives a PDF page by page**, five at a time (offset and limit count pages, at most ten):
+  - each page's text layer (`pdftotext -layout`), for copying exact values;
+  - then the page as an image (`pdftoppm`, 1,600 px on the long side), for headings, tables,
+    figures and layout, which plain text loses.
+
+  A page without a text layer is marked as a scan, to be read from its image. Without poppler the
+  result says what is missing, and without `pdftoppm` alone it gives the text.
+- **Images attached to a message:** in the TUI, an `@path` mention, or a path pasted or dropped
+  into the input box (quoted, with escaped spaces, or as a `file://` URL), attaches the image after
+  the message's text. A plain word such as `photo.png` in a sentence is left alone.
+- **R7 holds:** an image is encoded once into the session log and replayed from there.
+
+Measured on 2026-10-27, with an invoice PDF, an image-only scanned receipt and a chart PNG: the
+agent read all three with `read` and answered every question right in 48 s. Without this, the same
+task took it about twenty shell commands, installing Pillow and an OCR library and analysing
+pixels.
 
 ## 11. AGENTS.md
 

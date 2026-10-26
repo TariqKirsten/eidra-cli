@@ -92,6 +92,21 @@ pub fn char_ceil(text: &str, mut i: usize) -> usize {
 }
 
 /// FNV-1a: a stable 64-bit hash for noticing changes, not for security.
+/// Standard base64, with padding: for images in `data:` URLs.
+pub fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let byte = |i: usize| u32::from(chunk.get(i).copied().unwrap_or(0));
+        let n = byte(0) << 16 | byte(1) << 8 | byte(2);
+        out.push(char::from(TABLE[(n >> 18) as usize & 63]));
+        out.push(char::from(TABLE[(n >> 12) as usize & 63]));
+        out.push(if chunk.len() > 1 { char::from(TABLE[(n >> 6) as usize & 63]) } else { '=' });
+        out.push(if chunk.len() > 2 { char::from(TABLE[n as usize & 63]) } else { '=' });
+    }
+    out
+}
+
 pub fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
         (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
@@ -118,6 +133,15 @@ pub fn utc_datetime(unix_secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encodes_base64_with_padding() {
+        assert_eq!(base64(b"Man"), "TWFu");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        assert_eq!(base64(b"M"), "TQ==");
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(&[0xfb, 0xff]), "+/8=");
+    }
 
     #[test]
     fn cleans_colours_and_progress_bars() {

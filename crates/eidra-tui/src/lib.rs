@@ -4,6 +4,7 @@
 //! ratatui's inline viewport cannot change its height.
 
 mod app;
+mod attach;
 mod editor;
 mod markdown;
 mod screen;

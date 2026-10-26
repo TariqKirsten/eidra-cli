@@ -5,6 +5,7 @@ mod agent;
 mod confirm;
 pub mod display;
 mod event;
+pub mod media;
 mod profile;
 mod session;
 mod text;

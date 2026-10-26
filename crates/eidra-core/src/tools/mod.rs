@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 
 use crate::confirm::ConfirmPolicy;
 use crate::event::{Event, Frontend};
+use crate::media;
 use crate::profile::Profile;
 use crate::text::truncate_middle;
 
@@ -24,6 +25,14 @@ pub struct ToolOutput {
     pub is_error: bool,
     /// Set by `finish`: the model's summary.
     pub finish: Option<String>,
+    /// Images for the model, after the text, each with the text that follows it.
+    pub images: Vec<(media::Image, String)>,
+}
+
+impl ToolOutput {
+    pub fn text(text: String, is_error: bool) -> Self {
+        ToolOutput { text, is_error, finish: None, images: Vec::new() }
+    }
 }
 
 pub struct Toolbox {
@@ -39,6 +48,8 @@ pub struct Toolbox {
 
 enum Reply {
     Text(String),
+    /// Text, then images, each with the text that follows it.
+    Media(String, Vec<(media::Image, String)>),
     Finish(String),
 }
 
@@ -112,17 +123,17 @@ impl Toolbox {
             Err(format!("there is no tool called {name}; the tools are {}", names.join(", ")))
         };
         match result {
-            Ok(Reply::Text(text)) => {
-                ToolOutput { text: self.limit(name, text), is_error: false, finish: None }
+            Ok(Reply::Text(text)) => ToolOutput::text(self.limit(name, text), false),
+            Ok(Reply::Media(text, images)) => {
+                ToolOutput { text: self.limit(name, text), is_error: false, finish: None, images }
             }
-            Ok(Reply::Finish(summary)) => {
-                ToolOutput { text: "Finished.".into(), is_error: false, finish: Some(summary) }
-            }
-            Err(error) => ToolOutput {
-                text: self.limit(name, format!("Error: {error}")),
-                is_error: true,
-                finish: None,
+            Ok(Reply::Finish(summary)) => ToolOutput {
+                text: "Finished.".into(),
+                is_error: false,
+                finish: Some(summary),
+                images: Vec::new(),
             },
+            Err(error) => ToolOutput::text(self.limit(name, format!("Error: {error}")), true),
         }
     }
 
@@ -142,11 +153,22 @@ impl Toolbox {
             }
             "bash_output" => self.shell.job_output(required_number(args, "id")?)?,
             "bash_kill" => self.shell.kill_job(required_number(args, "id")?).await?,
-            "read" => self.files.read(
-                string(args, "path")?,
-                number(args, "offset")?,
-                number(args, "limit")?,
-            )?,
+            "read" => {
+                let path = string(args, "path")?;
+                let (offset, limit) = (number(args, "offset")?, number(args, "limit")?);
+                let abs = resolve(&self.workspace, path);
+                if media::is_pdf(&abs) && abs.is_file() {
+                    let pages = media::pdf(&abs, path, offset, limit).await?;
+                    return Ok(Reply::Media(pages.text, pages.images));
+                }
+                if media::is_image(&abs) && abs.is_file() {
+                    let bytes = fs::read(&abs).map_err(|e| format!("{path}: {e}"))?;
+                    let image = media::image(&bytes).map_err(|e| format!("{path}: {e}"))?;
+                    let text = format!("{path}: {}.", image.describe());
+                    return Ok(Reply::Media(text, vec![(image, String::new())]));
+                }
+                self.files.read(path, offset, limit)?
+            }
             "write" | "edit" => {
                 // The file's problems before the change, so that the result names only new ones.
                 let path = string(args, "path")?;
@@ -323,12 +345,14 @@ fn definition(name: &str, description: Option<&String>, interactive: bool) -> Re
             &["id"],
         ),
         "read" => (
-            "Read a text file. Lines come back numbered; read a long file in parts with offset and \
-             limit.",
+            "Read a file. A text file comes back with numbered lines; read a long one in parts with \
+             offset and limit. An image (PNG, JPEG, GIF, WebP) is shown to you. A PDF comes page by \
+             page, each page as its text layer and then as an image; offset and limit then count \
+             pages.",
             json!({
                 "path": {"type": "string", "description": "The file, relative to the working directory or absolute."},
-                "offset": {"type": "integer", "description": "The line to start at, counting from 1."},
-                "limit": {"type": "integer", "description": "How many lines to return: 2000 if unset."}
+                "offset": {"type": "integer", "description": "The line to start at, counting from 1; for a PDF, the page."},
+                "limit": {"type": "integer", "description": "How many lines to return: 2000 if unset. For a PDF, how many pages: 5 if unset, at most 10."}
             }),
             &["path"],
         ),

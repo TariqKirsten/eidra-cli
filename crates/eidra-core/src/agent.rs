@@ -12,12 +12,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use eidra_llm::{AssistantTurn, ChatRequest, Client, Message, StreamEvent, ToolCall, Usage};
+use eidra_llm::{
+    AssistantTurn, ChatRequest, Client, Content, ImageUrl, Message, Part, StreamEvent, ToolCall,
+    Usage,
+};
 use futures_util::future::join_all;
 use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::confirm::ConfirmPolicy;
 use crate::event::{Approval, Decision, Event, Frontend, RequestStats};
+use crate::media;
 use crate::profile::Profile;
 use crate::session::{Header, Session};
 use crate::text::{fnv1a, utc_datetime};
@@ -263,12 +267,26 @@ impl Agent {
     }
 
     pub fn push_user(&mut self, text: &str) -> Result<()> {
+        self.push_user_with(text, Vec::new())
+    }
+
+    /// A message from the user with images attached, after its text.
+    pub fn push_user_with(&mut self, text: &str, images: Vec<media::Image>) -> Result<()> {
         let text = if std::mem::take(&mut self.unanswered) {
             format!("{}\n\n{text}", self.profile.prompts.interrupted)
         } else {
             text.to_owned()
         };
-        self.session.push(Message::user(text), None)
+        if images.is_empty() {
+            return self.session.push(Message::user(text), None);
+        }
+        let mut parts = vec![Part::Text { text }];
+        parts.extend(
+            images
+                .into_iter()
+                .map(|image| Part::ImageUrl { image_url: ImageUrl { url: image.url } }),
+        );
+        self.session.push(Message::User { content: Content::Parts(parts) }, None)
     }
 
     /// Requests and runs tools until the model finishes or replies, or a limit is reached.
@@ -367,11 +385,10 @@ impl Agent {
                         if end > next {
                             self.run_subagents(batch, frontend).await
                         } else if truncated(next) {
-                            vec![ToolOutput {
-                                text: format!("Error: {}", self.cut_off_message()),
-                                is_error: true,
-                                finish: None,
-                            }]
+                            vec![ToolOutput::text(
+                                format!("Error: {}", self.cut_off_message()),
+                                true,
+                            )]
                         } else {
                             vec![self.tools.call(&batch[0], &mut self.confirm, frontend).await]
                         }
@@ -404,7 +421,8 @@ impl Agent {
                         output: output.text.clone(),
                         is_error: output.is_error,
                     });
-                    self.session.push(Message::tool(call.id.clone(), output.text), None)?;
+                    let message = tool_message(&call.id, output.text, output.images);
+                    self.session.push(message, None)?;
                     if output.finish.is_some() {
                         finished = output.finish;
                     }
@@ -473,11 +491,7 @@ impl Agent {
                 };
                 match frontend.background(background) {
                     Ok(()) => {
-                        outputs[i] = Some(ToolOutput {
-                            text: STARTED.into(),
-                            is_error: false,
-                            finish: None,
-                        });
+                        outputs[i] = Some(ToolOutput::text(STARTED.into(), false));
                         continue;
                     }
                     // A frontend that cannot run it in the background: it runs here, like any.
@@ -682,9 +696,7 @@ impl<F: FnMut(Event)> Frontend for Sink<F> {
 fn report(agent: &Agent, result: Result<Outcome>) -> ToolOutput {
     let unfinished = "It may have changed files: check them before relying on its work.";
     match result {
-        Ok(Outcome::Finished(summary)) => {
-            ToolOutput { text: summary, is_error: false, finish: None }
-        }
+        Ok(Outcome::Finished(summary)) => ToolOutput::text(summary, false),
         Ok(Outcome::RequestLimit) => failed(&format!(
             "the subagent used all {} of its requests without finishing. {unfinished}",
             agent.requests
@@ -701,7 +713,22 @@ fn report(agent: &Agent, result: Result<Outcome>) -> ToolOutput {
 }
 
 fn failed(why: &str) -> ToolOutput {
-    ToolOutput { text: format!("Error: {why}"), is_error: true, finish: None }
+    ToolOutput::text(format!("Error: {why}"), true)
+}
+
+/// A tool's result for the log: its text, and its images, each followed by its text.
+fn tool_message(id: &str, text: String, images: Vec<(media::Image, String)>) -> Message {
+    if images.is_empty() {
+        return Message::tool(id, text);
+    }
+    let mut parts = vec![Part::Text { text }];
+    for (image, after) in images {
+        parts.push(Part::ImageUrl { image_url: ImageUrl { url: image.url } });
+        if !after.is_empty() {
+            parts.push(Part::Text { text: after });
+        }
+    }
+    Message::Tool { tool_call_id: id.to_owned(), content: Content::Parts(parts) }
 }
 
 /// AGENTS.md from the user's config directory and from the workspace, for the system prompt.
