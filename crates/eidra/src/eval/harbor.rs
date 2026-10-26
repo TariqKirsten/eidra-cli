@@ -122,6 +122,27 @@ struct Solution {
 }
 
 impl Config {
+    /// A configuration asking for nothing in particular: `eidra eval vacuum-check` starts a
+    /// Harbor-shaped environment without a task behind it.
+    pub fn minimal() -> Config {
+        Config {
+            source: None,
+            agent_timeout_s: AGENT_TIMEOUT_S,
+            agent_user: None,
+            verifier_timeout_s: 600.0,
+            verifier_user: None,
+            verifier_env: BTreeMap::new(),
+            verifier_network: false,
+            docker_image: None,
+            build_timeout_s: 600.0,
+            workdir: None,
+            env: BTreeMap::new(),
+            cpus: None,
+            memory_mb: None,
+            solution_env: BTreeMap::new(),
+        }
+    }
+
     pub fn load(dir: &Path) -> Result<Config> {
         let path = dir.join("task.toml");
         let text =

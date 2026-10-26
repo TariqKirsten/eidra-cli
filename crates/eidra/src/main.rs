@@ -3,6 +3,7 @@
 mod eval;
 mod exec;
 mod format;
+mod interactive;
 mod probe;
 mod relay;
 mod replay;
@@ -10,10 +11,19 @@ mod replay;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "eidra", version, about)]
+#[command(
+    name = "eidra",
+    version,
+    about,
+    args_conflicts_with_subcommands = true,
+    after_help = "Without a command, eidra starts an interactive session in the terminal."
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+
+    #[command(flatten)]
+    agent: exec::AgentArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -32,7 +42,11 @@ enum Command {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let Some(command) = cli.command else {
+        return interactive::run(cli.agent).await;
+    };
+    match command {
         Command::Exec(args) => {
             // The agent, and the background jobs it started, are gone once run returns.
             let code = exec::run(args).await?;

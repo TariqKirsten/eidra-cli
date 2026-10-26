@@ -4,6 +4,8 @@ use std::future::Future;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::Background;
+
 /// Something the agent did or saw, in the order it happened.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -65,4 +67,10 @@ pub enum Decision {
 pub trait Frontend {
     fn event(&mut self, event: Event);
     fn approve(&mut self, approval: &Approval) -> impl Future<Output = Decision>;
+
+    /// Takes a subagent to run in the background while the agent that started it goes on. A
+    /// frontend that cannot hands it back, and it runs to its end within the call that started it.
+    fn background(&mut self, task: Background) -> Result<(), Background> {
+        Err(task)
+    }
 }

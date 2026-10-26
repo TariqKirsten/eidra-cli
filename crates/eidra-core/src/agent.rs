@@ -7,12 +7,14 @@ use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use eidra_llm::{AssistantTurn, ChatRequest, Client, Message, StreamEvent, ToolCall, Usage};
 use futures_util::future::join_all;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::confirm::ConfirmPolicy;
 use crate::event::{Approval, Decision, Event, Frontend, RequestStats};
@@ -46,6 +48,20 @@ pub enum Outcome {
     RequestLimit,
     /// The prompt grew past the profile's context limit, to this many tokens.
     ContextLimit(u64),
+    /// The user stopped the run (see [`Interrupter`]). The session can go on.
+    Interrupted,
+}
+
+/// Stops an agent's run from outside, as Esc does in the TUI. A request in flight is dropped, a
+/// running tool is stopped, and the log stays a valid conversation: the reply's unanswered calls
+/// get results that say they were interrupted.
+#[derive(Clone)]
+pub struct Interrupter(Arc<watch::Sender<bool>>);
+
+impl Interrupter {
+    pub fn interrupt(&self) {
+        self.0.send_replace(true);
+    }
 }
 
 pub struct Agent {
@@ -64,6 +80,54 @@ pub struct Agent {
     extra_confirm: Vec<String>,
     model_socket: Option<PathBuf>,
     date: String,
+    interrupt: Arc<watch::Sender<bool>>,
+    /// A run was stopped before the model replied. The next message says so: otherwise the
+    /// model takes up the request it was stopped on again.
+    unanswered: bool,
+    /// Subagents this agent started in the background that have not ended yet.
+    background: Arc<AtomicUsize>,
+    /// Tokens the conversation took at the last reply: its prompt and the reply.
+    used: u64,
+}
+
+/// A subagent started by a `task` call with `background`. The call returns at once, and the
+/// frontend runs the subagent while the conversation goes on; when it ends, its report goes back
+/// to the agent that started it as a message of its own (see [`Agent::report_message`]).
+pub struct Background {
+    /// The id of the `task` call that started it.
+    pub task: String,
+    /// The task's description.
+    pub label: String,
+    agent: Box<Agent>,
+    max_requests: usize,
+    /// Its place among the starting agent's background subagents, given back when it ends.
+    _running: Running,
+}
+
+/// What a background subagent reported when it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// The id of the `task` call that started it.
+    pub task: String,
+    pub label: String,
+    pub text: String,
+    pub is_error: bool,
+}
+
+/// Counts a background subagent as running until it is dropped.
+struct Running(Arc<AtomicUsize>);
+
+impl Running {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Running(Arc::clone(count))
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Whom an agent works for.
@@ -145,6 +209,10 @@ impl Agent {
             extra_confirm: options.confirm,
             model_socket: options.model_socket,
             date,
+            interrupt: Arc::new(watch::channel(false).0),
+            unanswered: false,
+            background: Arc::new(AtomicUsize::new(0)),
+            used: 0,
         })
     }
 
@@ -184,7 +252,22 @@ impl Agent {
         self.session.path()
     }
 
+    pub fn interrupter(&self) -> Interrupter {
+        Interrupter(Arc::clone(&self.interrupt))
+    }
+
+    /// The message that brings a background subagent's report to this agent.
+    pub fn report_message(&self, report: &Report) -> String {
+        let template = &self.profile.prompts.task_report;
+        template.replace("{task}", &report.label).replace("{report}", &report.text)
+    }
+
     pub fn push_user(&mut self, text: &str) -> Result<()> {
+        let text = if std::mem::take(&mut self.unanswered) {
+            format!("{}\n\n{text}", self.profile.prompts.interrupted)
+        } else {
+            text.to_owned()
+        };
         self.session.push(Message::user(text), None)
     }
 
@@ -194,19 +277,38 @@ impl Agent {
         frontend: &mut F,
         max_requests: usize,
     ) -> Result<Outcome> {
+        // An interrupt from before this run is not for it.
+        self.interrupt.send_replace(false);
         for _ in 0..max_requests {
             self.requests += 1;
             frontend.event(Event::Request { number: self.requests });
             let request = self.request()?;
-            let turn = self
-                .client
-                .chat(&request, |event| match event {
+            let mut stop = self.interrupt.subscribe();
+            let reply = tokio::select! {
+                reply = self.client.chat(&request, |event| match event {
                     StreamEvent::Reasoning(text) => frontend.event(Event::Reasoning { text }),
                     StreamEvent::Content(text) => frontend.event(Event::Content { text }),
                     StreamEvent::ToolCall { .. } | StreamEvent::ToolArguments { .. } => {}
-                })
-                .await
-                .with_context(|| format!("request {}", self.requests))?;
+                }) => Some(reply),
+                _ = stop.wait_for(|stop| *stop) => None,
+            };
+            // Nothing of a reply that was cut short goes into the log.
+            let Some(reply) = reply else {
+                self.unanswered = true;
+                return Ok(Outcome::Interrupted);
+            };
+            let turn = match reply {
+                Ok(turn) => turn,
+                Err(e) => {
+                    // A prompt the server cannot fit at all: as far as the session can go.
+                    if let Some(tokens) = context_exceeded(&e) {
+                        let tokens = tokens.unwrap_or(self.used);
+                        self.session.end("context_limit", &tokens.to_string())?;
+                        return Ok(Outcome::ContextLimit(tokens));
+                    }
+                    return Err(e).with_context(|| format!("request {}", self.requests));
+                }
+            };
             let stats = request_stats(&turn, request.seed);
             frontend.event(Event::Reply { stats: stats.clone() });
             let AssistantTurn { message, finish_reason, .. } = turn;
@@ -214,6 +316,7 @@ impl Agent {
             self.session.push(Message::Assistant(message), Some(&stats))?;
 
             let used = stats.prompt_tokens.unwrap_or(0) + stats.completion_tokens.unwrap_or(0);
+            self.used = used;
             if used > self.profile.context.limit {
                 self.session.end("context_limit", &used.to_string())?;
                 return Ok(Outcome::ContextLimit(used));
@@ -258,16 +361,41 @@ impl Agent {
                         arguments: call.function.arguments.clone(),
                     });
                 }
-                let outputs = if end > next {
-                    self.run_subagents(batch, frontend).await
-                } else if truncated(next) {
-                    vec![ToolOutput {
-                        text: format!("Error: {}", self.cut_off_message()),
-                        is_error: true,
-                        finish: None,
-                    }]
-                } else {
-                    vec![self.tools.call(&batch[0], &mut self.confirm, frontend).await]
+                let mut stop = self.interrupt.subscribe();
+                let outputs = tokio::select! {
+                    outputs = async {
+                        if end > next {
+                            self.run_subagents(batch, frontend).await
+                        } else if truncated(next) {
+                            vec![ToolOutput {
+                                text: format!("Error: {}", self.cut_off_message()),
+                                is_error: true,
+                                finish: None,
+                            }]
+                        } else {
+                            vec![self.tools.call(&batch[0], &mut self.confirm, frontend).await]
+                        }
+                    } => Some(outputs),
+                    _ = stop.wait_for(|stop| *stop) => None,
+                };
+                let Some(outputs) = outputs else {
+                    // Every call in the reply still needs a result, or the log is no longer a
+                    // conversation the server takes.
+                    for (i, call) in calls.iter().enumerate().skip(next) {
+                        let text = if i < next + batch.len() {
+                            "Error: the user interrupted this call before it finished."
+                        } else {
+                            "Error: not run, because the user interrupted the reply."
+                        };
+                        frontend.event(Event::ToolResult {
+                            id: call.id.clone(),
+                            name: call.function.name.clone(),
+                            output: text.into(),
+                            is_error: true,
+                        });
+                        self.session.push(Message::tool(call.id.clone(), text), None)?;
+                    }
+                    return Ok(Outcome::Interrupted);
                 };
                 for (call, output) in batch.iter().zip(outputs) {
                     frontend.event(Event::ToolResult {
@@ -297,7 +425,8 @@ impl Agent {
     }
 
     /// Runs `task` calls as subagents, at most `max_parallel` at once, relays what they do to
-    /// `frontend`, and returns each one's report, in the order of the calls.
+    /// `frontend`, and returns each one's report, in the order of the calls. A call with
+    /// `background` goes to the frontend to run instead, and its output says it started.
     async fn run_subagents<F: Frontend>(
         &mut self,
         calls: &[ToolCall],
@@ -308,20 +437,61 @@ impl Agent {
         let mut outputs: Vec<Option<ToolOutput>> = calls.iter().map(|_| None).collect();
         let mut children = Vec::new();
         for (i, call) in calls.iter().enumerate() {
-            let started = tools::task_arguments(call).and_then(|(description, prompt)| {
-                let agent = self.subagent(&description, &prompt).map_err(|e| format!("{e:#}"))?;
-                Ok((description, agent))
-            });
-            match started {
-                Ok((label, agent)) => {
-                    let mut relay = Relay { task: call.id.clone(), label, sender: sender.clone() };
-                    relay.event(Event::Notice {
-                        text: format!("started; its log is {}", agent.session_log().display()),
-                    });
-                    children.push((i, relay, agent));
+            let task = match tools::task_arguments(call) {
+                Ok(task) => task,
+                Err(e) => {
+                    outputs[i] = Some(failed(&format!("the subagent did not start: {e}")));
+                    continue;
                 }
-                Err(e) => outputs[i] = Some(failed(&format!("the subagent did not start: {e}"))),
+            };
+            let running = self.background.load(Ordering::SeqCst);
+            if task.background && running >= settings.max_parallel.max(1) {
+                let subagents = match running {
+                    1 => "1 subagent is".to_owned(),
+                    n => format!("{n} subagents are"),
+                };
+                outputs[i] = Some(failed(&format!(
+                    "{subagents} already running in the background, the most there can be at \
+                     once. Wait for a report, or run this task without background."
+                )));
+                continue;
             }
+            let agent = match self.subagent(&task.description, &task.prompt) {
+                Ok(agent) => agent,
+                Err(e) => {
+                    outputs[i] = Some(failed(&format!("the subagent did not start: {e:#}")));
+                    continue;
+                }
+            };
+            let agent = if task.background {
+                let background = Background {
+                    task: call.id.clone(),
+                    label: task.description.clone(),
+                    agent: Box::new(agent),
+                    max_requests: settings.background_max_requests,
+                    _running: Running::new(&self.background),
+                };
+                match frontend.background(background) {
+                    Ok(()) => {
+                        outputs[i] = Some(ToolOutput {
+                            text: STARTED.into(),
+                            is_error: false,
+                            finish: None,
+                        });
+                        continue;
+                    }
+                    // A frontend that cannot run it in the background: it runs here, like any.
+                    Err(background) => *background.agent,
+                }
+            } else {
+                agent
+            };
+            let mut relay =
+                Relay { task: call.id.clone(), label: task.description, sender: sender.clone() };
+            relay.event(Event::Notice {
+                text: format!("started; its log is {}", agent.session_log().display()),
+            });
+            children.push((i, relay, agent));
         }
         drop(sender);
 
@@ -397,6 +567,22 @@ pub fn reply_request(
     })
 }
 
+/// Whether `error` is the server refusing a prompt too long for its context, and the prompt's size
+/// if it says. radiance and vLLM send OpenAI's `context_length_exceeded` with a 400, llama-server
+/// its own message; radiance's carries all of them (GUIDE.md §5.8).
+fn context_exceeded(error: &eidra_llm::Error) -> Option<Option<u64>> {
+    let eidra_llm::Error::Status { status: 400, body, .. } = error else {
+        return None;
+    };
+    let signs =
+        ["context_length_exceeded", "maximum context length", "exceeds the available context"];
+    if !signs.iter().any(|sign| body.contains(sign)) {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    Some(body["error"]["n_prompt_tokens"].as_u64())
+}
+
 /// A request's seed: fixed by the session and the request's number, and recorded with the reply,
 /// so that any request can be sent again and give the same reply (DESIGN.md §16.2).
 fn seed(session: &str, request: usize) -> u64 {
@@ -425,6 +611,10 @@ pub fn request_stats(turn: &AssistantTurn, seed: Option<u64>) -> RequestStats {
     }
 }
 
+/// What a `task` call with `background` returns.
+const STARTED: &str = "Started in the background. Its report will come as a message of its own when \
+                       it ends; meanwhile, go on with the user, and leave the files it works on alone.";
+
 /// A subagent's frontend: it passes what the subagent does to the agent that started it, and
 /// declines commands that need approval, since a subagent cannot ask the user.
 struct Relay {
@@ -439,14 +629,52 @@ impl Frontend for Relay {
     }
 
     async fn approve(&mut self, _approval: &Approval) -> Decision {
-        Decision::Deny {
-            note: Some(
-                "A subagent cannot ask the user to approve a command. Leave this step out, and \
-                 say in your summary which command is needed, so that the agent that started you \
-                 can run it."
-                    .into(),
-            ),
-        }
+        declined_for_subagent()
+    }
+}
+
+fn declined_for_subagent() -> Decision {
+    Decision::Deny {
+        note: Some(
+            "A subagent cannot ask the user to approve a command. Leave this step out, and say in \
+             your summary which command is needed, so that the agent that started you can run it."
+                .into(),
+        ),
+    }
+}
+
+impl Background {
+    pub fn interrupter(&self) -> Interrupter {
+        self.agent.interrupter()
+    }
+
+    /// Runs the subagent to its end and returns its report. `on_event` gets what it does, as
+    /// [`Event::Subagent`]. Commands that need approval are declined, as for any subagent.
+    pub async fn run(mut self, on_event: impl FnMut(Event)) -> Report {
+        let mut sink = Sink { task: self.task.clone(), label: self.label.clone(), on_event };
+        let log = self.agent.session_log().display().to_string();
+        sink.event(Event::Notice { text: format!("started in the background; its log is {log}") });
+        let result = self.agent.run(&mut sink, self.max_requests).await;
+        let output = report(&self.agent, result);
+        Report { task: self.task, label: self.label, text: output.text, is_error: output.is_error }
+    }
+}
+
+/// A background subagent's frontend.
+struct Sink<F> {
+    task: String,
+    label: String,
+    on_event: F,
+}
+
+impl<F: FnMut(Event)> Frontend for Sink<F> {
+    fn event(&mut self, event: Event) {
+        let (task, label) = (self.task.clone(), self.label.clone());
+        (self.on_event)(Event::Subagent { task, label, event: Box::new(event) });
+    }
+
+    async fn approve(&mut self, _approval: &Approval) -> Decision {
+        declined_for_subagent()
     }
 }
 
@@ -467,6 +695,7 @@ fn report(agent: &Agent, result: Result<Outcome>) -> ToolOutput {
         Ok(Outcome::Replied) => {
             failed(&format!("the subagent stopped without a summary. {unfinished}"))
         }
+        Ok(Outcome::Interrupted) => failed(&format!("the subagent was interrupted. {unfinished}")),
         Err(e) => failed(&format!("the subagent failed: {e:#}. {unfinished}")),
     }
 }

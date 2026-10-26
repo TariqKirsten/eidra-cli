@@ -40,8 +40,9 @@ enum Reply {
     Finish(String),
 }
 
-/// The definitions of the profile's tools, plus `finish` in a headless session. A subagent gets
-/// the profile's subagent tools, and never `task`: subagents do not start subagents.
+/// The definitions of the profile's tools: in an interactive session with its interactive ones
+/// too, and in a headless one with `finish`. A subagent gets the profile's subagent tools, and
+/// never `task`: subagents do not start subagents.
 pub fn definitions(profile: &Profile, headless: bool, subagent: bool) -> Result<Vec<Tool>> {
     let mut names = match (&profile.subagents.tools, subagent) {
         (Some(tools), true) => tools.clone(),
@@ -50,10 +51,21 @@ pub fn definitions(profile: &Profile, headless: bool, subagent: bool) -> Result<
     if subagent {
         names.retain(|name| name != "task");
     }
+    let interactive = !headless && !subagent;
+    if interactive {
+        for name in &profile.tools.interactive {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+    }
     if headless && !names.iter().any(|n| n == "finish") {
         names.push("finish".into());
     }
-    names.iter().map(|name| definition(name, profile.tools.descriptions.get(name))).collect()
+    names
+        .iter()
+        .map(|name| definition(name, profile.tools.descriptions.get(name), interactive))
+        .collect()
 }
 
 impl Toolbox {
@@ -192,10 +204,21 @@ pub(crate) fn resolve(workspace: &Path, path: &str) -> PathBuf {
     out
 }
 
-/// A `task` call's description and prompt.
-pub(crate) fn task_arguments(call: &ToolCall) -> Result<(String, String), String> {
+/// What a `task` call asks for.
+pub(crate) struct TaskCall {
+    pub description: String,
+    pub prompt: String,
+    /// The call returns at once, and the subagent reports later.
+    pub background: bool,
+}
+
+pub(crate) fn task_arguments(call: &ToolCall) -> Result<TaskCall, String> {
     let args = arguments(&call.function.arguments)?;
-    Ok((string(&args, "description")?.trim().to_owned(), string(&args, "prompt")?.to_owned()))
+    Ok(TaskCall {
+        description: string(&args, "description")?.trim().to_owned(),
+        prompt: string(&args, "prompt")?.to_owned(),
+        background: boolean(&args, "background")?.unwrap_or(false),
+    })
 }
 
 fn arguments(raw: &str) -> Result<Value, String> {
@@ -254,8 +277,9 @@ fn boolean(args: &Value, key: &str) -> Result<Option<bool>, String> {
     }
 }
 
-/// A tool's definition, with the profile's description if it gives one.
-fn definition(name: &str, description: Option<&String>) -> Result<Tool> {
+/// A tool's definition, with the profile's description if it gives one. In an interactive session,
+/// `task` can run in the background.
+fn definition(name: &str, description: Option<&String>, interactive: bool) -> Result<Tool> {
     let (default, properties, required): (&str, Value, &[&str]) = match name {
         "bash" => (
             "Run a bash command and return its output (stdout and stderr together) and exit code. The \
@@ -341,10 +365,16 @@ fn definition(name: &str, description: Option<&String>) -> Result<Tool> {
              Several task calls in one reply run at the same time; give each its own files to change. \
              Good uses: searching many files when only the answer matters, independent changes you \
              can describe completely, reviewing a change.",
-            json!({
-                "description": {"type": "string", "description": "A few words naming the task."},
-                "prompt": {"type": "string", "description": "The complete instructions for the subagent."}
-            }),
+            {
+                let mut properties = json!({
+                    "description": {"type": "string", "description": "A few words naming the task."},
+                    "prompt": {"type": "string", "description": "The complete instructions for the subagent."}
+                });
+                if interactive {
+                    properties["background"] = json!({"type": "boolean", "description": "Start the subagent in the background and return at once, so that you can go on with the user while it works. Its report comes later, as a message of its own. For work that takes a while; leave the files it works on alone until it reports."});
+                }
+                properties
+            },
             &["description", "prompt"],
         ),
         "finish" => (
@@ -388,13 +418,30 @@ mod tests {
     fn every_builtin_tool_has_a_definition() {
         let profile = Profile::builtin().unwrap();
         for name in profile.tools.enabled.iter().map(String::as_str).chain(["task", "finish"]) {
-            let tool = definition(name, None).unwrap();
+            let tool = definition(name, None, false).unwrap();
             assert_eq!(tool.function.name, name);
             assert_eq!(tool.function.parameters["type"], "object");
         }
-        assert!(definition("teleport", None).is_err());
-        let custom = definition("read", Some(&"Read it.".to_owned())).unwrap();
+        assert!(definition("teleport", None, false).is_err());
+        let custom = definition("read", Some(&"Read it.".to_owned()), false).unwrap();
         assert_eq!(custom.function.description, "Read it.");
+    }
+
+    #[test]
+    fn interactive_sessions_add_their_tools_and_a_background_task() {
+        let profile = Profile::builtin().unwrap();
+        let task = |tools: &[Tool]| tools.iter().find(|t| t.function.name == "task").cloned();
+        let interactive = definitions(&profile, false, false).unwrap();
+        let background =
+            &task(&interactive).unwrap().function.parameters["properties"]["background"];
+        assert_eq!(background["type"], "boolean");
+        // Unattended runs, the evals among them, keep the tool list they had.
+        let headless = definitions(&profile, true, false).unwrap();
+        assert!(task(&headless).is_none());
+        let names: Vec<&str> = headless.iter().map(|t| t.function.name.as_str()).collect();
+        let mut expected: Vec<&str> = profile.tools.enabled.iter().map(String::as_str).collect();
+        expected.push("finish");
+        assert_eq!(names, expected);
     }
 
     #[test]
@@ -404,6 +451,7 @@ mod tests {
         };
         let mut profile = Profile::builtin().unwrap();
         profile.tools.enabled = vec!["read".into(), "task".into()];
+        profile.tools.interactive.clear();
         assert_eq!(names(definitions(&profile, false, false).unwrap()), ["read", "task"]);
         assert_eq!(names(definitions(&profile, true, true).unwrap()), ["read", "finish"]);
         profile.subagents.tools = Some(vec!["grep".into(), "task".into()]);

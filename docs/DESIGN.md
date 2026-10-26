@@ -1,9 +1,10 @@
 # eidra: design
 
 Status, 2026-10-26: M0 and M1 are done. M2's runner and first suite are done; harder tasks and
-baselines are next. M3's subagents are built and wait for the harder suite to judge them. The
-probe confirmed R2–R5 on the live server (§3.1), `eidra exec` completed the ledger task unattended
-(§16.1), the first suite runs are in §16.2, and the first subagent run is in §16.3.
+baselines are next. M3's subagents are built and wait for the harder suite to judge them. M4's
+inline TUI is built (§12). The probe confirmed R2–R5 on the live server (§3.1), `eidra exec`
+completed the ledger task unattended (§16.1), the first suite runs are in §16.2, and the first
+subagent run is in §16.3.
 
 ## 1. What and why
 
@@ -26,7 +27,7 @@ embeddings or repo maps, and any security boundary beyond the container's.
 | | |
 |---|---|
 | Endpoint | `http://127.0.0.1:8000/v1` (llama-swap in front of radiance); key in `RADIANCE_API_KEY` |
-| Model | `qwen3.8-flash-next`, an alias of the llama-swap profile `qwen-assistant`: 225,280-token context, 4 sequences, vision |
+| Model | `qwen3.8-flash-next`, an alias of the llama-swap profile `qwen-assistant`: 262,144-token context (the model's trained length; 225,280 until 2026-10-26), 4 sequences, vision |
 | Architecture | hybrid linear-attention MoE on 2 × Radeon AI PRO R9700, tensor parallel 2 |
 | Prefill | 2.2–4.3K tok/s, depending on the PCIe link (probe: 2.7–3.7K tok/s on 3–7K-token chunks) |
 | Decode | ~110–130 tok/s for one stream on 512-token answers, and ~62–67 tok/s each with four at once (244 total). The probe saw 150–240 tok/s on short tool-call turns, where speculative decoding helps |
@@ -111,7 +112,8 @@ What this shows about radiance:
 
 Server-side settings for `qwen-assistant`, applied 2026-10-26 in `~/radiance/llama-swap.yaml`:
 - **40 snapshot slots.** At the old 24 GiB container limit, radiance could pin only 8 of the 40
-  that `auto` wants for 4 × 225K. Subagents and other sessions then evicted a parent's snapshots.
+  that `auto` wants for 4 full-length sessions. Subagents and other sessions then evicted a
+  parent's snapshots.
   The profile now gets 37 GiB (`RADIANCE_MEM_GIB`).
 - **An 8 GiB host tier** (`--prefix-cache-mib 8192`, about 574K tokens):
   - Without it, a cached conversation's VRAM counts as held and is never lent to the expert slab,
@@ -121,7 +123,8 @@ Server-side settings for `qwen-assistant`, applied 2026-10-26 in `~/radiance/lla
 - **A 4 h expiry** (`--prefix-cache-ttl 14400`). Eviction under memory pressure is
   least-recently-used whatever the expiry is. The expiry drops sessions nobody has come back to.
 - **Stay on `qwen-assistant`.** A request for another llama-swap profile unloads it, and the
-  reload takes about 35 s and starts with a cold cache. The TUI reports this as "model loading".
+  reload takes about 35 s and starts with a cold cache. The TUI shows the wait as "waiting for
+  the model".
 
 ## 4. Architecture
 
@@ -131,7 +134,7 @@ Server-side settings for `qwen-assistant`, applied 2026-10-26 in `~/radiance/lla
 |---|---|---|
 | `eidra-llm` | OpenAI-compatible client: types, SSE streaming, turn accumulation, radiance extras. Knows nothing about agents | M0 |
 | `eidra-core` | session log, agent loop, tools, confirmation policy, model profiles, context budget. Takes `Op`s, emits `Event`s | M1 |
-| `eidra-tui` | inline ratatui frontend | M4 |
+| `eidra-tui` | inline terminal frontend, drawn with crossterm | M4 |
 | `eidra` | the binary: `eidra` (TUI), `eidra exec` (headless), `eidra eval`, `eidra probe` | M0 on |
 
 The core never prints anything. Frontends send `Op`s (a user message, an approval, an
@@ -196,8 +199,10 @@ Later: LSP navigation (definition, references, hover), PDF page images and web f
 
 ### 5.1 Subagents (M3)
 
-`task` hands a self-contained piece of work to a subagent. It is off by default: adding `task` to
-the profile's tools turns it on, once the evals show where it helps (§16.3).
+`task` hands a self-contained piece of work to a subagent. Unattended runs, the evals among them,
+go without it until the evals show where it helps (§16.3); adding `task` to `[tools] enabled` turns
+it on there. Interactive sessions get it through `[tools] interactive`, with one more parameter,
+`background` (below).
 
 - **A subagent is a fresh, unattended agent** in the same workspace, with its own session log.
   The log's header names the parent session and the task. It gets the profile's tools, or
@@ -218,6 +223,27 @@ the profile's tools turns it on, once the evals show where it helps (§16.3).
 - **Frontends** see a subagent's events wrapped as `subagent` events, labelled with the task's
   description. Eval metrics add subagents' requests, tokens and tool calls to the attempt's totals,
   and count them.
+
+**In the background** (interactive sessions; the user asked for it on 2026-10-26, to have a
+calculator built "while we chat"):
+- A `task` call with `background` returns at once, saying the subagent has started. The frontend
+  runs the subagent while the user and the agent go on talking (`Frontend::background`); a
+  frontend that cannot hands it back, and it runs within the call as above.
+- At most `max_parallel` run in the background at once, each with `background_max_requests`
+  (150) rather than `max_requests`: it is a whole task, not a piece of a turn.
+- When one ends, its report reaches the agent as a message of its own, worded by
+  `[prompts] task_report` and appended like any other (R5, R6). It goes at once if the agent is
+  idle, so that the agent tells the user; at the end of a turn that is running; or, after an
+  interrupt, with the user's next message.
+- The TUI shows its steps under its label and counts it in the status line; `/tasks` lists them
+  and `/stop` stops them. `/new` stops the old session's, and their reports go nowhere.
+
+The first run was the user's own request, against Qwen. It started the subagent in the background
+and answered a question while it worked, as intended. But at 40 requests the subagent ran out
+before testing the 12 modules it wrote, and on that unfinished report the agent finished the task
+itself, in a long turn nobody had asked for. Hence the separate request limit, and the report's
+last line, which asks the agent to tell the user how it went and to ask before taking unfinished
+work up.
 
 ## 6. Bash
 
@@ -268,8 +294,17 @@ The policy guards against model mistakes. It is not a security boundary.
 
 ## 8. Context
 
-- **Compaction threshold:** the window is 225K tokens, but quality and latency fall off earlier.
-  The threshold is a profile setting, starting at 120K, tuned by evals.
+- **Context limit:** sessions stop at 256K tokens (`[context] limit`; 160K until 2026-10-26),
+  subagents' too. The server's window is 262,144 tokens, the model's trained length: raised from
+  225,280 the same day, with no RoPE scaling. It took no more memory: the KV pool is what the
+  experts leave either way (1.6 full-length sessions at once, about 417K tokens across them), and
+  radiance still keeps 40 snapshots. A near-full retrieval test passed (§16.4). Every request still
+  asks for `max_tokens` 32,768: past about 229K of prompt radiance cuts it to the room left rather
+  than refusing, so replies near the end get shorter, and one cut off at the window ends with
+  `finish_reason: "length"` (§5). A prompt that does not fit at all is refused with
+  `context_length_exceeded`, and that ends the session as reaching the limit does.
+- **Compaction threshold** (M6): quality and latency fall off well before the window's end, so
+  compaction will start earlier, at a profile setting tuned by evals, from around 120K.
 - **Compaction:** summarise with a prompt that keeps decisions, open work and exact details, then
   start a new conversation with the summary. That costs one cold prefill, about 30–55 s at 120K.
 - **Reasoning stays in history (R3)** and counts against the window. Evals decide the thinking
@@ -309,15 +344,76 @@ The policy guards against model mistakes. It is not a security boundary.
 
 ## 12. TUI (M4)
 
-The TUI renders inline, like Claude Code, using ratatui's `Viewport::Inline` and
-`Terminal::insert_before`. Finished cells go to the terminal's scrollback. The bottom region holds
-the streaming tail, the input box and a status line: model, context used against the limit, cache
-reuse, prefill and decode tok/s, and the current mode.
+`eidra` with no command starts an interactive session in the current directory. It takes exec's
+options (`--profile`, `-C`, `--base-url`, `--model`, `--session-dir`, `--confirm`) and refuses to
+start without a terminal. The session uses the profile's interactive prompt and has no `finish`
+tool: a reply without tool calls ends the turn.
 
-Keys:
-- Enter sends; Shift+Enter or Ctrl+J adds a newline.
-- Esc interrupts.
-- `/` opens commands, `@` the file picker and `!` the shell.
+**Rendering.** The TUI renders inline, like Claude Code, and draws with crossterm alone. ratatui
+was the plan, but ratatui-core 0.1.2 fixes an inline viewport's height when it is created, and the
+live region here grows and shrinks.
+- Finished output goes into the terminal's own scrollback, where the terminal scrolls, selects and
+  searches it.
+- A live region at the bottom is redrawn in place: move to its top, clear everything below, write
+  the newly finished lines, then the region again. Each draw is one synchronized update.
+- Between draws the cursor rests at the region's top-left, so a draw starts there without knowing
+  where on screen the region is. That also survives a terminal reflowing its contents on resize.
+- eidra wraps everything itself, measured with unicode-width, so it knows exactly how many rows a
+  draw takes. Live rows are wrapped one column short of the width, so the terminal never wraps
+  them, and the region stays shorter than the terminal, so its top is always on screen.
+- Raw mode, bracketed paste, and the kitty keyboard protocol's unambiguous keys where the terminal
+  has them, so that Shift+Enter is not Enter. Exiting or panicking restores the terminal.
+- Control characters in model or tool output are never written to the terminal.
+
+**The live region**, top to bottom:
+- the streaming tail: the reply as markdown, or its reasoning, dimmed, until the reply starts
+- a busy line: spinner, what the agent is doing, the turn's time, "esc to interrupt"
+- messages queued for the end of the turn
+- a command waiting for approval
+- the input box, under a rule
+- the status line: model · effort · background tasks running and reports waiting, if any · context
+  used/limit · cache % · prefill and decode tok/s, all from the last request
+
+**The scrollback** holds the user's messages, then for each request:
+- its reasoning as one line, "∴ thought for N tokens", or whole after Ctrl+T
+- its text as markdown, with the model's line breaks kept
+- each tool call in one line, and its result summarised and dimmed (red for an error)
+- todo lists as checklists, subagents' steps under their task's label, and notices
+- a background task's end, with its report summarised (§5.1)
+
+A step's reasoning, calls and results stay together; a blank line separates everything else.
+
+**Keys:**
+- Enter sends. While the agent works, the message is queued and sent when the turn ends.
+- Shift+Enter, Alt+Enter or Ctrl+J add a newline.
+- Esc interrupts. Ctrl+C interrupts when the agent works, else clears the input, else quits.
+  Ctrl+D quits when the input is empty.
+- Up and Down move between rows, and walk the history from the first or the last.
+- Ctrl+T shows reasoning whole or as one line.
+- An approval takes y (once), a (this command, for the rest of the session) or n. Keys that arrive
+  in the first 0.4 s are ignored, so that typing meant for the input box does not answer it.
+- Commands: `/help`, `/new`, `/tasks` and `/stop [n]` for background tasks, `/reasoning`, `/quit`
+  (or `/exit`). Quitting stops the turn and the background tasks first.
+
+**Interrupts.** The agent runs in a future that owns it and hands it back when the turn ends; it
+sends events and approval requests to the UI loop through a channel. Esc stops the run:
+- A reply cut off mid-stream leaves nothing in the log. The next message starts with the profile's
+  `interrupted` note. Without it the model saw its last request still unanswered and took it up
+  again: in the first smoke test it finished an interrupted count to 400 before the next task.
+- A tool call cut off gets an "interrupted" result, as do the calls after it, and a foreground
+  command's whole process group is stopped.
+- Messages queued during the turn go back to the input box.
+
+**Checks.** Beyond the unit tests, two scripts drive the binary in a pseudo-terminal and read its
+screen with a small terminal emulator:
+- `scripts/tui/offline.py` runs it against a fake server that streams scripted replies: typing and
+  commands, a reply with the status line's numbers, tool calls, an approval, an interrupt, a queued
+  message, a background task worked on during the chat, and SIGTERM. About 20 s, no GPU; run it
+  after any change to the TUI.
+- `scripts/tui/smoke.py` does the same against radiance, in about 30 s of GPU. It refuses to run
+  unless qwen-assistant is already loaded, since asking for it would unload whatever else is.
+
+Later: an `@` file picker, a `!` shell, and `--continue`/`--resume` (§14).
 
 Reference: codex-rs `tui`.
 
@@ -342,6 +438,18 @@ Reference: codex-rs `tui`.
   DNS, no route and nothing on loopback, so they cannot look things up, fetch a fix or install
   packages. Anything inside can still talk to the server through the socket, which is the one
   thing allowed. Evals run this way by default (`eidra eval run --network host` opts out).
+  - The vacuum is the container's network namespace, not a setting the agent can reach: there is
+    no flag, variable or file inside that turns it back on, because the network is simply not
+    there to turn on. `eidra eval vacuum-check` tests that claim. It runs a probe
+    (`eval/vacuum_probe.py`) in the very container an attempt's agent gets, and the probe tries
+    every way out we know of — DNS, the server's own port, the internet over TCP and UDP, making
+    an interface or a route, `unshare`/`nsenter` into another namespace, a Docker socket or CLI,
+    pointing eidra's own `--base-url` at the server over the network — and exits non-zero if any
+    worked. It checks both shapes of vacuum (`--network none`, and a Harbor container
+    disconnected from the bridge) and a `control` on the host's network, which must report a
+    leak, so that a probe passing everywhere cannot pass for a sealed vacuum. The relay stays a
+    pipe to one server, never a proxy: a request naming another host is still answered by the
+    model server (tested in `relay.rs`).
 - **TLS:** none yet, because radiance is plain http on localhost. The first https server brings
   rustls with the ring provider.
 
@@ -531,6 +639,22 @@ times larger. Three sequences side by side decoded about 240 tokens/s together, 
 for one, which did not make up for it. On a task this size, delegating costs more than it saves,
 as radiance's own five-agent demo found. The harder suite will show where it pays, if anywhere:
 larger codebases, and searches whose details the parent does not need.
+
+### 16.4 A 262,144-token context (2026-10-26)
+
+qwen-assistant's window went from 225,280 to 262,144 tokens, the model's trained length, with no
+RoPE scaling. Radiance's startup report, before and after:
+- The experts keep 22.36 GiB of each card either way.
+- The KV cache gets 3.34 GiB a card: 417,360 tokens of context, 1.6 full-length sessions at once
+  (1.8 at 225,280).
+- The snapshot store stays at 40 slots, 4.40 GiB pinned: geometric backoff keeps 9 a session at
+  either length.
+- The container uses 31.9 of its 37 GiB.
+
+A near-full retrieval test, as in radiance's October context tests: a 261,064-token archive with
+three access codes at 5%, 50% and 95%, sent cold. All three came back right. Prefill ran at
+4,218 tok/s, and the answer started after 62 s. (October's 224K test took 5 min 18 s, with
+512-token chunks on an older radiance.)
 
 ## 17. Open questions
 

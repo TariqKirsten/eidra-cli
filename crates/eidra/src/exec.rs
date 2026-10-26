@@ -6,12 +6,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use eidra_core::{
-    Agent, AgentOptions, Approval, Decision, Event, Frontend, Outcome, Profile, RequestStats,
-};
+use eidra_core::display::{describe_call, describe_stats, summarise};
+use eidra_core::{Agent, AgentOptions, Approval, Decision, Event, Frontend, Outcome, Profile};
 use serde_json::{Value, json};
-
-use crate::format::thousands;
 
 #[derive(Debug, Args)]
 pub struct ExecArgs {
@@ -22,6 +19,26 @@ pub struct ExecArgs {
     #[arg(long, value_name = "FILE")]
     task_file: Option<PathBuf>,
 
+    #[command(flatten)]
+    agent: AgentArgs,
+
+    /// Reach the model server through this Unix socket instead of the network, for an agent
+    /// with no network of its own (see `eidra relay`)
+    #[arg(long, env = "EIDRA_MODEL_SOCKET", value_name = "PATH")]
+    model_socket: Option<PathBuf>,
+
+    /// Stop after this many requests to the model
+    #[arg(long, default_value_t = 150)]
+    max_requests: usize,
+
+    /// Print events as JSON lines on stdout
+    #[arg(long)]
+    json: bool,
+}
+
+/// What an agent's session starts from, for `eidra exec` and the interactive `eidra`.
+#[derive(Debug, Args)]
+pub struct AgentArgs {
     /// The directory to work in [default: the current directory]
     #[arg(short = 'C', long, value_name = "DIR")]
     cwd: Option<PathBuf>,
@@ -38,56 +55,60 @@ pub struct ExecArgs {
     #[arg(long, env = "EIDRA_MODEL")]
     model: Option<String>,
 
-    /// Reach the model server through this Unix socket instead of the network, for an agent
-    /// with no network of its own (see `eidra relay`)
-    #[arg(long, env = "EIDRA_MODEL_SOCKET", value_name = "PATH")]
-    model_socket: Option<PathBuf>,
-
-    /// Stop after this many requests to the model
-    #[arg(long, default_value_t = 150)]
-    max_requests: usize,
-
     /// A command that needs approval, on top of the profile's; repeatable. An unattended run
     /// declines it
     #[arg(long = "confirm", value_name = "PATTERN")]
-    confirm: Vec<String>,
+    pub confirm: Vec<String>,
 
     /// Where session logs go [default: $XDG_DATA_HOME/eidra/sessions]
     #[arg(long, env = "EIDRA_SESSION_DIR", value_name = "DIR")]
     session_dir: Option<PathBuf>,
+}
 
-    /// Print events as JSON lines on stdout
-    #[arg(long)]
-    json: bool,
+impl AgentArgs {
+    /// The profile, with the server and model the command line gives.
+    pub fn profile(&self) -> Result<Profile> {
+        let mut profile = match &self.profile {
+            Some(dir) => Profile::load(dir)?,
+            None => Profile::builtin()?,
+        };
+        if let Some(url) = &self.base_url {
+            profile.base_url.clone_from(url);
+        }
+        if let Some(model) = &self.model {
+            profile.model.clone_from(model);
+        }
+        Ok(profile)
+    }
+
+    pub fn workspace(&self) -> Result<PathBuf> {
+        match &self.cwd {
+            Some(dir) => Ok(dir.clone()),
+            None => std::env::current_dir().context("the current directory"),
+        }
+    }
+
+    pub fn session_root(&self, workspace: &Path) -> PathBuf {
+        self.session_dir.clone().unwrap_or_else(|| default_session_dir(workspace))
+    }
 }
 
 /// Exit codes besides 0 (finished) and 1 (error).
 const REQUEST_LIMIT: i32 = 2;
 const CONTEXT_LIMIT: i32 = 3;
 const REPLIED: i32 = 4;
+/// As a shell reports a command stopped by Ctrl-C.
+const INTERRUPTED: i32 = 130;
 
 pub async fn run(args: ExecArgs) -> Result<i32> {
     let task = read_task(&args)?;
-    let mut profile = match &args.profile {
-        Some(dir) => Profile::load(dir)?,
-        None => Profile::builtin()?,
-    };
-    if let Some(url) = &args.base_url {
-        profile.base_url.clone_from(url);
-    }
-    if let Some(model) = &args.model {
-        profile.model.clone_from(model);
-    }
-    let workspace = match &args.cwd {
-        Some(dir) => dir.clone(),
-        None => std::env::current_dir().context("the current directory")?,
-    };
-    let session_root = args.session_dir.clone().unwrap_or_else(|| default_session_dir(&workspace));
+    let profile = args.agent.profile()?;
+    let workspace = args.agent.workspace()?;
     let options = AgentOptions {
+        session_root: args.agent.session_root(&workspace),
         workspace,
-        session_root,
         headless: true,
-        confirm: args.confirm.clone(),
+        confirm: args.agent.confirm.clone(),
         model_socket: args.model_socket.clone(),
     };
     let mut agent = Agent::start(profile, options)?;
@@ -102,6 +123,7 @@ pub async fn run(args: ExecArgs) -> Result<i32> {
         Outcome::RequestLimit => REQUEST_LIMIT,
         Outcome::ContextLimit(_) => CONTEXT_LIMIT,
         Outcome::Replied => REPLIED,
+        Outcome::Interrupted => INTERRUPTED,
     })
 }
 
@@ -193,6 +215,7 @@ impl Output {
                 Outcome::Replied => ("replied", Value::Null),
                 Outcome::RequestLimit => ("request_limit", Value::Null),
                 Outcome::ContextLimit(tokens) => ("context_limit", json!(tokens)),
+                Outcome::Interrupted => ("interrupted", Value::Null),
             };
             self.print_json(&json!({"type": "end", "outcome": kind, "detail": detail, "log": log}));
             return;
@@ -204,6 +227,7 @@ impl Output {
             Outcome::ContextLimit(tokens) => {
                 eprintln!("Stopped: the conversation reached {tokens} tokens.")
             }
+            Outcome::Interrupted => eprintln!("Interrupted."),
         }
     }
 
@@ -301,135 +325,5 @@ impl Frontend for Output {
                     .into(),
             ),
         }
-    }
-}
-
-pub(crate) fn describe_stats(stats: &RequestStats) -> String {
-    let mut parts = Vec::new();
-    if let Some(prompt) = stats.prompt_tokens {
-        let cached = stats.cached_tokens.unwrap_or(0);
-        let share = (100 * cached).checked_div(prompt).unwrap_or(0);
-        parts.push(format!("{} prompt ({share}% cached)", thousands(prompt)));
-    }
-    if let Some(out) = stats.completion_tokens {
-        match stats.reasoning_tokens {
-            Some(thinking) if thinking > 0 => {
-                parts.push(format!("{} out ({} thinking)", thousands(out), thousands(thinking)))
-            }
-            _ => parts.push(format!("{} out", thousands(out))),
-        }
-    }
-    if let Some(ttft) = stats.ttft_ms {
-        parts.push(format!("{:.1} s to first token", ttft / 1000.0));
-    }
-    if let Some(rate) = stats.decode_per_second {
-        parts.push(format!("{rate:.0} tok/s"));
-    }
-    if let Some(reason) =
-        stats.finish_reason.as_deref().filter(|r| *r != "tool_calls" && *r != "stop")
-    {
-        parts.push(format!("stopped: {reason}"));
-    }
-    parts.join(" · ")
-}
-
-/// A one-line description of a tool call.
-pub(crate) fn describe_call(name: &str, arguments: &str) -> String {
-    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
-    let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
-    let number = |key: &str| args.get(key).map(|v| v.to_string().trim_matches('"').to_owned());
-    match name {
-        "bash" => {
-            let command = text("command");
-            let mut line = clip(command.lines().next().unwrap_or_default(), 160);
-            if command.lines().count() > 1 {
-                line.push_str(" …");
-            }
-            let background = args.get("background").is_some_and(|b| b == true || b == "true");
-            format!("$ {line}{}", if background { "  (background)" } else { "" })
-        }
-        "read" => {
-            let range = match (number("offset"), number("limit")) {
-                (None, None) => String::new(),
-                (offset, limit) => format!(
-                    " (from line {}{})",
-                    offset.unwrap_or_else(|| "1".into()),
-                    limit.map(|l| format!(", {l} lines")).unwrap_or_default()
-                ),
-            };
-            format!("read {}{range}", text("path"))
-        }
-        "edit" => format!("edit {}", text("path")),
-        "write" => format!("write {} ({} lines)", text("path"), text("content").lines().count()),
-        "glob" => format!("glob {}", text("pattern")),
-        "grep" => format!("grep {} {}", text("pattern"), text("path")).trim_end().to_owned(),
-        "bash_output" | "bash_kill" => format!("{name} {}", number("id").unwrap_or_default()),
-        "task" => format!("task: {}", text("description")),
-        "todo" | "finish" => name.to_owned(),
-        _ => format!("{name} {}", clip(arguments, 160)),
-    }
-}
-
-/// The first line of a tool's output, and how many more there are.
-fn summarise(output: &str) -> String {
-    let lines = output.lines().count();
-    let first = clip(output.lines().next().unwrap_or("(no output)"), 140);
-    if lines > 1 { format!("{first}  (+{} lines)", lines - 1) } else { first }
-}
-
-fn clip(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_owned()
-    } else {
-        format!("{}…", text.chars().take(max).collect::<String>())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn describes_calls_in_one_line() {
-        assert_eq!(
-            describe_call("bash", r#"{"command": "cd x && make\nmake test"}"#),
-            "$ cd x && make …"
-        );
-        assert_eq!(
-            describe_call("bash", r#"{"command": "serve", "background": true}"#),
-            "$ serve  (background)"
-        );
-        assert_eq!(
-            describe_call("read", r#"{"path": "a.py", "offset": 40}"#),
-            "read a.py (from line 40)"
-        );
-        assert_eq!(
-            describe_call("write", r#"{"path": "a.py", "content": "x\ny\n"}"#),
-            "write a.py (2 lines)"
-        );
-        assert_eq!(describe_call("grep", r#"{"pattern": "def main"}"#), "grep def main");
-        assert_eq!(
-            describe_call("task", r#"{"description": "find the parser", "prompt": "…"}"#),
-            "task: find the parser"
-        );
-    }
-
-    #[test]
-    fn summarises_output_and_stats() {
-        assert_eq!(summarise("one\ntwo\nthree"), "one  (+2 lines)");
-        let stats = RequestStats {
-            prompt_tokens: Some(12_000),
-            cached_tokens: Some(9_000),
-            completion_tokens: Some(300),
-            reasoning_tokens: Some(120),
-            ttft_ms: Some(1_250.0),
-            decode_per_second: Some(118.4),
-            finish_reason: Some("tool_calls".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            describe_stats(&stats),
-            "12,000 prompt (75% cached) · 300 out (120 thinking) · 1.2 s to first token · 118 tok/s"
-        );
     }
 }

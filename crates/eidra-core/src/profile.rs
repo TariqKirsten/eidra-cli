@@ -72,6 +72,10 @@ impl Default for ContextSettings {
 #[serde(deny_unknown_fields)]
 pub struct ToolSettings {
     pub enabled: Vec<String>,
+    /// Tools added in interactive sessions, where the user can go on talking to the agent while a
+    /// subagent works in the background.
+    #[serde(default)]
+    pub interactive: Vec<String>,
     /// Characters of one tool result the model sees; longer output is cut and saved whole.
     pub output_limit: usize,
     /// Replacement descriptions, by tool name.
@@ -95,6 +99,10 @@ pub struct SubagentSettings {
     pub max_parallel: usize,
     /// Requests each subagent may make before it is stopped.
     pub max_requests: usize,
+    /// The same for a subagent in the background: a whole task, done while the user talks to the
+    /// agent, rather than a piece of a turn.
+    #[serde(default = "background_max_requests")]
+    pub background_max_requests: usize,
     /// The tools a subagent gets; unset, the main agent's, without `task`.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
@@ -102,8 +110,17 @@ pub struct SubagentSettings {
 
 impl Default for SubagentSettings {
     fn default() -> Self {
-        SubagentSettings { max_parallel: 3, max_requests: 40, tools: None }
+        SubagentSettings {
+            max_parallel: 3,
+            max_requests: 40,
+            background_max_requests: background_max_requests(),
+            tools: None,
+        }
     }
+}
+
+fn background_max_requests() -> usize {
+    150
 }
 
 /// What the model is told beyond the system prompt template.
@@ -120,6 +137,10 @@ pub struct Prompts {
     pub cut_off: String,
     /// Sent in an unattended session when a reply calls no tool.
     pub no_tool_call: String,
+    /// Starts the user's next message after they stopped a reply before it was finished.
+    pub interrupted: String,
+    /// Brings a background subagent's report; `{task}` is its description, `{report}` the report.
+    pub task_report: String,
 }
 
 impl Profile {

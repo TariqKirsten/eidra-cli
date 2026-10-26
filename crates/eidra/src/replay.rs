@@ -13,7 +13,7 @@ use eidra_core::{Log, Profile, fnv1a, reply_request, request_stats};
 use eidra_llm::{AssistantMessage, Client, Message};
 use serde_json::json;
 
-use crate::exec::{describe_call, describe_stats};
+use eidra_core::display::{describe_call, describe_stats};
 
 #[derive(Debug, Args)]
 pub struct ReplayArgs {

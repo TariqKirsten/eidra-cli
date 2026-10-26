@@ -168,6 +168,8 @@ impl Shell {
             .spawn()
             .map_err(|e| format!("could not start bash: {e}"))?;
         let pgid = child.id().map(|pid| pid as i32);
+        // If this future is dropped (the user interrupted the agent), the group goes too.
+        let mut guard = GroupGuard(pgid);
         let mut stdout = child.stdout.take().expect("stdout is piped");
         let mut capture = Capture::default();
 
@@ -181,7 +183,7 @@ impl Shell {
                 }
                 Ok(Err(e)) => return Err(format!("reading the command's output failed: {e}")),
                 Err(_) => {
-                    if let Some(pgid) = pgid {
+                    if let Some(pgid) = guard.0.take() {
                         stop_group(pgid).await;
                     }
                     let _ = child.wait().await;
@@ -191,6 +193,7 @@ impl Shell {
                     ))
                 }
             };
+        guard.0 = None;
         let output = clean_terminal_output(&capture.into_string());
         let output = output.trim_end();
         Ok(match (output.is_empty(), status) {
@@ -334,6 +337,31 @@ async fn collect(
 }
 
 /// SIGTERM to the whole group, then SIGKILL if it is still there after a moment.
+/// Stops a foreground command's process group if the command is abandoned before it ends:
+/// `kill_on_drop` stops only bash, not what the command started.
+struct GroupGuard(Option<i32>);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        let Some(pgid) = self.0 else {
+            return;
+        };
+        // SAFETY: killpg only sends signals, to a process group this shell created.
+        unsafe { libc::killpg(pgid, libc::SIGTERM) };
+        // What ignores SIGTERM is killed a little later, if a runtime is still there to do it.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                // SAFETY: as above; signal 0 only checks that the group still exists.
+                if unsafe { libc::killpg(pgid, 0) } == 0 {
+                    // SAFETY: as above.
+                    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+                }
+            });
+        }
+    }
+}
+
 async fn stop_group(pgid: i32) {
     // SAFETY: killpg only sends signals, to a process group this shell created.
     unsafe { libc::killpg(pgid, libc::SIGTERM) };

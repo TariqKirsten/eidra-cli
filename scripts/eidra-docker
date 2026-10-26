@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Runs eidra in its container on the current directory: the interactive session with no arguments,
+# or any eidra command (scripts/eidra-docker exec "make the tests pass"). Build the image first:
+# docker build -t eidra .
+#
+# The directory is mounted at the same path, so paths read the same inside and out. Session logs
+# go to the host's ~/.local/share/eidra and uv's cache to ~/.cache/uv. Commands run as you, so
+# files the agent writes are yours. The host's network is shared, since radiance listens on the
+# host's localhost.
+set -euo pipefail
+
+image=${EIDRA_IMAGE:-eidra}
+data=${XDG_DATA_HOME:-$HOME/.local/share}
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/uv
+mkdir -p "$data/eidra" "$cache"
+
+args=(
+  --rm -i --network host
+  --user "$(id -u):$(id -g)"
+  -v "$PWD:$PWD" -w "$PWD"
+  -v "$data/eidra:$data/eidra" -e "XDG_DATA_HOME=$data"
+  -v "$cache:$cache" -e "UV_CACHE_DIR=$cache"
+  -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e EIDRA_MODEL
+)
+if [ -t 0 ] && [ -t 1 ]; then
+  args+=(-t)
+fi
+# Your git identity, so the agent's commits are yours.
+if [ -f "$HOME/.gitconfig" ]; then
+  args+=(-v "$HOME/.gitconfig:/home/eidra/.gitconfig:ro")
+fi
+# A profile directory of your own goes in read-only.
+if [ -n "${EIDRA_PROFILE:-}" ]; then
+  profile=$(cd "$EIDRA_PROFILE" && pwd)
+  args+=(-v "$profile:$profile:ro" -e "EIDRA_PROFILE=$profile")
+fi
+
+exec docker run "${args[@]}" "$image" "$@"

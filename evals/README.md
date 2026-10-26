@@ -11,6 +11,7 @@ the profile can be judged by numbers rather than by impression (docs/DESIGN.md �
     eidra eval report evals/runs/<run>         # print a recorded run again
     eidra eval compare evals/runs/<a> evals/runs/<b>
     eidra eval regrade evals/runs/<run>        # rerun fixed checks on what the attempts left
+    eidra eval vacuum-check                     # check the sandbox itself, not the model
 
 ## How an attempt runs
 
@@ -27,6 +28,24 @@ the profile can be judged by numbers rather than by impression (docs/DESIGN.md �
 Each attempt keeps its session log (`sessions/`), its JSON events (`events.jsonl`), the
 workspace as the agent left it (`work/`) and each check's output (`checks/`). `results.jsonl`
 has one line per attempt.
+
+## Checking the vacuum
+
+The vacuum (docs/DESIGN.md §13) is what stops a task's agent from reaching anything but the
+model: no setting inside the container turns the network back on, because the network is not
+there. `eidra eval vacuum-check` tests that, standing in for the agent. It runs a probe in the
+same container an attempt gets and has it try every way out — DNS, the model server's own port,
+the internet, making an interface or route, `unshare`/`nsenter`, a Docker socket, and pointing
+eidra's `--base-url` at the server over the network. The probe exits non-zero if any worked.
+
+    eidra eval vacuum-check              # none, disconnected, and a control, in turn
+    eidra eval vacuum-check --mode none  # just the agent's --network none container
+    eidra eval vacuum-check --out dir/   # keep the probe's per-mode logs
+
+It checks both shapes of vacuum — a suite task's `--network none` container, and a Harbor task's
+container disconnected from the bridge — and a `control` on the host's network, which *must*
+find a way out: a probe that passed everywhere would prove nothing. The command exits non-zero
+if any vacuum leaked or the control did not, so it belongs in CI.
 
 ## Writing a task
 

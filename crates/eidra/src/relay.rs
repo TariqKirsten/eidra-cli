@@ -99,6 +99,55 @@ mod tests {
         assert!(target_of("http:///v1").is_err());
     }
 
+    /// Whatever an agent in a vacuum asks for, the relay hands it to the one server it was
+    /// pointed at: a Host header or an absolute URL names another host, and that host never sees
+    /// the request. This is the only way out of a vacuum, so it has to stay a pipe, not a proxy.
+    #[tokio::test]
+    async fn a_request_for_another_host_still_goes_to_the_server() {
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = server.local_addr().unwrap().to_string();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        tokio::spawn({
+            let seen = std::sync::Arc::clone(&seen);
+            async move {
+                loop {
+                    let (mut conn, _) = server.accept().await.unwrap();
+                    let seen = std::sync::Arc::clone(&seen);
+                    tokio::spawn(async move {
+                        let mut request = vec![0u8; 1024];
+                        let read = conn.read(&mut request).await.unwrap();
+                        request.truncate(read);
+                        seen.lock().await.push(String::from_utf8_lossy(&request).into_owned());
+                        conn.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .unwrap();
+                    });
+                }
+            }
+        });
+        let socket =
+            std::env::temp_dir().join(format!("eidra-relay-proxy-{}.sock", std::process::id()));
+        let relay = tokio::spawn({
+            let socket = socket.clone();
+            async move { serve(&socket, &target).await }
+        });
+        while !socket.exists() {
+            tokio::task::yield_now().await;
+        }
+        let mut client = UnixStream::connect(&socket).await.unwrap();
+        client
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = [0u8; 14];
+        client.read_exact(&mut reply).await.unwrap();
+        // The answer came from the server the relay was pointed at, whoever the request named.
+        assert_eq!(&reply, b"HTTP/1.1 404 N");
+        assert_eq!(seen.lock().await.len(), 1);
+        relay.abort();
+        let _ = std::fs::remove_file(&socket);
+    }
+
     #[tokio::test]
     async fn forwards_a_socket_to_a_port() {
         let server = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -3,3 +3,5 @@ dist
 .git
 .claude
 evals/runs
+evals/harbor
+**/__pycache__

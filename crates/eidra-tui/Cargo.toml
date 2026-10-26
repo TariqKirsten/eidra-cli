@@ -1,0 +1,20 @@
+[package]
+name = "eidra-tui"
+description = "eidra's interactive frontend: inline, in the terminal's own scrollback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+eidra-core.workspace = true
+futures-util.workspace = true
+pulldown-cmark.workspace = true
+# Signals, to quit cleanly when the terminal closes or eidra is told to stop.
+tokio = { workspace = true, features = ["signal"] }
+unicode-width.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

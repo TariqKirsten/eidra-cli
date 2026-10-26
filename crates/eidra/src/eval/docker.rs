@@ -54,6 +54,25 @@ impl Container {
         self
     }
 
+    /// The `docker run` arguments for `command`, in one place so that tests can read them: a
+    /// container's network, and what it may reach, is what `eidra eval vacuum-check` checks.
+    pub(super) fn args(&self, name: &str, command: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = ["run", "--rm", "--init"].map(String::from).to_vec();
+        args.extend(["--name".into(), name.to_owned()]);
+        args.extend(["--network".into(), self.network.to_owned()]);
+        args.extend(["--user".into(), user()]);
+        args.extend(["-e".into(), "HOME=/tmp".into(), "-w".into(), "/work".into()]);
+        for mount in &self.mounts {
+            args.extend(["-v".into(), mount.clone()]);
+        }
+        for var in &self.env {
+            args.extend(["-e".into(), var.clone()]);
+        }
+        args.push(self.image.clone());
+        args.extend(command.iter().map(|arg| (*arg).to_owned()));
+        args
+    }
+
     /// Runs `command` in /work, stopping the container after `timeout`. Stderr goes to `stderr`, or
     /// with stdout to `stdout` when that is `None`.
     pub async fn run(
@@ -75,27 +94,8 @@ impl Container {
             }
             None => out.try_clone()?,
         };
-        let user = user();
         let mut cmd = Command::new("docker");
-        cmd.args([
-            "run",
-            "--rm",
-            "--init",
-            "--name",
-            &name,
-            "--network",
-            self.network,
-            "--user",
-            &user,
-        ]);
-        cmd.args(["-e", "HOME=/tmp", "-w", "/work"]);
-        for mount in &self.mounts {
-            cmd.args(["-v", mount]);
-        }
-        for var in &self.env {
-            cmd.args(["-e", var]);
-        }
-        cmd.arg(&self.image).args(command);
+        cmd.args(self.args(&name, command));
         cmd.stdin(Stdio::null()).stdout(out).stderr(err).kill_on_drop(true);
 
         let started = Instant::now();
@@ -142,4 +142,36 @@ pub fn copy_dir(from: &Path, to: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A container with no network gets none: the flag is what the vacuum rests on, so it is
+    /// worth pinning here as well as in the live check (`eidra eval vacuum-check`).
+    #[test]
+    fn a_container_passes_its_network_to_docker() {
+        let args = Container::new("python:3.13-slim", "none").args("c", &["true"]);
+        assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
+        assert_eq!(args.last().unwrap(), "true");
+        assert!(args.contains(&"python:3.13-slim".to_owned()));
+    }
+
+    #[test]
+    fn mounts_and_variables_reach_the_command() {
+        let args = Container::new("img", "none")
+            .mount(Path::new("/tmp/work"), "/work", false)
+            .mount(Path::new("/tmp/check"), "/check", true)
+            .set_env("A", "1")
+            .pass_env("B")
+            .args("c", &["sh", "-c", "echo hi"]);
+        assert!(args.windows(2).any(|pair| pair == ["-v", "/tmp/work:/work"]));
+        assert!(args.windows(2).any(|pair| pair == ["-v", "/tmp/check:/check:ro"]));
+        assert!(args.windows(2).any(|pair| pair == ["-e", "A=1"]));
+        assert!(args.windows(2).any(|pair| pair == ["-e", "B"]));
+        // Everything after the image is the command, untouched.
+        let image = args.iter().position(|arg| arg == "img").unwrap();
+        assert_eq!(&args[image + 1..], ["sh", "-c", "echo hi"]);
+    }
 }

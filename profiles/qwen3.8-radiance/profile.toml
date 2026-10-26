@@ -21,13 +21,20 @@ parallel_tool_calls = true
 [request.extra]
 
 [context]
-# Prompt tokens past which a session stops (M1) or compacts (M6).
-limit = 160000
+# Prompt tokens past which a session stops (M1) or compacts (M6); subagents' too. The server's
+# window is 262,144, the model's trained length. Near its end radiance cuts max_tokens to the room
+# left rather than refusing, so replies get shorter, and a prompt that no longer fits at all ends
+# the session as the limit does (DESIGN.md §8).
+limit = 256000
 
 [tools]
 # Add "task" to let the model hand work to subagents ([subagents] below). It stays off until the
 # evals show it helps (DESIGN.md §5.1).
 enabled = ["bash", "bash_output", "bash_kill", "read", "edit", "write", "glob", "grep", "todo"]
+# Added in interactive sessions only. There "task" can also start a subagent in the background,
+# and the user goes on talking to the agent while it works (DESIGN.md §5.1). Unattended runs, the
+# evals among them, go without.
+interactive = ["task"]
 # Characters of one tool result the model sees; longer output is cut in the middle and saved whole.
 output_limit = 30000
 
@@ -40,6 +47,9 @@ output_limit = 30000
 max_parallel = 3
 # Requests each subagent may make before it is stopped.
 max_requests = 40
+# The same for a subagent started in the background, which does a whole task while the user talks
+# to the agent. At 40, the first one Qwen started (a calculator) ran out before testing its work.
+background_max_requests = 150
 # The tools a subagent gets; unset, the main agent's without "task". A read-only list makes
 # explorers instead of workers.
 # tools = ["read", "glob", "grep", "bash"]
@@ -73,3 +83,10 @@ Another agent gave you this task and is waiting for your result. Nobody else is 
 cut_off = "Your last reply reached the {max_tokens}-token limit and was cut off, so its last tool call was not run. Write large files in smaller parts, or change them with edit."
 # Sent in an unattended session when a reply calls no tool.
 no_tool_call = "Call a tool: carry on with the task, or call finish if it is complete."
+# Starts the user's next message after they stopped a reply before it was finished. Without it the
+# model sees the request it was stopped on still unanswered, and takes it up again.
+interrupted = "[The user interrupted you before you finished your last reply, and it was discarded.]"
+# Brings a background subagent's report, as a message of its own once it ends. {task} is replaced
+# with the task's description and {report} with what the subagent reported. Without the last
+# sentence, an unfinished report had the agent finish the task itself, a long turn nobody asked for.
+task_report = "[The background task \"{task}\" has ended. Its report:]\n\n{report}\n\n[Tell the user how it went. If it did not finish, say what is left, and ask before you take it up yourself.]"

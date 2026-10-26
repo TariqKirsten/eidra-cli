@@ -15,6 +15,7 @@ mod metrics;
 mod report;
 mod select;
 mod task;
+mod vacuum;
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -70,6 +71,9 @@ enum EvalCommand {
     },
     /// Make a suite of some of a downloaded Harbor dataset's tasks, by language and date
     Select(select::SelectArgs),
+    /// Check the vacuum itself: run a probe in the container an agent gets and make sure it
+    /// cannot reach anything but the model
+    VacuumCheck(vacuum::VacuumArgs),
 }
 
 #[derive(Debug, Args)]
@@ -221,6 +225,7 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
         EvalCommand::Validate(selection) => validate(&selection).await,
         EvalCommand::Regrade { run, suite } => regrade(&run, &suite).await,
         EvalCommand::Select(args) => select::run(&args),
+        EvalCommand::VacuumCheck(args) => vacuum::run(args).await,
     }
 }
 
@@ -389,22 +394,17 @@ async fn run_attempt(context: &RunContext, task: &Task, repeat: u32) -> Result<A
         "--max-requests",
         &max_requests,
     ];
-    let network = if context.model_socket.is_some() { "none" } else { "host" };
-    let mut agent = Container::new(&task.spec.image, network)
-        .mount(&context.binary, "/usr/local/bin/eidra", true)
-        .mount(&work, "/work", false)
-        .mount(&sessions, "/sessions", false);
-    if let Some(socket) = &context.model_socket {
-        agent = agent
-            .mount(socket, harbor::SOCKET_IN_CONTAINER, false)
-            .set_env("EIDRA_MODEL_SOCKET", harbor::SOCKET_IN_CONTAINER);
-    }
-    if let Some(profile) = &context.profile_dir {
-        agent = agent.mount(profile, "/profile", true);
+    let agent = agent_container(
+        &task.spec.image,
+        &context.binary,
+        &work,
+        &sessions,
+        context.model_socket.as_deref(),
+        context.profile_dir.as_deref(),
+        context.api_key_env.as_deref(),
+    );
+    if context.profile_dir.is_some() {
         command.extend(["--profile", "/profile"]);
-    }
-    if let Some(var) = &context.api_key_env {
-        agent = agent.pass_env(var);
     }
     command.push(&task.spec.prompt);
     let timeout = Duration::from_secs(task.spec.timeout_s);
@@ -425,6 +425,37 @@ async fn run_attempt(context: &RunContext, task: &Task, repeat: u32) -> Result<A
         wall_s: finished.seconds,
         metrics,
     })
+}
+
+/// The container an attempt's agent runs in. The vacuum lives here: with a model socket the
+/// container gets no network at all, and the socket is the only way out of it. `eidra eval
+/// vacuum-check` tests this same container, so that what it checks is what agents get.
+pub(super) fn agent_container(
+    image: &str,
+    binary: &Path,
+    work: &Path,
+    sessions: &Path,
+    model_socket: Option<&Path>,
+    profile_dir: Option<&Path>,
+    api_key_env: Option<&str>,
+) -> Container {
+    let network = if model_socket.is_some() { "none" } else { "host" };
+    let mut agent = Container::new(image, network)
+        .mount(binary, "/usr/local/bin/eidra", true)
+        .mount(work, "/work", false)
+        .mount(sessions, "/sessions", false);
+    if let Some(socket) = model_socket {
+        agent = agent
+            .mount(socket, harbor::SOCKET_IN_CONTAINER, false)
+            .set_env("EIDRA_MODEL_SOCKET", harbor::SOCKET_IN_CONTAINER);
+    }
+    if let Some(profile) = profile_dir {
+        agent = agent.mount(profile, "/profile", true);
+    }
+    if let Some(var) = api_key_env {
+        agent = agent.pass_env(var);
+    }
+    agent
 }
 
 /// Runs a task's checks on a copy of `workspace`, logging each to `dir/checks/<name>.log`.
@@ -617,4 +648,59 @@ fn sanitize(label: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '-' })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_of(socket: Option<&Path>) -> Vec<String> {
+        agent_container(
+            "python:3.13-slim",
+            Path::new("/usr/bin/eidra"),
+            Path::new("/tmp/work"),
+            Path::new("/tmp/sessions"),
+            socket,
+            Some(Path::new("/tmp/profile")),
+            Some("RADIANCE_API_KEY"),
+        )
+        .args("probe", &["eidra", "exec"])
+    }
+
+    /// The vacuum: with a model socket the agent's container gets no network, reaches the model
+    /// only through the socket, and gets nothing it could use to give itself a network again.
+    /// `eidra eval vacuum-check` checks the same container for real.
+    #[test]
+    fn a_vacuum_leaves_only_the_model_socket() {
+        let args = args_of(Some(Path::new("/run/eidra-model.sock")));
+        assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
+        assert!(!args.iter().any(|arg| arg.contains("--network=host")));
+        let mounts: Vec<&String> =
+            args.windows(2).filter(|pair| pair[0] == "-v").map(|pair| &pair[1]).collect();
+        assert_eq!(
+            mounts,
+            [
+                "/usr/bin/eidra:/usr/local/bin/eidra:ro",
+                "/tmp/work:/work",
+                "/tmp/sessions:/sessions",
+                &format!("/run/eidra-model.sock:{}", harbor::SOCKET_IN_CONTAINER),
+                "/tmp/profile:/profile:ro",
+            ]
+        );
+        assert!(!mounts.iter().any(|mount| mount.contains("docker.sock")));
+        assert!(!args.iter().any(|arg| arg == "--privileged" || arg.starts_with("--cap-add")));
+        assert!(
+            args.windows(2).any(|pair| pair
+                == ["-e", &format!("EIDRA_MODEL_SOCKET={}", harbor::SOCKET_IN_CONTAINER)])
+        );
+    }
+
+    /// Without a socket there is nothing to relay through, so the agent is on the host's network
+    /// and the vacuum's checks would mean nothing: `--network host` is the opt-out.
+    #[test]
+    fn without_a_socket_the_agent_is_on_the_hosts_network() {
+        let args = args_of(None);
+        assert!(args.windows(2).any(|pair| pair == ["--network", "host"]));
+        assert!(!args.iter().any(|arg| arg.contains("EIDRA_MODEL_SOCKET")));
+    }
 }

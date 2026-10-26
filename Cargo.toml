@@ -11,8 +11,11 @@ publish = false
 [workspace.dependencies]
 eidra-core = { path = "crates/eidra-core" }
 eidra-llm = { path = "crates/eidra-llm" }
+eidra-tui = { path = "crates/eidra-tui" }
 anyhow = "1.0.104"
 clap = { version = "4.6", features = ["derive", "env"] }
+# The TUI draws with crossterm alone: ratatui's inline viewport cannot change height (DESIGN.md §12).
+crossterm = { version = "0.29", default-features = false, features = ["bracketed-paste", "event-stream"] }
 # join_all, for subagents running side by side; reqwest already builds it.
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 globset = "0.4.20"
@@ -20,6 +23,7 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "0.4.33"
 libc = "0.2.191"
+pulldown-cmark = { version = "0.13.5", default-features = false }
 # Plain http only for now: radiance is on localhost. TLS (rustls with ring) comes with the first
 # https server (docs/DESIGN.md §13).
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
@@ -30,6 +34,7 @@ tokio = { version = "1.54", features = ["io-util", "macros", "net", "process", "
 toml = "0.9.8"
 tree-sitter = "0.27.1"
 tree-sitter-bash = "0.25.1"
+unicode-width = "0.2.2"
 
 [profile.release]
 lto = "thin"
