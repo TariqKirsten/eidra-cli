@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Runs cargo in the pinned Rust image, so the host needs only Docker.
+# Downloads are cached in ~/.cache/eidra/cargo and build output goes to ./target. The binaries are
+# static (musl) and run on the host too.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Tagged by the Dockerfile's contents, so editing it builds a fresh image.
+image=eidra-dev:$(sha256sum "$root/scripts/dev.Dockerfile" | cut -c1-12)
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/eidra/cargo
+mkdir -p "$cache"
+
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  echo "building $image..." >&2
+  docker build -q -t "$image" -f "$root/scripts/dev.Dockerfile" "$root/scripts" >/dev/null
+fi
+
+tty=()
+if [ -t 0 ] && [ -t 1 ]; then tty=(-t); fi
+
+# --network host lets `scripts/cargo run -- probe` reach a server on the host's localhost.
+exec docker run --rm -i "${tty[@]}" \
+  --network host \
+  --user "$(id -u):$(id -g)" \
+  -e CARGO_HOME=/cargo -e HOME=/tmp \
+  -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e EIDRA_MODEL \
+  -v "$cache:/cargo" -v "$root:/src" -w /src \
+  "$image" cargo "$@"

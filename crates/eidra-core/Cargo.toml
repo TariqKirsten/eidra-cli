@@ -1,0 +1,22 @@
+[package]
+name = "eidra-core"
+description = "eidra's agent: session log, loop, tools and confirmation policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+eidra-llm.workspace = true
+globset.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+ignore.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tree-sitter.workspace = true
+tree-sitter-bash.workspace = true

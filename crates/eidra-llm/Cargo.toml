@@ -1,0 +1,13 @@
+[package]
+name = "eidra-llm"
+description = "OpenAI-compatible chat client for eidra, with radiance's extensions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

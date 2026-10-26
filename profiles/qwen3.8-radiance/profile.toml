@@ -1,0 +1,52 @@
+# Qwen3.8 Flash-Next served by radiance (docs/DESIGN.md §2–§5). Everything here is a tuning knob:
+# change it, run the evals, keep what wins.
+name = "qwen3.8-radiance"
+base_url = "http://127.0.0.1:8000/v1"
+model = "qwen3.8-flash-next"
+api_key_env = "RADIANCE_API_KEY"
+
+[request]
+# Counts the reasoning too, so it leaves room for a large file write.
+max_tokens = 16384
+# Fixed for the whole session: low and xhigh rewrite the start of the system prompt (DESIGN.md §3, R2).
+reasoning_effort = "medium"
+thinking_budget = 2048
+parallel_tool_calls = true
+
+# Other request fields, sent as given. Unset ones use the model's generation config on the server.
+[request.extra]
+
+[context]
+# Prompt tokens past which a session stops (M1) or compacts (M6).
+limit = 160000
+
+[tools]
+enabled = ["bash", "bash_output", "bash_kill", "read", "edit", "write", "glob", "grep", "todo"]
+# Characters of one tool result the model sees; longer output is cut in the middle and saved whole.
+output_limit = 30000
+
+# Replacement tool descriptions, by tool name.
+[tools.descriptions]
+
+[confirm]
+# Commands that need the user's go-ahead: "git" covers every git command, "git push" only pushes.
+commands = []
+
+# What the model is told beyond system.md.
+[prompts]
+# Replaces {{mode}} in system.md in an unattended session.
+headless = """
+
+# Finishing
+Nobody is watching this session, and nobody can answer questions. Make reasonable assumptions and keep going until the task is done. Every reply must call a tool. When the task is complete and checked, call `finish` with a short summary of what you changed and how you checked it.
+"""
+# Replaces {{mode}} when a person is in the loop.
+interactive = """
+
+# Replying
+When you have done what was asked, reply with a short summary of what you changed and how you checked it.
+"""
+# Sent when a reply stops at max_tokens; {max_tokens} is replaced.
+cut_off = "Your last reply reached the {max_tokens}-token limit and was cut off, so its last tool call was not run. Write large files in smaller parts, or change them with edit."
+# Sent in an unattended session when a reply calls no tool.
+no_tool_call = "Call a tool: carry on with the task, or call finish if it is complete."
