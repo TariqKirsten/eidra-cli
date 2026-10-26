@@ -782,7 +782,22 @@ three access codes at 5%, 50% and 95%, sent cold. All three came back right. Pre
 - **The snapshot store under load:** the 40 slots are shared by every session. Measure them with
   subagents and anvil running, using radiance's `/metrics`
   (`radiance:prefix_hit_cut_tokens_total`, `radiance:prefix_cache_ckpt_evictions_by_reason_total`).
-- **Images in tool messages:** does radiance accept image parts in `tool` messages?
+- **Evicting a finished subagent's cache** (asked 2026-10-27). A subagent's conversation is never
+  sent again once it reports, but radiance keeps it like any other: its attention blocks (in VRAM,
+  copied to the 8 GiB host tier and given back to the experts on demand) and its linear-state
+  snapshots (about nine, in the 40-slot store every conversation shares), until the 4-hour TTL or
+  until memory is wanted. Radiance has no way to drop one conversation: `POST /reset_prefix_cache`
+  drops every one, the parent's included, and `cache_prompt: false` is ignored.
+  - What it costs now is probably little: eviction is least-recently-used, and a finished
+    subagent's entries are older than those of the conversations still going, so they go first.
+    The risk is a burst: several subagents ending together fill the snapshot store, and a parent
+    idle for a while (the user reading) can lose its snapshots before they do. Measure it with
+    `/sessions` and `prefix_cache_ckpt_evictions_by_reason_total{reason="store_full"}` while
+    subagents run.
+  - If it matters, the fix is in radiance: `DELETE /sessions/{session_id}`, which drops one
+    conversation's blocks, host copy and snapshots. eidra already labels every request with its
+    session's id (`session_id`), so it would call it when a subagent reports. A shared prefix (the
+    system prompt) stays while any conversation uses it, as radiance does now.
 - **Settings to tune with evals:** the compaction threshold, the thinking policy per kind of step,
   and tool-schema variants.
 - **ty:** is it good enough on real projects?
