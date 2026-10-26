@@ -60,13 +60,16 @@ pub struct RequestSettings {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSettings {
-    /// Prompt tokens past which a session stops (M1) or compacts (M6).
+    /// Tokens past which a session stops.
     pub limit: u64,
+    /// Tokens past which the conversation is summarised and goes on in a new one; unset, never.
+    #[serde(default)]
+    pub compact_at: Option<u64>,
 }
 
 impl Default for ContextSettings {
     fn default() -> Self {
-        ContextSettings { limit: 160_000 }
+        ContextSettings { limit: 160_000, compact_at: None }
     }
 }
 
@@ -168,6 +171,10 @@ pub struct Prompts {
     pub interrupted: String,
     /// Brings a background subagent's report; `{task}` is its description, `{report}` the report.
     pub task_report: String,
+    /// Asks for the summary a compacted conversation goes on from.
+    pub compact: String,
+    /// Starts the conversation after a compaction; `{tokens}` and `{summary}` are replaced.
+    pub compacted: String,
 }
 
 impl Profile {

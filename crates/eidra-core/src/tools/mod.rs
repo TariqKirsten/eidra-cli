@@ -1,6 +1,7 @@
 //! The tools the model calls (docs/DESIGN.md §5). Parameters are flat strings, integers and
 //! booleans: Qwen3.8 writes tool calls as XML, where those are natural and nested values are not.
 
+mod agents;
 mod bash;
 mod diagnostics;
 mod files;
@@ -44,6 +45,7 @@ pub struct Toolbox {
     files: files::Files,
     shell: bash::Shell,
     diagnostics: diagnostics::Diagnostics,
+    nested: agents::Nested,
 }
 
 enum Reply {
@@ -97,6 +99,7 @@ impl Toolbox {
             saved: 0,
             files: files::Files::new(workspace),
             diagnostics: diagnostics::Diagnostics::new(workspace, profile.diagnostics.clone()),
+            nested: agents::Nested::new(workspace),
             shell: bash::Shell::new(
                 workspace,
                 &session_dir.join("shell"),
@@ -114,7 +117,10 @@ impl Toolbox {
         let name = call.function.name.as_str();
         let result = if self.definitions.iter().any(|d| d.function.name == name) {
             match arguments(&call.function.arguments) {
-                Ok(args) => self.dispatch(name, &args, confirm, frontend).await,
+                Ok(args) => {
+                    let reply = self.dispatch(name, &args, confirm, frontend).await;
+                    reply.map(|reply| self.with_nested(name, &args, reply))
+                }
                 Err(e) => Err(e),
             }
         } else {
@@ -212,6 +218,28 @@ impl Toolbox {
             _ => return Err(format!("{name} is not implemented")),
         };
         Ok(Reply::Text(text))
+    }
+
+    /// The reply with the instructions of nested AGENTS.md files it is the first to touch: in the
+    /// directory of a path the call named, or where the shell is after a command.
+    fn with_nested(&mut self, name: &str, args: &Value, reply: Reply) -> Reply {
+        let touched = match name {
+            "read" | "edit" | "write" | "glob" | "grep" => match optional_string(args, "path") {
+                Ok(Some(path)) => resolve(&self.workspace, path),
+                _ => return reply,
+            },
+            "bash" => self.shell.cwd().to_path_buf(),
+            _ => return reply,
+        };
+        let instructions = self.nested.for_path(&touched);
+        if instructions.is_empty() {
+            return reply;
+        }
+        match reply {
+            Reply::Text(text) => Reply::Text(text + &instructions),
+            Reply::Media(text, images) => Reply::Media(text + &instructions, images),
+            finish @ Reply::Finish(_) => finish,
+        }
     }
 
     /// Output past the profile's limit is cut in the middle, and saved whole for the model to read.

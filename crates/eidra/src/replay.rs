@@ -81,7 +81,10 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
         unreachable!("index points at a reply");
     };
     let recorded_seed = stats.as_ref().and_then(|s| s.seed);
-    let messages: Vec<Message> = log.messages[..index].iter().map(|(m, _)| m.clone()).collect();
+    // The reply's own conversation: a compaction starts a new one.
+    let start = log.start_of(index);
+    let messages: Vec<Message> =
+        log.messages[start..index].iter().map(|(m, _)| m.clone()).collect();
 
     let mut seeds = args.seeds.clone();
     if seeds.is_empty() && args.samples == 0 {

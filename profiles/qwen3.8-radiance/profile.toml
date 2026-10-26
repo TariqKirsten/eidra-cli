@@ -21,11 +21,15 @@ parallel_tool_calls = true
 [request.extra]
 
 [context]
-# Prompt tokens past which a session stops (M1) or compacts (M6); subagents' too. The server's
-# window is 262,144, the model's trained length. Near its end radiance cuts max_tokens to the room
-# left rather than refusing, so replies get shorter, and a prompt that no longer fits at all ends
-# the session as the limit does (DESIGN.md §8).
+# Tokens past which a session stops, subagents' too. The server's window is 262,144, the model's
+# trained length. Near its end radiance cuts max_tokens to the room left rather than refusing, so
+# replies get shorter, and a prompt that no longer fits at all ends the session as the limit does
+# (DESIGN.md §8).
 limit = 256000
+# Past this, the conversation is summarised and goes on in a new one, which starts with the same
+# system prompt and the summary: one short prefill instead of a stop. Quality falls off before the
+# window's end; tune it with the evals (DESIGN.md §8).
+compact_at = 200000
 
 [tools]
 # Add "task" to let the model hand work to subagents ([subagents] below). It stays off until the
@@ -99,3 +103,13 @@ interrupted = "[The user interrupted you before you finished your last reply, an
 # with the task's description and {report} with what the subagent reported. Without the last
 # sentence, an unfinished report had the agent finish the task itself, a long turn nobody asked for.
 task_report = "[The background task \"{task}\" has ended. Its report:]\n\n{report}\n\n[Tell the user how it went. If it did not finish, say what is left, and ask before you take it up yourself.]"
+# Asks for the summary a conversation goes on from once it passes [context] compact_at.
+compact = """[This conversation is too long to go on with, so it will continue in a new one that starts from a summary you write now. Write it for yourself, with no tools. Include:
+- the task and the user's instructions, word for word where they are short;
+- what has been done and decided, and why;
+- the files changed and how, and the state they are in;
+- what is left, as next steps;
+- every exact detail needed to go on: paths, names, commands, error messages, values.
+Reply with the summary only.]"""
+# Starts the conversation after a compaction; {tokens} and {summary} are replaced.
+compacted = "[The conversation so far reached {tokens} tokens and was compacted. This is the summary you wrote of it:]\n\n{summary}\n\n[Go on from here.]"

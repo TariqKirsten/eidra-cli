@@ -34,6 +34,9 @@ pub struct Metrics {
     pub subagents: u64,
     #[serde(default)]
     pub subagent_requests: u64,
+    /// Times the conversation was summarised and went on in a new one.
+    #[serde(default)]
+    pub compactions: u64,
 }
 
 impl Metrics {
@@ -53,6 +56,7 @@ impl Metrics {
         self.output_tokens += sub.output_tokens;
         self.reasoning_tokens += sub.reasoning_tokens;
         self.nudges += sub.nudges;
+        self.compactions += sub.compactions;
         for (name, count) in sub.tool_calls {
             *self.tool_calls.entry(name).or_default() += count;
         }
@@ -108,6 +112,20 @@ fn parse(text: &str) -> (Metrics, bool) {
                 metrics.session = string(&record["id"]);
                 metrics.profile_hash = string(&record["profile_hash"]);
                 subagent = record["parent"].is_string();
+            }
+            // The summary a compacted conversation goes on from: a request like any other.
+            Some("compaction") => {
+                let stats = &record["stats"];
+                let count = |key: &str| stats[key].as_u64().unwrap_or(0);
+                let (prompt, cached) = (count("prompt_tokens"), count("cached_tokens"));
+                metrics.requests += 1;
+                metrics.compactions += 1;
+                metrics.prompt_tokens += prompt;
+                metrics.cached_tokens += cached;
+                metrics.computed_tokens += prompt.saturating_sub(cached);
+                metrics.prefill_s += stats["prefill_ms"].as_f64().unwrap_or(0.0) / 1000.0;
+                metrics.output_tokens += count("completion_tokens");
+                metrics.reasoning_tokens += count("reasoning_tokens");
             }
             Some("end") => {
                 metrics.outcome = string(&record["outcome"]);

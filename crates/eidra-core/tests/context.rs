@@ -1,10 +1,11 @@
-//! The end of the context: a prompt the server cannot fit ends the session at its limit, rather
-//! than with an error every later request would repeat.
+//! The end of the context: a long conversation goes on from a summary, and a prompt the server
+//! cannot fit ends the session at its limit rather than with an error every later request repeats.
 
 mod common;
 
-use common::{Quiet, Reply, agent, fake_server, scratch};
-use eidra_core::Outcome;
+use common::{Quiet, Reply, agent, agent_with, fake_server, recording_server, scratch};
+use common::{text, tool_call, usage};
+use eidra_core::{Log, Outcome};
 use serde_json::json;
 
 #[tokio::test]
@@ -37,5 +38,43 @@ async fn other_refusals_are_still_errors() {
     agent.push_user("go on").unwrap();
     let error = agent.run(&mut Quiet, 5).await.unwrap_err();
     assert!(format!("{error:#}").contains("bad tool schema"), "{error:#}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_long_conversation_goes_on_from_a_summary() {
+    let dir = scratch("compact");
+    let (url, requests) = recording_server(vec![
+        Reply::Chunks(usage(tool_call("bash", json!({"command": "true"})), 5_000)),
+        Reply::Chunks(usage(text("SUMMARY: ran true; nothing is left."), 5_100)),
+        Reply::Chunks(usage(text("Done."), 600)),
+    ])
+    .await;
+    let mut agent = agent_with(url, &dir, |profile| profile.context.compact_at = Some(1_000));
+    agent.push_user("run true").unwrap();
+    assert_eq!(agent.run(&mut Quiet, 5).await.unwrap(), Outcome::Replied);
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    // The summary is asked for with the whole conversation and the same tools, so that the
+    // server's cache holds all of it.
+    assert_eq!(requests[1]["tool_choice"], "auto");
+    assert_eq!(requests[1]["tools"], requests[0]["tools"]);
+    let asked: Vec<&str> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(asked, ["system", "user", "assistant", "tool", "user"]);
+    // The new conversation: the same system prompt, then the summary.
+    let next = requests[2]["messages"].as_array().unwrap();
+    assert_eq!(next.len(), 2);
+    assert_eq!(next[0], requests[0]["messages"][0]);
+    let first = next[1]["content"].as_str().unwrap();
+    assert!(first.contains("5,010 tokens") && first.contains("SUMMARY: ran true"), "{first}");
+    // The log keeps both, and says where the second begins.
+    let log = Log::read(agent.session_log()).unwrap();
+    assert_eq!(log.starts, [0, 4]);
     let _ = std::fs::remove_dir_all(&dir);
 }

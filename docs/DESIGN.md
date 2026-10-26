@@ -303,10 +303,28 @@ The policy guards against model mistakes. It is not a security boundary.
   than refusing, so replies near the end get shorter, and one cut off at the window ends with
   `finish_reason: "length"` (§5). A prompt that does not fit at all is refused with
   `context_length_exceeded`, and that ends the session as reaching the limit does.
-- **Compaction threshold** (M6): quality and latency fall off well before the window's end, so
-  compaction will start earlier, at a profile setting tuned by evals, from around 120K.
-- **Compaction:** summarise with a prompt that keeps decisions, open work and exact details, then
-  start a new conversation with the summary. That costs one cold prefill, about 30–55 s at 120K.
+- **Compaction** (M6, 2026-10-27): once a reply leaves the conversation past
+  `[context] compact_at` (200K), the next request asks for a summary instead: the whole
+  conversation, then the profile's `compact` prompt. That prompt asks for the task and the user's
+  words, what was done and decided, the files changed, what is left, and every exact detail
+  needed to go on. It also asks for no tool calls, and any the reply makes are ignored: the
+  request keeps its tools and `tool_choice: "auto"`, because radiance takes the tools out of the
+  prompt for `"none"`, which would compute the whole conversation again. The conversation then starts again: the same system prompt (so
+  the server's cache still has it), then a user message with the summary (`compacted`). The
+  session log keeps both conversations, with a `compaction` record between them, so replay and
+  resume read the last one. Subagents compact the same way.
+  - The summary request is a prefix hit, since it only adds a message; the new conversation
+    costs one cold prefill of the summary, a few seconds.
+  - Interrupting it leaves the conversation as it was. A summary that comes back empty leaves the
+    conversation to run on to the limit, and a summary request the server cannot fit ends the
+    session there.
+  - 200K is a first guess: quality and latency fall off before the window's end, so evals will
+    tune it, from around 120K.
+
+  Tested live with `compact_at` at 14K on a task that read two source files whole and then
+  answered three questions about them: the summary request found 15,168 of its 19,058 tokens in
+  the cache, the summary took 1,182 tokens and named the answers already found and the read still
+  to do, and the agent did that read and answered all three right from the new conversation.
 - **Reasoning stays in history (R3)** and counts against the window. Evals decide the thinking
   budget.
 
@@ -364,7 +382,12 @@ pixels.
 
 - The root `AGENTS.md` and `~/.config/eidra/AGENTS.md` go into the system prompt at session
   start.
-- A nested `AGENTS.md` is appended to the first tool result that touches its directory (R5).
+- A nested `AGENTS.md` (M6, 2026-10-27) is appended to the first tool result that touches its
+  directory or one below it, headed with where it came from, and never again in that session
+  (R5). `read`, `edit`, `write`, `glob` and `grep` touch the directory of the path they name;
+  `bash`, the directory the shell is in after the command. Files between the workspace and that
+  directory come outermost first, each cut at 8,000 characters. The prompt grows only for the
+  parts of the project the agent works in.
 
 ## 12. TUI (M4)
 

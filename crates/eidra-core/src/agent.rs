@@ -20,6 +20,7 @@ use futures_util::future::join_all;
 use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::confirm::ConfirmPolicy;
+use crate::display::thousands;
 use crate::event::{Approval, Decision, Event, Frontend, RequestStats};
 use crate::media;
 use crate::profile::Profile;
@@ -92,6 +93,9 @@ pub struct Agent {
     background: Arc<AtomicUsize>,
     /// Tokens the conversation took at the last reply: its prompt and the reply.
     used: u64,
+    /// A summary came back empty, so this conversation runs on to the limit instead of asking for
+    /// one after every reply.
+    uncompactable: bool,
 }
 
 /// A subagent started by a `task` call with `background`. The call returns at once, and the
@@ -217,6 +221,7 @@ impl Agent {
             unanswered: false,
             background: Arc::new(AtomicUsize::new(0)),
             used: 0,
+            uncompactable: false,
         })
     }
 
@@ -298,6 +303,12 @@ impl Agent {
         // An interrupt from before this run is not for it.
         self.interrupt.send_replace(false);
         for _ in 0..max_requests {
+            if self.profile.context.compact_at.is_some_and(|at| self.used > at)
+                && !self.uncompactable
+                && let Some(outcome) = self.compact(frontend).await?
+            {
+                return Ok(outcome);
+            }
             self.requests += 1;
             frontend.event(Event::Request { number: self.requests });
             let request = self.request()?;
@@ -436,6 +447,75 @@ impl Agent {
         }
         self.session.end("request_limit", "")?;
         Ok(Outcome::RequestLimit)
+    }
+
+    /// Summarises the conversation and goes on in a new one that starts with the same system
+    /// prompt and the summary (docs/DESIGN.md §8). Returns an outcome only if the run ends here:
+    /// the user stopped it, and the conversation is as it was, or the server could not fit it.
+    async fn compact<F: Frontend>(&mut self, frontend: &mut F) -> Result<Option<Outcome>> {
+        let tokens = self.used;
+        frontend.event(Event::Notice {
+            text: format!(
+                "the conversation has reached {} tokens: summarising it, to go on from the summary",
+                thousands(tokens)
+            ),
+        });
+        self.requests += 1;
+        frontend.event(Event::Request { number: self.requests });
+        let mut messages = self.session.messages().to_vec();
+        messages.push(Message::user(self.profile.prompts.compact.clone()));
+        let header = self.session.header();
+        let mut request =
+            reply_request(&self.profile, header, messages, seed(&header.id, self.requests))?;
+        // Not "none": radiance takes the tools out of the prompt for that, and the whole
+        // conversation would be computed again. The prompt asks for no calls; any are ignored.
+        request.tool_choice = Some("auto".into());
+        let mut stop = self.interrupt.subscribe();
+        let reply = tokio::select! {
+            reply = self.client.chat(&request, |_| {}) => Some(reply),
+            _ = stop.wait_for(|stop| *stop) => None,
+        };
+        let Some(reply) = reply else {
+            self.unanswered = true;
+            return Ok(Some(Outcome::Interrupted));
+        };
+        let turn = match reply {
+            Ok(turn) => turn,
+            Err(e) => {
+                if let Some(tokens) = context_exceeded(&e) {
+                    let tokens = tokens.unwrap_or(self.used);
+                    self.session.end("context_limit", &tokens.to_string())?;
+                    return Ok(Some(Outcome::ContextLimit(tokens)));
+                }
+                return Err(e).with_context(|| format!("request {}, for a summary", self.requests));
+            }
+        };
+        let stats = request_stats(&turn, request.seed);
+        let summary = turn.message.content.unwrap_or_default();
+        let summary = summary.trim();
+        if summary.is_empty() {
+            frontend.event(Event::Notice {
+                text: "the summary came back empty, so the conversation goes on as it is".into(),
+            });
+            self.uncompactable = true;
+            return Ok(None);
+        }
+        let system = self.session.messages().first().cloned().context("no system prompt")?;
+        let first = self
+            .profile
+            .prompts
+            .compacted
+            .replace("{tokens}", &thousands(tokens))
+            .replace("{summary}", summary);
+        self.session.compact(tokens, summary, Some(&stats), vec![system, Message::user(first)])?;
+        self.used = 0;
+        frontend.event(Event::Notice {
+            text: format!(
+                "compacted: the conversation goes on from a summary of {} tokens",
+                thousands(stats.completion_tokens.unwrap_or(0))
+            ),
+        });
+        Ok(None)
     }
 
     fn has_tool(&self, name: &str) -> bool {

@@ -47,6 +47,14 @@ enum Record<'a> {
         outcome: &'a str,
         detail: &'a str,
     },
+    /// The conversation grew past the profile's threshold and goes on in a new one, from a summary
+    /// (docs/DESIGN.md §8). The new conversation's messages follow.
+    Compaction {
+        tokens: u64,
+        summary: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stats: Option<&'a RequestStats>,
+    },
 }
 
 /// A log's records, read back.
@@ -60,6 +68,7 @@ enum Read {
         stats: Option<RequestStats>,
     },
     End {},
+    Compaction {},
 }
 
 /// A session log read back, for replaying its requests.
@@ -67,6 +76,8 @@ pub struct Log {
     pub header: Header,
     /// Every message in order, each reply with the stats of the request that produced it.
     pub messages: Vec<(Message, Option<RequestStats>)>,
+    /// Where each conversation begins in `messages`: 0, and after each compaction.
+    pub starts: Vec<usize>,
 }
 
 impl Log {
@@ -75,6 +86,7 @@ impl Log {
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut header = None;
         let mut messages = Vec::new();
+        let mut starts = vec![0];
         for (i, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
             let record = serde_json::from_str(line)
                 .with_context(|| format!("{} line {}", path.display(), i + 1))?;
@@ -82,12 +94,18 @@ impl Log {
                 Read::Session(h) => header = Some(h),
                 Read::Message { message, stats } => messages.push((message, stats)),
                 Read::End {} => {}
+                Read::Compaction {} => starts.push(messages.len()),
             }
         }
         let Some(header) = header else {
             bail!("{} has no session header", path.display());
         };
-        Ok(Log { header, messages })
+        Ok(Log { header, messages, starts })
+    }
+
+    /// Where the conversation that holds message `index` begins.
+    pub fn start_of(&self, index: usize) -> usize {
+        self.starts.iter().copied().filter(|&start| start <= index).max().unwrap_or(0)
     }
 }
 
@@ -150,6 +168,22 @@ impl Session {
         self.write(&Record::End { outcome, detail })
     }
 
+    /// Ends the conversation at `tokens` and starts a new one of `messages`, from `summary`.
+    pub fn compact(
+        &mut self,
+        tokens: u64,
+        summary: &str,
+        stats: Option<&RequestStats>,
+        messages: Vec<Message>,
+    ) -> Result<()> {
+        self.write(&Record::Compaction { tokens, summary, stats })?;
+        self.messages.clear();
+        for message in messages {
+            self.push(message, None)?;
+        }
+        Ok(())
+    }
+
     fn write(&mut self, record: &Record) -> Result<()> {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
@@ -195,6 +229,37 @@ mod tests {
         assert_eq!(lines[1]["message"]["content"], "hi");
         assert_eq!(lines[2]["outcome"], "finished");
         assert!(session.dir().is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_compaction_starts_a_new_conversation_in_the_same_log() {
+        let root = std::env::temp_dir().join(format!("eidra-compact-test-{}", std::process::id()));
+        let header = Header {
+            version: 1,
+            id: String::new(),
+            created: String::new(),
+            workspace: "/work".into(),
+            headless: true,
+            profile: "p".into(),
+            profile_hash: "h".into(),
+            base_url: "http://x/v1".into(),
+            model: "m".into(),
+            reasoning_effort: "medium".into(),
+            tools: vec![],
+            parent: None,
+            task: None,
+        };
+        let mut session = Session::create(&root, header).unwrap();
+        session.push(Message::system("s"), None).unwrap();
+        session.push(Message::user("long task"), None).unwrap();
+        let fresh = vec![Message::system("s"), Message::user("summary")];
+        session.compact(200_000, "summary", None, fresh.clone()).unwrap();
+        assert_eq!(session.messages(), fresh.as_slice());
+        let log = Log::read(session.path()).unwrap();
+        assert_eq!(log.messages.len(), 4);
+        assert_eq!(log.starts, [0, 2]);
+        assert_eq!((log.start_of(1), log.start_of(3)), (0, 2));
         fs::remove_dir_all(root).unwrap();
     }
 }

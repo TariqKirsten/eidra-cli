@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eidra_core::{Agent, AgentOptions, Approval, Decision, Event, Frontend, Profile};
@@ -23,12 +24,20 @@ pub enum Reply {
 
 /// Serves `replies` in order, one per request, and returns the API root.
 pub async fn fake_server(replies: Vec<Reply>) -> String {
+    recording_server(replies).await.0
+}
+
+/// The same, keeping each request's body.
+pub async fn recording_server(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&requests);
     tokio::spawn(async move {
         for reply in replies {
             let (mut conn, _) = listener.accept().await.unwrap();
-            read_request(&mut conn).await;
+            let body = read_request(&mut conn).await;
+            kept.lock().unwrap().push(serde_json::from_slice(&body).unwrap_or(Value::Null));
             let (chunks, stall) = match reply {
                 Reply::Chunks(chunks) => (chunks, false),
                 Reply::Stall(chunks) => (chunks, true),
@@ -60,11 +69,11 @@ pub async fn fake_server(replies: Vec<Reply>) -> String {
             }
         }
     });
-    url
+    (url, requests)
 }
 
-/// Reads one request's head and body, which the fake server does not look at.
-async fn read_request(conn: &mut tokio::net::TcpStream) {
+/// Reads one request's head and body, and returns the body.
+async fn read_request(conn: &mut tokio::net::TcpStream) -> Vec<u8> {
     let mut seen = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -81,11 +90,11 @@ async fn read_request(conn: &mut tokio::net::TcpStream) {
                 })
                 .unwrap_or(0usize);
             if seen.len() >= end + 4 + length {
-                return;
+                return seen[end + 4..end + 4 + length].to_vec();
             }
         }
         if n == 0 {
-            return;
+            return Vec::new();
         }
     }
 }
@@ -108,6 +117,14 @@ pub fn tool_calls(calls: &[(&str, Value)]) -> Vec<Value> {
         json!({"choices": [{"index": 0, "delta": {"tool_calls": calls}}]}),
         json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
     ]
+}
+
+/// `chunks` with the usage a server reports at the end of a reply.
+pub fn usage(mut chunks: Vec<Value>, prompt_tokens: u64) -> Vec<Value> {
+    chunks.push(
+        json!({"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 10}}),
+    );
+    chunks
 }
 
 /// A reply of text, calling no tool.

@@ -106,6 +106,11 @@ impl Shell {
         })
     }
 
+    /// The directory the next command starts in.
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
     pub async fn run<F: Frontend>(
         &mut self,
         command: &str,
