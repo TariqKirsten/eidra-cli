@@ -132,9 +132,10 @@ changed after the turn is left alone.
 
 Past 200K tokens the conversation is summarised and goes on from the summary, so a session does not
 stop at the context window. If no summary can be made, it stops at the profile's limit (256K
-tokens of the server's 262,144), and `/new` starts another. Each session is logged as JSON lines under
-`~/.local/share/eidra/sessions`, or wherever `--session-dir` says, and the path is printed when you
-quit.
+tokens of the server's 262,144), and `/new` starts another.
+
+Each session is logged as JSON lines under `~/.local/share/eidra/sessions`, or wherever
+`--session-dir` says, and the path is printed when you quit.
 
 ## Unattended runs
 
