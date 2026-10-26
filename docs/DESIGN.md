@@ -1,8 +1,9 @@
 # eidra: design
 
-Status, 2026-10-26: M0 and M1 are done, and M2 is under way. The probe confirmed R2–R5 on the
-live server (§3.1), `eidra exec` completed the ledger task unattended (§16.1), and the first suite
-runs are in §16.2.
+Status, 2026-10-26: M0 and M1 are done. M2's runner and first suite are done; harder tasks and
+baselines are next. M3's subagents are built and wait for the harder suite to judge them. The
+probe confirmed R2–R5 on the live server (§3.1), `eidra exec` completed the ledger task unattended
+(§16.1), the first suite runs are in §16.2, and the first subagent run is in §16.3.
 
 ## 1. What and why
 
@@ -193,6 +194,31 @@ Initial set (M1):
 
 Later: LSP navigation (definition, references, hover), PDF page images and web fetch.
 
+### 5.1 Subagents (M3)
+
+`task` hands a self-contained piece of work to a subagent. It is off by default: adding `task` to
+the profile's tools turns it on, once the evals show where it helps (§16.3).
+
+- **A subagent is a fresh, unattended agent** in the same workspace, with its own session log.
+  The log's header names the parent session and the task. It gets the profile's tools, or
+  `[subagents] tools`, but never `task`, so subagents do not nest.
+- **Only its summary comes back.** The subagent ends with `finish`, and its summary is the
+  `task` call's result. If it stops at its request limit (`[subagents] max_requests`) or its
+  context limit, the result is an error saying so, with a warning that files may have changed.
+- **Side by side.** The `task` calls in one reply run together, at most `max_parallel` at once:
+  three, since radiance serves four and something else may be using it. Results go back in call
+  order, because Qwen's tool-result format does not carry call ids. Subagents share the
+  workspace, so the tool's description tells the model to give each its own files.
+- **Cache.** A subagent's system prompt is the parent's with the `{{mode}}` section replaced, and
+  the same date, so it starts as the parent's does. The shared part is shorter than one
+  2048-token snapshot, though, so a subagent's first request is computed whole: about 3K tokens,
+  under a second.
+- **Approvals.** A subagent cannot ask the user. A command that needs approval is declined with a
+  note asking it to name the command in its summary, so that the parent can run it.
+- **Frontends** see a subagent's events wrapped as `subagent` events, labelled with the task's
+  description. Eval metrics add subagents' requests, tokens and tool calls to the attempt's totals,
+  and count them.
+
 ## 6. Bash
 
 - **One `bash -c` per command**, with stdin from `/dev/null` and its own process group. The
@@ -304,11 +330,18 @@ Reference: codex-rs `tui`.
   - Debian slim plus bash, git, ripgrep, fd, jq, curl, poppler-utils, uv, ruff, ty and tini, with
     the binary copied in.
   - A non-root user matching the host UID and GID; `--init`.
-  - `--network host`, because the ufw rule admits only the LAN to port 8000.
+  - `--network host`, because the ufw rule admits only the LAN to port 8000. Or a vacuum (below).
   - Volumes for the workspace, `~/.local/share/eidra` and the uv cache.
   - `RADIANCE_API_KEY` passed at run time only.
   - `--detach-keys` changed so Ctrl-P reaches the TUI.
 - **Host wrapper:** a script runs the container in the current directory.
+- **Vacuum:** the agent gets no network at all except the model. Its container runs with
+  `--network none`, and eidra reaches the model through a Unix socket mounted into it
+  (`EIDRA_MODEL_SOCKET`, or `--model-socket`). Outside the container, `eidra relay` forwards that
+  socket to the profile's host and port, and to nothing else. Commands the model runs find no
+  DNS, no route and nothing on loopback, so they cannot look things up, fetch a fix or install
+  packages. Anything inside can still talk to the server through the socket, which is the one
+  thing allowed. Evals run this way by default (`eidra eval run --network host` opts out).
 - **TLS:** none yet, because radiance is plain http on localhost. The first https server brings
   rustls with the ring provider.
 
@@ -326,9 +359,9 @@ Reference: codex-rs `tui`.
 - **`eidra exec`:** headless, emits JSON events, sets an exit code, and uses
   `tool_choice: "required"` with `finish`.
 - **`eidra eval run`** runs each task of a suite N times. Each attempt runs in its own container,
-  with the static binary mounted and a fresh copy of the task's workspace. Checks then run with
-  no network, on a copy of what the agent left, with the task's hidden `check/` directory
-  mounted. Each attempt records:
+  with the static binary mounted, a fresh copy of the task's workspace, and no network but the
+  model (the vacuum, §13). Checks then run with no network, on a copy of what the agent left,
+  with the task's hidden `check/` directory mounted. Each attempt records:
   - pass or fail, per check
   - wall-clock time
   - requests, tool calls and tool errors
@@ -354,13 +387,17 @@ Reference: codex-rs `tui`.
   - one default changed in code, config, docs and tests, among decoys
 
   Tuning looks only at train attempts; test results show whether the tuning generalises.
+- **Harbor tasks.** `eidra eval` also runs tasks in Harbor's format (`instruction.md`,
+  `task.toml`, `environment/`, `tests/test.sh` writing a reward to `/logs/verifier/reward.txt`),
+  the format of Terminal-Bench, SWE-bench and SWE-rebench. The agent and then the verifier run in
+  one container of the task's image, the way Harbor verifies a task in the agent's environment;
+  the details are in evals/README.md. `eidra eval select` makes a suite from a downloaded
+  dataset, by language and date, and `--remove-images` bounds the disk a run of large images
+  needs.
 - **To add next:** harder tasks, since this suite saturates (§16.2).
-  - Harbor-format tasks (`instruction.md`, `task.toml`, `environment/`, `tests/test.sh` writing a
-    reward to `/logs/verifier/reward.txt`). The agent and the verifier run inside the task's own
-    container. One adapter opens Terminal-Bench, SWE-bench and SWE-rebench.
   - SWE-rebench's monthly splits, newer than the model. Qwen3.8 recalls SWE-bench and
     Terminal-Bench environments (§16.2), so tasks it cannot have seen measure the harness, not
-    memory. Their images are large, so each is pulled for its task and removed after.
+    memory. The July 2026 snapshot has 20 Python tasks from issues of 2026-05-15 to 2026-06-15.
   - tasks from the user's own repos
   - larger codebases, for M3's subagents to show what they are worth
 - **Baselines on the same model:** Codex (`/v1/responses`), Claude Code (`/v1/messages`) and pi
@@ -477,6 +514,23 @@ the model back the first time.
 `old` did not match, which is the cost of not requiring a read. It took one step, as the refusal
 did. Times moved both ways (ledger 9.6 → 1.6 min, log-report 2.6 → 5.4 min with its drift), so at
 xhigh, one attempt per task cannot show a time effect; that needs repeats.
+
+### 16.3 M3: first subagent run (2026-10-26)
+
+The ledger task, with `task` enabled and the prompt asking for one subagent per module, in a
+vacuum. Five subagents started from one reply, three at a time. All five finished, and the parent
+then ran the tests: 36 of 36 pass.
+
+| | requests | tokens generated | wall |
+|---|---|---|---|
+| one agent (run file-tools) | 19 | 16K | 1.6 min |
+| parent and 5 subagents | 13 + 82 | 69K | 4.8 min |
+
+Each subagent read the spec and its tests again and checked its own module, so the work was four
+times larger. Three sequences side by side decoded about 240 tokens/s together, against 150–170
+for one, which did not make up for it. On a task this size, delegating costs more than it saves,
+as radiance's own five-agent demo found. The harder suite will show where it pays, if anywhere:
+larger codebases, and searches whose details the parent does not need.
 
 ## 17. Open questions
 

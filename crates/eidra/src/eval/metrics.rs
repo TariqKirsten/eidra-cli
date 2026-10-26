@@ -28,30 +28,74 @@ pub struct Metrics {
     pub nudges: u64,
     pub tool_calls: BTreeMap<String, u64>,
     pub tool_errors: BTreeMap<String, u64>,
+    /// Subagents the agent started, and the requests they made. Their requests, tokens, tool
+    /// calls and errors are in the totals above too.
+    #[serde(default)]
+    pub subagents: u64,
+    #[serde(default)]
+    pub subagent_requests: u64,
 }
 
 impl Metrics {
     pub fn tool_error_count(&self) -> u64 {
         self.tool_errors.values().sum()
     }
+
+    /// Adds a subagent's session to this one's totals.
+    fn absorb(&mut self, sub: Metrics) {
+        self.subagents += 1;
+        self.subagent_requests += sub.requests;
+        self.requests += sub.requests;
+        self.prompt_tokens += sub.prompt_tokens;
+        self.cached_tokens += sub.cached_tokens;
+        self.computed_tokens += sub.computed_tokens;
+        self.prefill_s += sub.prefill_s;
+        self.output_tokens += sub.output_tokens;
+        self.reasoning_tokens += sub.reasoning_tokens;
+        self.nudges += sub.nudges;
+        for (name, count) in sub.tool_calls {
+            *self.tool_calls.entry(name).or_default() += count;
+        }
+        for (name, count) in sub.tool_errors {
+            *self.tool_errors.entry(name).or_default() += count;
+        }
+    }
 }
 
-/// Reads the session log in `sessions`. Empty metrics if the agent never started one.
+/// Reads the session logs in `sessions`: the agent's, with its subagents' added to its totals.
+/// Empty metrics if the agent never started one.
 pub fn read(sessions: &Path) -> Result<Metrics> {
-    let log = fs::read_dir(sessions)
+    let mut logs: Vec<_> = fs::read_dir(sessions)
         .with_context(|| format!("reading {}", sessions.display()))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"));
-    let Some(log) = log else {
-        return Ok(Metrics::default());
-    };
-    let text = fs::read_to_string(&log).with_context(|| format!("reading {}", log.display()))?;
-    Ok(parse(&text))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    // Session ids start with the time, so the first is the agent's even if two are not subagents.
+    logs.sort();
+    let mut main = None;
+    let mut subagents = Vec::new();
+    for log in logs {
+        let text =
+            fs::read_to_string(&log).with_context(|| format!("reading {}", log.display()))?;
+        let (metrics, subagent) = parse(&text);
+        if subagent {
+            subagents.push(metrics);
+        } else if main.is_none() {
+            main = Some(metrics);
+        }
+    }
+    let mut total = main.unwrap_or_default();
+    for sub in subagents {
+        total.absorb(sub);
+    }
+    Ok(total)
 }
 
-fn parse(text: &str) -> Metrics {
+/// A session log's metrics, and whether it is a subagent's.
+fn parse(text: &str) -> (Metrics, bool) {
     let mut metrics = Metrics::default();
+    let mut subagent = false;
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut user_messages = 0u64;
     let string = |value: &Value| value.as_str().map(str::to_owned);
@@ -63,6 +107,7 @@ fn parse(text: &str) -> Metrics {
             Some("session") => {
                 metrics.session = string(&record["id"]);
                 metrics.profile_hash = string(&record["profile_hash"]);
+                subagent = record["parent"].is_string();
             }
             Some("end") => {
                 metrics.outcome = string(&record["outcome"]);
@@ -112,7 +157,7 @@ fn parse(text: &str) -> Metrics {
         }
     }
     metrics.nudges = user_messages.saturating_sub(1);
-    metrics
+    (metrics, subagent)
 }
 
 #[cfg(test)]
@@ -129,7 +174,8 @@ mod tests {
 {"type":"message","message":{"role":"assistant","tool_calls":[{"id":"b","type":"function","function":{"name":"finish","arguments":"{}"}}]},"stats":{"prompt_tokens":1100,"cached_tokens":1024,"completion_tokens":20,"prefill_ms":30.0}}
 {"type":"message","message":{"role":"tool","tool_call_id":"b","content":"Finished."}}
 {"type":"end","outcome":"finished","detail":"done"}"#;
-        let m = parse(log);
+        let (m, subagent) = parse(log);
+        assert!(!subagent);
         assert_eq!((m.session.as_deref(), m.profile_hash.as_deref()), (Some("s1"), Some("h1")));
         assert_eq!((m.outcome.as_deref(), m.summary.as_deref()), (Some("finished"), Some("done")));
         assert_eq!(
@@ -144,5 +190,40 @@ mod tests {
         assert_eq!(m.tool_calls["write"], 1);
         assert_eq!(m.tool_errors["write"], 1);
         assert_eq!(m.tool_error_count(), 1);
+    }
+
+    #[test]
+    fn adds_subagents_to_the_agents_totals() {
+        let dir = std::env::temp_dir().join(format!("eidra-metrics-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let reply = |id: &str, name: &str, prompt: u64| {
+            format!(
+                r#"{{"type":"message","message":{{"role":"assistant","tool_calls":[{{"id":"{id}","type":"function","function":{{"name":"{name}","arguments":"{{}}"}}}}]}},"stats":{{"prompt_tokens":{prompt},"cached_tokens":0,"completion_tokens":10}}}}"#
+            )
+        };
+        let main = [
+            r#"{"type":"session","id":"20261026-100000-aaaa","profile_hash":"h"}"#.to_owned(),
+            reply("a", "task", 2000),
+            r#"{"type":"message","message":{"role":"tool","tool_call_id":"a","content":"found it"}}"#.into(),
+            reply("b", "finish", 2100),
+            r#"{"type":"end","outcome":"finished","detail":"done"}"#.into(),
+        ];
+        let sub = [
+            r#"{"type":"session","id":"20261026-100001-bbbb","parent":"20261026-100000-aaaa"}"#.to_owned(),
+            reply("c", "grep", 1500),
+            r#"{"type":"message","message":{"role":"tool","tool_call_id":"c","content":"Error: bad"}}"#.into(),
+            reply("d", "finish", 1600),
+            r#"{"type":"end","outcome":"finished","detail":"it is in x.py"}"#.into(),
+        ];
+        fs::write(dir.join("20261026-100000-aaaa.jsonl"), main.join("\n")).unwrap();
+        fs::write(dir.join("20261026-100001-bbbb.jsonl"), sub.join("\n")).unwrap();
+        let m = read(&dir).unwrap();
+        assert_eq!(m.session.as_deref(), Some("20261026-100000-aaaa"));
+        assert_eq!(m.summary.as_deref(), Some("done"));
+        assert_eq!((m.requests, m.subagents, m.subagent_requests), (4, 1, 2));
+        assert_eq!((m.prompt_tokens, m.final_prompt_tokens), (7200, 2100));
+        assert_eq!((m.tool_calls["task"], m.tool_calls["grep"], m.tool_errors["grep"]), (1, 1, 1));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

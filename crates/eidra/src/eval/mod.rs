@@ -6,13 +6,17 @@
 //! - its own container, with the static eidra binary mounted in
 //!
 //! The checks then run in another container, with no network, on a copy of what the agent left,
-//! with the task's hidden check/ directory mounted.
+//! with the task's hidden check/ directory mounted. Harbor-format tasks run differently: the agent
+//! and then the verifier run in one container of the task's own image (harbor.rs).
 
 mod docker;
+mod harbor;
 mod metrics;
 mod report;
+mod select;
 mod task;
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -25,6 +29,7 @@ use eidra_core::{Profile, fnv1a, utc_datetime};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
+use crate::relay;
 use docker::{Container, copy_dir};
 use metrics::Metrics;
 use task::{Split, Task, load_suite};
@@ -63,6 +68,8 @@ enum EvalCommand {
         #[arg(long, default_value = "evals/tasks", value_name = "DIR")]
         suite: PathBuf,
     },
+    /// Make a suite of some of a downloaded Harbor dataset's tasks, by language and date
+    Select(select::SelectArgs),
 }
 
 #[derive(Debug, Args)]
@@ -102,9 +109,33 @@ struct RunArgs {
     #[arg(long)]
     label: Option<String>,
 
+    /// The agent's network
+    #[arg(long, value_enum, default_value_t = Network::Vacuum)]
+    network: Network,
+
     /// Where runs are recorded
     #[arg(long, default_value = "evals/runs", value_name = "DIR")]
     out: PathBuf,
+
+    /// Requests per attempt, for every task [default: each task's own]
+    #[arg(long, value_name = "N")]
+    max_requests: Option<usize>,
+
+    /// Remove each Harbor task's images once its attempts are done, to bound disk use. Attempts
+    /// then run task by task, so each image is fetched once
+    #[arg(long)]
+    remove_images: bool,
+}
+
+/// The network an agent gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    /// None at all: the model is reached through a relay's socket, so the agent cannot look
+    /// anything up, fetch a fix or install packages
+    Vacuum,
+    /// The host's network, as the agent has outside the evals
+    Host,
 }
 
 /// What a run was, written when it starts.
@@ -124,6 +155,9 @@ pub struct Manifest {
     pub tasks: Vec<String>,
     pub repeats: u32,
     pub parallel: usize,
+    /// The agents' network; runs from before it was recorded had the host's.
+    #[serde(default)]
+    pub network: Option<Network>,
     /// When the checks were last run again on the attempts (`eidra eval regrade`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regraded: Option<String>,
@@ -150,6 +184,9 @@ pub struct CheckResult {
     pub passed: bool,
     pub timed_out: bool,
     pub seconds: f64,
+    /// A Harbor verifier's reward; the check passes at 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reward: Option<f64>,
 }
 
 /// What every attempt of a run shares.
@@ -158,6 +195,13 @@ struct RunContext {
     profile_dir: Option<PathBuf>,
     api_key_env: Option<String>,
     run_dir: PathBuf,
+    /// The relay's socket, for agents in a vacuum.
+    model_socket: Option<PathBuf>,
+    max_requests: Option<usize>,
+    /// How Harbor tasks' agents reach the model server: the host's network, or a relay's socket.
+    route: harbor::Route,
+    /// Harbor tasks' images, made once per run.
+    images: tokio::sync::Mutex<HashMap<String, harbor::Images>>,
 }
 
 pub async fn run(args: EvalArgs) -> Result<i32> {
@@ -176,6 +220,7 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
         }
         EvalCommand::Validate(selection) => validate(&selection).await,
         EvalCommand::Regrade { run, suite } => regrade(&run, &suite).await,
+        EvalCommand::Select(args) => select::run(&args),
     }
 }
 
@@ -233,6 +278,7 @@ async fn run_suite(args: RunArgs) -> Result<i32> {
         tasks: tasks.iter().map(|t| t.id().to_owned()).collect(),
         repeats: args.repeats,
         parallel: args.parallel.max(1),
+        network: Some(args.network),
         regraded: None,
     };
     fs::write(run_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest)? + "\n")?;
@@ -246,17 +292,43 @@ async fn run_suite(args: RunArgs) -> Result<i32> {
         &manifest.binary_hash[..8]
     );
 
+    // Agents in a vacuum reach the model through this relay, which runs as long as the run does.
+    // Its socket goes where sockets usually do: a run directory's path can be longer than a
+    // socket's path may be.
+    let model_socket = match args.network {
+        Network::Vacuum => {
+            let dir =
+                std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+            let socket = dir.join(format!("eidra-model-{}.sock", std::process::id()));
+            let listener = relay::bind(&socket).context("starting the model relay")?;
+            tokio::spawn(relay::forward(listener, relay::target_of(&profile.base_url)?));
+            Some(socket)
+        }
+        Network::Host => None,
+    };
     let context = Arc::new(RunContext {
         binary,
         profile_dir,
         api_key_env: profile.api_key_env.clone(),
         run_dir: run_dir.clone(),
+        route: match &model_socket {
+            Some(socket) => harbor::Route::Socket(socket.clone()),
+            None => harbor::Route::Host,
+        },
+        model_socket,
+        max_requests: args.max_requests,
+        images: tokio::sync::Mutex::new(HashMap::new()),
     });
     let tasks = Arc::new(tasks);
     // Every task once, then every task again: a run stopped early still covers the whole suite.
-    let jobs: Vec<(usize, u32)> = (1..=args.repeats)
+    // Removing images instead runs each task's attempts together, so each image is fetched once.
+    let mut jobs: Vec<(usize, u32)> = (1..=args.repeats)
         .flat_map(|repeat| (0..tasks.len()).map(move |task| (task, repeat)))
         .collect();
+    if args.remove_images {
+        jobs.sort();
+    }
+    let mut left = vec![args.repeats; tasks.len()];
     let mut results =
         OpenOptions::new().create(true).append(true).open(run_dir.join("results.jsonl"))?;
     let mut running = JoinSet::new();
@@ -267,15 +339,29 @@ async fn run_suite(args: RunArgs) -> Result<i32> {
             let (task, repeat) = jobs[next];
             next += 1;
             let (tasks, context) = (Arc::clone(&tasks), Arc::clone(&context));
-            running.spawn(async move { run_attempt(&context, &tasks[task], repeat).await });
+            running.spawn(async move {
+                let attempt = run_attempt(&context, &tasks[task], repeat).await;
+                (task, attempt)
+            });
         }
         let Some(joined) = running.join_next().await else {
             break;
         };
-        let attempt = joined.context("an attempt panicked")??;
+        let (task, attempt) = joined.context("an attempt panicked")?;
+        let attempt = attempt?;
         writeln!(results, "{}", serde_json::to_string(&attempt)?)?;
         report::progress(attempts.len() + 1, jobs.len(), &attempt);
         attempts.push(attempt);
+        left[task] -= 1;
+        if args.remove_images && left[task] == 0 {
+            let images = context.images.lock().await.remove(tasks[task].id());
+            if let Some(images) = images {
+                harbor::remove_images(&images).await;
+            }
+        }
+    }
+    if let Some(socket) = &context.model_socket {
+        let _ = fs::remove_file(socket);
     }
     eprintln!();
     report::print(&manifest, &attempts);
@@ -283,13 +369,17 @@ async fn run_suite(args: RunArgs) -> Result<i32> {
 }
 
 async fn run_attempt(context: &RunContext, task: &Task, repeat: u32) -> Result<Attempt> {
+    let max_requests = context.max_requests.unwrap_or(task.spec.max_requests);
+    if let Some(config) = &task.harbor {
+        return harbor::run_attempt(context, task, config, repeat, max_requests).await;
+    }
     let dir = context.run_dir.join(task.id()).join(repeat.to_string());
     let work = dir.join("work");
     let sessions = dir.join("sessions");
     copy_dir(&task.workspace(), &work)?;
     fs::create_dir_all(&sessions)?;
 
-    let max_requests = task.spec.max_requests.to_string();
+    let max_requests = max_requests.to_string();
     let mut command = vec![
         "eidra",
         "exec",
@@ -299,10 +389,16 @@ async fn run_attempt(context: &RunContext, task: &Task, repeat: u32) -> Result<A
         "--max-requests",
         &max_requests,
     ];
-    let mut agent = Container::new(&task.spec.image, "host")
+    let network = if context.model_socket.is_some() { "none" } else { "host" };
+    let mut agent = Container::new(&task.spec.image, network)
         .mount(&context.binary, "/usr/local/bin/eidra", true)
         .mount(&work, "/work", false)
         .mount(&sessions, "/sessions", false);
+    if let Some(socket) = &context.model_socket {
+        agent = agent
+            .mount(socket, harbor::SOCKET_IN_CONTAINER, false)
+            .set_env("EIDRA_MODEL_SOCKET", harbor::SOCKET_IN_CONTAINER);
+    }
     if let Some(profile) = &context.profile_dir {
         agent = agent.mount(profile, "/profile", true);
         command.extend(["--profile", "/profile"]);
@@ -352,6 +448,7 @@ async fn run_checks(task: &Task, workspace: &Path, dir: &Path) -> Result<Vec<Che
             passed: finished.code == Some(0) && !finished.timed_out,
             timed_out: finished.timed_out,
             seconds: finished.seconds,
+            reward: None,
         });
     }
     fs::remove_dir_all(&scratch)?;
@@ -366,6 +463,34 @@ async fn validate(selection: &Selection) -> Result<i32> {
     let mut problems = 0;
     for task in &tasks {
         let dir = root.join(task.id());
+        if let Some(config) = &task.harbor {
+            let verdict = match harbor::validate(task, config, &dir).await {
+                Ok((start, solved)) => {
+                    let reward = |r: Option<f64>| {
+                        r.map_or("no reward".to_owned(), |r| format!("reward {r}"))
+                    };
+                    let ok = start.is_none_or(|r| r < 1.0) && solved.is_some_and(|r| r >= 1.0);
+                    println!(
+                        "{:<18} {:<5}  start: {:<34} solution: {:<28} {}",
+                        task.id(),
+                        task.spec.split.name(),
+                        format!("verifier gives {}", reward(start)),
+                        format!("verifier gives {}", reward(solved)),
+                        if ok { "ok" } else { "PROBLEM" }
+                    );
+                    ok
+                }
+                Err(error) => {
+                    println!("{:<18} PROBLEM: {error:#}", task.id());
+                    false
+                }
+            };
+            if !verdict {
+                problems += 1;
+                println!("  logs: {}", dir.display());
+            }
+            continue;
+        }
         let start = dir.join("start");
         copy_dir(&task.workspace(), &start)?;
         let before = run_checks(task, &start, &dir.join("start-checks")).await?;
@@ -423,6 +548,11 @@ async fn regrade(run: &Path, suite: &Path) -> Result<i32> {
             regraded.push(attempt);
             continue;
         };
+        if task.harbor.is_some() {
+            println!("{name:<20} a Harbor task, whose container is gone; left as it was");
+            regraded.push(attempt);
+            continue;
+        }
         let dir = run.join(&attempt.task).join(attempt.repeat.to_string());
         let checks = run_checks(task, &dir.join("work"), &dir).await?;
         let passed = checks.iter().all(|c| c.passed);

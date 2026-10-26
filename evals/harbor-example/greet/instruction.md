@@ -1,0 +1,1 @@
+Write `greet.py` in the working directory. Run as `python3 greet.py NAME`, it prints `Hello, NAME!`; run without an argument, it prints `Hello, world!`. With more than one argument, it greets each in turn, one line each.

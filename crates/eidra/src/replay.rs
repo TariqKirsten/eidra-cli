@@ -41,6 +41,10 @@ pub struct ReplayArgs {
     /// The profile the session ran with, as a directory [default: the built-in profile]
     #[arg(long, value_name = "DIR")]
     profile: Option<PathBuf>,
+
+    /// Reach the server through this Unix socket instead of the network (see `eidra relay`)
+    #[arg(long, env = "EIDRA_MODEL_SOCKET", value_name = "PATH")]
+    model_socket: Option<PathBuf>,
 }
 
 pub async fn run(args: ReplayArgs) -> Result<()> {
@@ -96,7 +100,8 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
     );
 
     let api_key = profile.api_key_env.as_deref().and_then(|name| std::env::var(name).ok());
-    let client = Client::new(&header.base_url, api_key.filter(|key| !key.is_empty()))?;
+    let api_key = api_key.filter(|key| !key.is_empty());
+    let client = Client::new(&header.base_url, api_key, args.model_socket.as_deref())?;
     let out = args.session.with_extension("").join("replays");
     fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
 

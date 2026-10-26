@@ -1,4 +1,6 @@
 /target
 /dist
 /evals/runs
+/evals/harbor
 __pycache__/
+/.claude

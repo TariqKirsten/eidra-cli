@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 eidra-llm.workspace = true
+futures-util.workspace = true
 globset.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true

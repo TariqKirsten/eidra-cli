@@ -27,7 +27,8 @@ pub struct Container {
 }
 
 impl Container {
-    /// `network` is `host`, so the agent reaches the model server, or `none`, for checks.
+    /// `network` is `host`, or `none`: for checks, and for agents in a vacuum, which reach the
+    /// model through a relay's socket.
     pub fn new(image: &str, network: &'static str) -> Self {
         Container { image: image.to_owned(), network, mounts: Vec::new(), env: Vec::new() }
     }
@@ -38,6 +39,12 @@ impl Container {
         let source = std::path::absolute(source).unwrap_or_else(|_| source.to_path_buf());
         let mode = if read_only { ":ro" } else { "" };
         self.mounts.push(format!("{}:{target}{mode}", source.display()));
+        self
+    }
+
+    /// Sets an environment variable in the container.
+    pub fn set_env(mut self, name: &str, value: &str) -> Self {
+        self.env.push(format!("{name}={value}"));
         self
     }
 
@@ -110,7 +117,7 @@ impl Container {
 }
 
 /// `uid:gid` of this process.
-fn user() -> String {
+pub(super) fn user() -> String {
     // SAFETY: getuid and getgid cannot fail and touch no memory.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     format!("{uid}:{gid}")

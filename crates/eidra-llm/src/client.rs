@@ -1,5 +1,6 @@
 //! The HTTP client.
 
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -35,12 +36,22 @@ pub struct Client {
 impl Client {
     /// `base_url` is the API root, such as `http://127.0.0.1:8000/v1`. Plain `http:` only for
     /// now: the build carries no TLS.
-    pub fn new(base_url: &str, api_key: Option<String>) -> Result<Self, Error> {
+    ///
+    /// With `socket`, every connection goes through that Unix socket instead, and the URL's host
+    /// only names the server. That is how an agent with no network reaches the model: a relay
+    /// outside its container forwards the socket to the server (docs/DESIGN.md §13).
+    pub fn new(
+        base_url: &str,
+        api_key: Option<String>,
+        socket: Option<&Path>,
+    ) -> Result<Self, Error> {
         let base_url = base_url.trim_end_matches('/').to_owned();
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|source| Error::Http { url: base_url.clone(), source })?;
+        let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
+        if let Some(socket) = socket {
+            builder = builder.unix_socket(socket);
+        }
+        let http =
+            builder.build().map_err(|source| Error::Http { url: base_url.clone(), source })?;
         Ok(Client { http, base_url, api_key })
     }
 
@@ -195,7 +206,7 @@ mod tests {
 
     #[test]
     fn root_url_drops_v1() {
-        let client = Client::new("http://127.0.0.1:8000/v1/", None).unwrap();
+        let client = Client::new("http://127.0.0.1:8000/v1/", None, None).unwrap();
         assert_eq!(client.base_url(), "http://127.0.0.1:8000/v1");
         assert_eq!(client.root_url(), "http://127.0.0.1:8000");
     }

@@ -13,6 +13,8 @@ eidra-core = { path = "crates/eidra-core" }
 eidra-llm = { path = "crates/eidra-llm" }
 anyhow = "1.0.104"
 clap = { version = "4.6", features = ["derive", "env"] }
+# join_all, for subagents running side by side; reqwest already builds it.
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 globset = "0.4.20"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
@@ -24,7 +26,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0"
-tokio = { version = "1.54", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { version = "1.54", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 toml = "0.9.8"
 tree-sitter = "0.27.1"
 tree-sitter-bash = "0.25.1"

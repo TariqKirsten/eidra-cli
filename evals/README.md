@@ -7,6 +7,7 @@ the profile can be judged by numbers rather than by impression (docs/DESIGN.md Â
     eidra eval run --repeats 3                 # every task three times, recorded in evals/runs/
     eidra eval run --task ledger --repeats 1   # one task
     eidra eval run --profile my-profile/       # a profile variant
+    eidra eval run --network host              # agents get the host's network (default: none, model only)
     eidra eval report evals/runs/<run>         # print a recorded run again
     eidra eval compare evals/runs/<a> evals/runs/<b>
     eidra eval regrade evals/runs/<run>        # rerun fixed checks on what the attempts left
@@ -15,8 +16,9 @@ the profile can be judged by numbers rather than by impression (docs/DESIGN.md Â
 
 1. The task's `workspace/` is copied to `evals/runs/<run>/<task>/<n>/work`.
 2. A container from the task's `image` runs `eidra exec` on the prompt, with that copy at `/work`.
-   - The container gets the running eidra binary mounted at `/usr/local/bin/eidra`, and the host
-     network so that the agent reaches the model server.
+   - The container gets the running eidra binary mounted at `/usr/local/bin/eidra`, and no
+     network: the agent reaches the model server through a relay's socket, and its commands reach
+     nothing (`--network host` gives it the host's network instead).
    - It runs as you, with the API key passed through.
 3. The checks run one after another, in another container with no network. They work on a copy
    of what the agent left, with the task's `check/` directory mounted at `/check`. The attempt
@@ -83,3 +85,68 @@ Some guidelines:
 | `timeout-config` | test | one default changed in code, config, docs and tests, among decoys |
 
 `ledger` comes from radiance's agent demo. The others were written for eidra.
+
+## Harbor tasks
+
+`eidra eval` also runs tasks in [Harbor's format](https://docs.harborframework.com/tasks/overview),
+which is how Terminal-Bench and SWE-rebench publish theirs. A directory with an `instruction.md`
+is one:
+
+| path | |
+|---|---|
+| `instruction.md` | the prompt |
+| `task.toml` | timeouts, resources, network, environment variables |
+| `environment/Dockerfile` | the environment, unless `task.toml` names a prebuilt `docker_image` |
+| `tests/test.sh` | the verifier: it writes a reward to `/logs/verifier/reward.txt` (or `.json`) |
+| `solution/solve.sh` | the reference solution, for `eidra eval validate` |
+
+An attempt runs as Harbor runs a task without a separate verifier:
+
+1. The image is built from `environment/`, tagged `eidra-harbor/<task>:<hash of environment/>`
+   and reused while `environment/` is unchanged. A prebuilt image is pulled.
+2. A container of it starts with the task's CPU and memory limits and `environment.env`, the
+   eidra binary and a sessions directory mounted. `eidra exec` runs in the image's working
+   directory (or `environment.workdir`), as `agent.user`, for at most `agent.timeout_sec`. In a
+   vacuum (the default), the container starts on Docker's bridge network and is disconnected
+   from it before the agent runs, so the agent reaches only the model, through the relay's
+   socket; it is connected again for the verifier, unless the task says `network_mode =
+   "no-network"`.
+3. `agent.patch` records what the agent changed, if the working directory is a git repository.
+4. `tests/` is copied to `/tests` and `bash /tests/test.sh` runs in the same container, as
+   `verifier.user` with `verifier.env`. `/logs/verifier` is copied to `checks/verifier/`. The
+   attempt passes at a reward of 1.
+
+When the agent runs out of time, its container is stopped (what the agent started cannot be
+stopped otherwise) and the verifier runs in a new one made from a snapshot of its files. A task
+whose image cannot be built counts as a failed attempt with an `error.log`, so one bad image does
+not stop a long run. Harbor tasks have no split, and count as test. Not supported: multi-step
+tasks, verifiers in a separate environment, docker-compose environments. `regrade` leaves Harbor
+attempts as they were, since their containers are gone.
+
+`evals/harbor-example/` holds one small task, for checking the adapter:
+
+    eidra eval validate --suite evals/harbor-example
+    eidra eval run --suite evals/harbor-example --repeats 1
+
+### SWE-rebench
+
+[SWE-rebench](https://swe-rebench.com) collects fresh GitHub issues every month, so tasks newer
+than the model are ones it cannot have seen. Harbor's CLI downloads its task directories (text
+only; the images come later, when tasks run):
+
+    uvx harbor download "ibragim-badertdinov/swe-rebench-07-2026@2026-07" -o evals/harbor
+    uvx harbor download "swe-rebench/swe-rebench-leaderboard@latest" -o evals/harbor
+
+The first is the July 2026 leaderboard: 111 tasks from issues of 2026-05-15 to 2026-06-15, 20 of
+them in Python. The second is 860 older Python tasks. `eidra eval select` links some of them into
+a suite, newest first, using each task's `tests/config.json`:
+
+    eidra eval select --from evals/harbor/swe-rebench-07-2026 --to evals/harbor/swe-july-python \
+        --language python --exclude verl-project__verl-6506
+    eidra eval run --suite evals/harbor/swe-july-python --repeats 1 --remove-images
+
+Each task's image (`swerebenchv2/<task>`) is 0.4â€“6.5 GB compressed. `--remove-images` removes a
+task's images once its attempts are done, and runs each task's attempts together so that each
+image is fetched once. Building an image fetches uv. The verifiers parse test logs with plain
+Python, but a few run pytest through `uv run`, which may fetch packages, so a verifier keeps the
+network unless `task.toml` says `network_mode = "no-network"`.

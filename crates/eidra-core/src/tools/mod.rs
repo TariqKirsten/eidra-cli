@@ -40,9 +40,16 @@ enum Reply {
     Finish(String),
 }
 
-/// The definitions of the profile's tools, plus `finish` in a headless session.
-pub fn definitions(profile: &Profile, headless: bool) -> Result<Vec<Tool>> {
-    let mut names = profile.tools.enabled.clone();
+/// The definitions of the profile's tools, plus `finish` in a headless session. A subagent gets
+/// the profile's subagent tools, and never `task`: subagents do not start subagents.
+pub fn definitions(profile: &Profile, headless: bool, subagent: bool) -> Result<Vec<Tool>> {
+    let mut names = match (&profile.subagents.tools, subagent) {
+        (Some(tools), true) => tools.clone(),
+        _ => profile.tools.enabled.clone(),
+    };
+    if subagent {
+        names.retain(|name| name != "task");
+    }
     if headless && !names.iter().any(|n| n == "finish") {
         names.push("finish".into());
     }
@@ -148,6 +155,7 @@ impl Toolbox {
                 "The todo list is updated.".into()
             }
             "finish" => return Ok(Reply::Finish(string(args, "summary")?.to_owned())),
+            // The agent runs `task` itself, since it starts another agent.
             _ => return Err(format!("{name} is not implemented")),
         };
         Ok(Reply::Text(text))
@@ -182,6 +190,12 @@ pub(crate) fn resolve(workspace: &Path, path: &str) -> PathBuf {
         }
     }
     out
+}
+
+/// A `task` call's description and prompt.
+pub(crate) fn task_arguments(call: &ToolCall) -> Result<(String, String), String> {
+    let args = arguments(&call.function.arguments)?;
+    Ok((string(&args, "description")?.trim().to_owned(), string(&args, "prompt")?.to_owned()))
 }
 
 fn arguments(raw: &str) -> Result<Value, String> {
@@ -320,6 +334,19 @@ fn definition(name: &str, description: Option<&String>) -> Result<Tool> {
             json!({"list": {"type": "string", "description": "The whole checklist."}}),
             &["list"],
         ),
+        "task" => (
+            "Hand a self-contained piece of work to a subagent: a new agent with the same tools, which \
+             starts knowing nothing of this conversation and returns only its final summary. Give it \
+             everything it needs: the goal, the files and facts that matter, and what to report back. \
+             Several task calls in one reply run at the same time; give each its own files to change. \
+             Good uses: searching many files when only the answer matters, independent changes you \
+             can describe completely, reviewing a change.",
+            json!({
+                "description": {"type": "string", "description": "A few words naming the task."},
+                "prompt": {"type": "string", "description": "The complete instructions for the subagent."}
+            }),
+            &["description", "prompt"],
+        ),
         "finish" => (
             "End the task. Call it only when the task is complete and checked, with a short summary of \
              what you did and how you checked it.",
@@ -360,7 +387,7 @@ mod tests {
     #[test]
     fn every_builtin_tool_has_a_definition() {
         let profile = Profile::builtin().unwrap();
-        for name in profile.tools.enabled.iter().map(String::as_str).chain(["finish"]) {
+        for name in profile.tools.enabled.iter().map(String::as_str).chain(["task", "finish"]) {
             let tool = definition(name, None).unwrap();
             assert_eq!(tool.function.name, name);
             assert_eq!(tool.function.parameters["type"], "object");
@@ -368,5 +395,18 @@ mod tests {
         assert!(definition("teleport", None).is_err());
         let custom = definition("read", Some(&"Read it.".to_owned())).unwrap();
         assert_eq!(custom.function.description, "Read it.");
+    }
+
+    #[test]
+    fn subagents_never_get_task() {
+        let names = |tools: Vec<Tool>| -> Vec<String> {
+            tools.into_iter().map(|t| t.function.name).collect()
+        };
+        let mut profile = Profile::builtin().unwrap();
+        profile.tools.enabled = vec!["read".into(), "task".into()];
+        assert_eq!(names(definitions(&profile, false, false).unwrap()), ["read", "task"]);
+        assert_eq!(names(definitions(&profile, true, true).unwrap()), ["read", "finish"]);
+        profile.subagents.tools = Some(vec!["grep".into(), "task".into()]);
+        assert_eq!(names(definitions(&profile, true, true).unwrap()), ["grep", "finish"]);
     }
 }

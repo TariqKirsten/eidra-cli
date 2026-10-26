@@ -4,6 +4,7 @@ mod eval;
 mod exec;
 mod format;
 mod probe;
+mod relay;
 mod replay;
 
 use clap::{Parser, Subcommand};
@@ -25,6 +26,8 @@ enum Command {
     Probe(probe::ProbeArgs),
     /// Send one request of a recorded session again, with its recorded seed or new ones
     Replay(replay::ReplayArgs),
+    /// Forward a Unix socket to the model server, for an agent in a container with no network
+    Relay(relay::RelayArgs),
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -41,5 +44,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Probe(args) => probe::run(args).await,
         Command::Replay(args) => replay::run(args).await,
+        Command::Relay(args) => relay::run(args).await,
     }
 }

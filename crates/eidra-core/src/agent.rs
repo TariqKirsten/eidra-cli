@@ -4,14 +4,18 @@
 //! one before it (§3).
 
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use eidra_llm::{AssistantTurn, ChatRequest, Client, Message, StreamEvent, Usage};
+use eidra_llm::{AssistantTurn, ChatRequest, Client, Message, StreamEvent, ToolCall, Usage};
+use futures_util::future::join_all;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::confirm::ConfirmPolicy;
-use crate::event::{Event, Frontend, RequestStats};
+use crate::event::{Approval, Decision, Event, Frontend, RequestStats};
 use crate::profile::Profile;
 use crate::session::{Header, Session};
 use crate::text::{fnv1a, utc_datetime};
@@ -27,6 +31,8 @@ pub struct AgentOptions {
     pub headless: bool,
     /// Confirm patterns on top of the profile's.
     pub confirm: Vec<String>,
+    /// A Unix socket that reaches the model server, for an agent with no network of its own.
+    pub model_socket: Option<PathBuf>,
 }
 
 /// How a run ended.
@@ -51,10 +57,31 @@ pub struct Agent {
     confirm: ConfirmPolicy,
     headless: bool,
     requests: usize,
+    /// What a subagent inherits: where logs go, the confirm patterns beyond the profile's, the way
+    /// to the model, and the date in the system prompt (so that its prompt starts as this one's
+    /// does).
+    session_root: PathBuf,
+    extra_confirm: Vec<String>,
+    model_socket: Option<PathBuf>,
+    date: String,
+}
+
+/// Whom an agent works for.
+enum Role {
+    /// The user, in the loop or not.
+    Main,
+    /// Another agent: the session that started it, and the task's description.
+    Subagent { parent: String, task: String },
 }
 
 impl Agent {
     pub fn start(profile: Profile, options: AgentOptions) -> Result<Self> {
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let (year, month, day, ..) = utc_datetime(secs);
+        Self::create(profile, options, Role::Main, format!("{year:04}-{month:02}-{day:02}"))
+    }
+
+    fn create(profile: Profile, options: AgentOptions, role: Role, date: String) -> Result<Self> {
         let workspace = fs::canonicalize(&options.workspace)
             .with_context(|| format!("the working directory {}", options.workspace.display()))?;
         let api_key = profile
@@ -62,9 +89,14 @@ impl Agent {
             .as_deref()
             .and_then(|name| std::env::var(name).ok())
             .filter(|key| !key.is_empty());
-        let client = Client::new(&profile.base_url, api_key)?;
+        let client = Client::new(&profile.base_url, api_key, options.model_socket.as_deref())?;
 
-        let definitions = tools::definitions(&profile, options.headless)?;
+        let subagent = matches!(role, Role::Subagent { .. });
+        let definitions = tools::definitions(&profile, options.headless, subagent)?;
+        let (parent, task) = match role {
+            Role::Main => (None, None),
+            Role::Subagent { parent, task } => (Some(parent), Some(task)),
+        };
         let header = Header {
             version: 1,
             id: String::new(),
@@ -77,24 +109,29 @@ impl Agent {
             model: profile.model.clone(),
             reasoning_effort: profile.request.reasoning_effort.clone(),
             tools: definitions.clone(),
+            parent,
+            task,
         };
         let mut session = Session::create(&options.session_root, header)?;
         let tools = Toolbox::new(&profile, &workspace, session.dir(), definitions)?;
 
-        let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let (year, month, day, ..) = utc_datetime(secs);
-        let mode =
-            if options.headless { &profile.prompts.headless } else { &profile.prompts.interactive };
+        let mode = if subagent {
+            &profile.prompts.subagent
+        } else if options.headless {
+            &profile.prompts.headless
+        } else {
+            &profile.prompts.interactive
+        };
         let system = profile.system_prompt(&[
             ("workspace", &workspace.display().to_string()),
-            ("date", &format!("{year:04}-{month:02}-{day:02}")),
+            ("date", &date),
             ("mode", mode),
             ("agents", &agents_md(&workspace)),
         ]);
         session.push(Message::system(system), None)?;
 
         let mut patterns = profile.confirm.commands.clone();
-        patterns.extend(options.confirm);
+        patterns.extend(options.confirm.iter().cloned());
         Ok(Agent {
             client,
             confirm: ConfirmPolicy::new(&patterns),
@@ -104,7 +141,30 @@ impl Agent {
             tools,
             headless: options.headless,
             requests: 0,
+            session_root: options.session_root,
+            extra_confirm: options.confirm,
+            model_socket: options.model_socket,
+            date,
         })
+    }
+
+    /// A subagent for one `task` call: a new, unattended session in the same workspace, with this
+    /// agent's profile and confirm patterns, and the task's prompt as its first message.
+    fn subagent(&self, description: &str, prompt: &str) -> Result<Agent> {
+        let options = AgentOptions {
+            workspace: self.workspace.clone(),
+            session_root: self.session_root.clone(),
+            headless: true,
+            confirm: self.extra_confirm.clone(),
+            model_socket: self.model_socket.clone(),
+        };
+        let role = Role::Subagent {
+            parent: self.session.header().id.clone(),
+            task: description.to_owned(),
+        };
+        let mut agent = Agent::create(self.profile.clone(), options, role, self.date.clone())?;
+        agent.push_user(prompt)?;
+        Ok(agent)
     }
 
     pub fn workspace(&self) -> &Path {
@@ -177,32 +237,51 @@ impl Agent {
             }
 
             let mut finished = None;
-            for (i, call) in calls.iter().enumerate() {
-                frontend.event(Event::ToolCall {
-                    id: call.id.clone(),
-                    name: call.function.name.clone(),
-                    arguments: call.function.arguments.clone(),
-                });
+            let mut next = 0;
+            while next < calls.len() {
                 // A reply cut off at max_tokens may end in a call that was cut off too.
-                let output = if cut_off && i + 1 == calls.len() {
-                    ToolOutput {
+                let truncated = |i: usize| cut_off && i + 1 == calls.len();
+                // `task` calls next to each other run together, as subagents side by side.
+                let mut end = next;
+                while end < calls.len()
+                    && calls[end].function.name == "task"
+                    && self.has_tool("task")
+                    && !truncated(end)
+                {
+                    end += 1;
+                }
+                let batch = &calls[next..end.max(next + 1)];
+                for call in batch {
+                    frontend.event(Event::ToolCall {
+                        id: call.id.clone(),
+                        name: call.function.name.clone(),
+                        arguments: call.function.arguments.clone(),
+                    });
+                }
+                let outputs = if end > next {
+                    self.run_subagents(batch, frontend).await
+                } else if truncated(next) {
+                    vec![ToolOutput {
                         text: format!("Error: {}", self.cut_off_message()),
                         is_error: true,
                         finish: None,
-                    }
+                    }]
                 } else {
-                    self.tools.call(call, &mut self.confirm, frontend).await
+                    vec![self.tools.call(&batch[0], &mut self.confirm, frontend).await]
                 };
-                frontend.event(Event::ToolResult {
-                    id: call.id.clone(),
-                    name: call.function.name.clone(),
-                    output: output.text.clone(),
-                    is_error: output.is_error,
-                });
-                self.session.push(Message::tool(call.id.clone(), output.text), None)?;
-                if output.finish.is_some() {
-                    finished = output.finish;
+                for (call, output) in batch.iter().zip(outputs) {
+                    frontend.event(Event::ToolResult {
+                        id: call.id.clone(),
+                        name: call.function.name.clone(),
+                        output: output.text.clone(),
+                        is_error: output.is_error,
+                    });
+                    self.session.push(Message::tool(call.id.clone(), output.text), None)?;
+                    if output.finish.is_some() {
+                        finished = output.finish;
+                    }
                 }
+                next += batch.len();
             }
             if let Some(summary) = finished {
                 self.session.end("finished", &summary)?;
@@ -211,6 +290,70 @@ impl Agent {
         }
         self.session.end("request_limit", "")?;
         Ok(Outcome::RequestLimit)
+    }
+
+    fn has_tool(&self, name: &str) -> bool {
+        self.session.header().tools.iter().any(|tool| tool.function.name == name)
+    }
+
+    /// Runs `task` calls as subagents, at most `max_parallel` at once, relays what they do to
+    /// `frontend`, and returns each one's report, in the order of the calls.
+    async fn run_subagents<F: Frontend>(
+        &mut self,
+        calls: &[ToolCall],
+        frontend: &mut F,
+    ) -> Vec<ToolOutput> {
+        let settings = self.profile.subagents.clone();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut outputs: Vec<Option<ToolOutput>> = calls.iter().map(|_| None).collect();
+        let mut children = Vec::new();
+        for (i, call) in calls.iter().enumerate() {
+            let started = tools::task_arguments(call).and_then(|(description, prompt)| {
+                let agent = self.subagent(&description, &prompt).map_err(|e| format!("{e:#}"))?;
+                Ok((description, agent))
+            });
+            match started {
+                Ok((label, agent)) => {
+                    let mut relay = Relay { task: call.id.clone(), label, sender: sender.clone() };
+                    relay.event(Event::Notice {
+                        text: format!("started; its log is {}", agent.session_log().display()),
+                    });
+                    children.push((i, relay, agent));
+                }
+                Err(e) => outputs[i] = Some(failed(&format!("the subagent did not start: {e}"))),
+            }
+        }
+        drop(sender);
+
+        let limit = Semaphore::new(settings.max_parallel.max(1));
+        let results = {
+            let runs = children.iter_mut().map(|(_, relay, agent)| {
+                let limit = &limit;
+                // Boxed, since a subagent's run is this same function a level down.
+                let run: Pin<Box<dyn Future<Output = Result<Outcome>> + '_>> =
+                    Box::pin(async move {
+                        let _turn = limit.acquire().await;
+                        agent.run(relay, settings.max_requests).await
+                    });
+                run
+            });
+            let mut all = std::pin::pin!(join_all(runs));
+            loop {
+                tokio::select! {
+                    results = &mut all => break results,
+                    Some((task, label, event)) = receiver.recv() => {
+                        frontend.event(Event::Subagent { task, label, event: Box::new(event) });
+                    }
+                }
+            }
+        };
+        while let Ok((task, label, event)) = receiver.try_recv() {
+            frontend.event(Event::Subagent { task, label, event: Box::new(event) });
+        }
+        for ((i, _, agent), result) in children.iter().zip(results) {
+            outputs[*i] = Some(report(agent, result));
+        }
+        outputs.into_iter().map(|output| output.expect("every call has an output")).collect()
     }
 
     /// The next request: everything in the log, with the settings fixed at the start.
@@ -280,6 +423,56 @@ pub fn request_stats(turn: &AssistantTurn, seed: Option<u64>) -> RequestStats {
         ttft_ms: timings.ttft_ms,
         finish_reason: turn.finish_reason.clone(),
     }
+}
+
+/// A subagent's frontend: it passes what the subagent does to the agent that started it, and
+/// declines commands that need approval, since a subagent cannot ask the user.
+struct Relay {
+    task: String,
+    label: String,
+    sender: mpsc::UnboundedSender<(String, String, Event)>,
+}
+
+impl Frontend for Relay {
+    fn event(&mut self, event: Event) {
+        let _ = self.sender.send((self.task.clone(), self.label.clone(), event));
+    }
+
+    async fn approve(&mut self, _approval: &Approval) -> Decision {
+        Decision::Deny {
+            note: Some(
+                "A subagent cannot ask the user to approve a command. Leave this step out, and \
+                 say in your summary which command is needed, so that the agent that started you \
+                 can run it."
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// What a subagent's run tells the agent that started it.
+fn report(agent: &Agent, result: Result<Outcome>) -> ToolOutput {
+    let unfinished = "It may have changed files: check them before relying on its work.";
+    match result {
+        Ok(Outcome::Finished(summary)) => {
+            ToolOutput { text: summary, is_error: false, finish: None }
+        }
+        Ok(Outcome::RequestLimit) => failed(&format!(
+            "the subagent used all {} of its requests without finishing. {unfinished}",
+            agent.requests
+        )),
+        Ok(Outcome::ContextLimit(tokens)) => failed(&format!(
+            "the subagent's conversation reached {tokens} tokens before it finished. {unfinished}"
+        )),
+        Ok(Outcome::Replied) => {
+            failed(&format!("the subagent stopped without a summary. {unfinished}"))
+        }
+        Err(e) => failed(&format!("the subagent failed: {e:#}. {unfinished}")),
+    }
+}
+
+fn failed(why: &str) -> ToolOutput {
+    ToolOutput { text: format!("Error: {why}"), is_error: true, finish: None }
 }
 
 /// AGENTS.md from the user's config directory and from the workspace, for the system prompt.

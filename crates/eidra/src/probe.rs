@@ -30,6 +30,10 @@ pub struct ProbeArgs {
     #[arg(long, env = "EIDRA_BASE_URL", default_value = "http://127.0.0.1:8000/v1")]
     base_url: String,
 
+    /// Reach the server through this Unix socket instead of the network (see `eidra relay`)
+    #[arg(long, env = "EIDRA_MODEL_SOCKET", value_name = "PATH")]
+    model_socket: Option<std::path::PathBuf>,
+
     /// Model to request
     #[arg(long, env = "EIDRA_MODEL", default_value = "qwen3.8-flash-next")]
     model: String,
@@ -327,7 +331,7 @@ pub async fn run(args: ProbeArgs) -> Result<()> {
     if key.is_none() {
         eprintln!("note: ${} is not set, so no API key is sent", args.api_key_env);
     }
-    let client = Client::new(&args.base_url, key)?;
+    let client = Client::new(&args.base_url, key, args.model_socket.as_deref())?;
     let models = client.models().await.context("listing the server's models")?;
     if !models.contains(&args.model) {
         eprintln!(

@@ -110,8 +110,12 @@ pub fn progress(done: usize, total: usize, attempt: &Attempt) {
 pub fn print(manifest: &Manifest, attempts: &[Attempt]) {
     let regraded =
         manifest.regraded.as_ref().map_or(String::new(), |when| format!(" · regraded {when}"));
+    let network = match manifest.network {
+        Some(super::Network::Vacuum) => "vacuum",
+        Some(super::Network::Host) | None => "host network",
+    };
     println!(
-        "{} · profile {} ({}) · binary {} · {} · started {}{regraded}",
+        "{} · profile {} ({}) · binary {} · {network} · {} · started {}{regraded}",
         manifest.label,
         manifest.profile,
         short(&manifest.profile_hash),

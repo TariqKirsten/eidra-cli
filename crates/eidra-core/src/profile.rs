@@ -29,6 +29,8 @@ pub struct Profile {
     pub tools: ToolSettings,
     #[serde(default)]
     pub confirm: ConfirmSettings,
+    #[serde(default)]
+    pub subagents: SubagentSettings,
     pub prompts: Prompts,
     /// The system prompt template: system.md beside profile.toml.
     #[serde(skip)]
@@ -85,6 +87,25 @@ pub struct ConfirmSettings {
     pub commands: Vec<String>,
 }
 
+/// Subagents, which the `task` tool starts (docs/DESIGN.md §5.1).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentSettings {
+    /// Subagents running at once. Radiance serves four requests at a time.
+    pub max_parallel: usize,
+    /// Requests each subagent may make before it is stopped.
+    pub max_requests: usize,
+    /// The tools a subagent gets; unset, the main agent's, without `task`.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+}
+
+impl Default for SubagentSettings {
+    fn default() -> Self {
+        SubagentSettings { max_parallel: 3, max_requests: 40, tools: None }
+    }
+}
+
 /// What the model is told beyond the system prompt template.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +114,8 @@ pub struct Prompts {
     pub headless: String,
     /// Replaces `{{mode}}` when a person is in the loop.
     pub interactive: String,
+    /// Replaces `{{mode}}` for a subagent.
+    pub subagent: String,
     /// Sent when a reply stops at max_tokens; `{max_tokens}` is replaced.
     pub cut_off: String,
     /// Sent in an unattended session when a reply calls no tool.

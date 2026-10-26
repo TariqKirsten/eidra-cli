@@ -25,12 +25,24 @@ parallel_tool_calls = true
 limit = 160000
 
 [tools]
+# Add "task" to let the model hand work to subagents ([subagents] below). It stays off until the
+# evals show it helps (DESIGN.md §5.1).
 enabled = ["bash", "bash_output", "bash_kill", "read", "edit", "write", "glob", "grep", "todo"]
 # Characters of one tool result the model sees; longer output is cut in the middle and saved whole.
 output_limit = 30000
 
 # Replacement tool descriptions, by tool name.
 [tools.descriptions]
+
+[subagents]
+# Subagents running at once. Radiance serves four requests at a time (the agent that started them
+# waits meanwhile); three leaves one for anything else using the server.
+max_parallel = 3
+# Requests each subagent may make before it is stopped.
+max_requests = 40
+# The tools a subagent gets; unset, the main agent's without "task". A read-only list makes
+# explorers instead of workers.
+# tools = ["read", "glob", "grep", "bash"]
 
 [confirm]
 # Commands that need the user's go-ahead: "git" covers every git command, "git push" only pushes.
@@ -49,6 +61,13 @@ interactive = """
 
 # Replying
 When you have done what was asked, reply with a short summary of what you changed and how you checked it.
+"""
+# Replaces {{mode}} for a subagent. Everything before {{mode}} is the same as the main agent's, so
+# the server reuses its cached start.
+subagent = """
+
+# Working for another agent
+Another agent gave you this task and is waiting for your result. Nobody else is watching, and nobody can answer questions: make reasonable assumptions and keep going until the task is done. Every reply must call a tool. Other agents may be working in the same directory at the same time, so change only the files your task is about. When you are done, call `finish` with what the other agent needs: what you found or changed and where (files and line numbers), how you checked it, and anything you could not do. It sees only that summary.
 """
 # Sent when a reply stops at max_tokens; {max_tokens} is replaced.
 cut_off = "Your last reply reached the {max_tokens}-token limit and was cut off, so its last tool call was not run. Write large files in smaller parts, or change them with edit."

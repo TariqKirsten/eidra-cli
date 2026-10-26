@@ -38,6 +38,11 @@ pub struct ExecArgs {
     #[arg(long, env = "EIDRA_MODEL")]
     model: Option<String>,
 
+    /// Reach the model server through this Unix socket instead of the network, for an agent
+    /// with no network of its own (see `eidra relay`)
+    #[arg(long, env = "EIDRA_MODEL_SOCKET", value_name = "PATH")]
+    model_socket: Option<PathBuf>,
+
     /// Stop after this many requests to the model
     #[arg(long, default_value_t = 150)]
     max_requests: usize,
@@ -78,8 +83,13 @@ pub async fn run(args: ExecArgs) -> Result<i32> {
         None => std::env::current_dir().context("the current directory")?,
     };
     let session_root = args.session_dir.clone().unwrap_or_else(|| default_session_dir(&workspace));
-    let options =
-        AgentOptions { workspace, session_root, headless: true, confirm: args.confirm.clone() };
+    let options = AgentOptions {
+        workspace,
+        session_root,
+        headless: true,
+        confirm: args.confirm.clone(),
+        model_socket: args.model_socket.clone(),
+    };
     let mut agent = Agent::start(profile, options)?;
 
     let mut output = Output::new(args.json);
@@ -261,6 +271,25 @@ impl Frontend for Output {
                 self.stop_streaming();
                 eprintln!("! {text}");
             }
+            // Subagents run side by side, so only their steps are shown, each under its task.
+            Event::Subagent { label, event, .. } => match *event {
+                Event::ToolCall { name, arguments, .. } => {
+                    self.stop_streaming();
+                    eprintln!("  [{label}] → {}", describe_call(&name, &arguments));
+                }
+                Event::ToolResult { output, is_error, .. } => {
+                    let mark = if is_error { "✗" } else { "←" };
+                    eprintln!(
+                        "{}",
+                        self.dim(&format!("  [{label}]   {mark} {}", summarise(&output)))
+                    );
+                }
+                Event::Notice { text } => {
+                    self.stop_streaming();
+                    eprintln!("  [{label}] ! {text}");
+                }
+                _ => {}
+            },
         }
     }
 
@@ -335,6 +364,7 @@ pub(crate) fn describe_call(name: &str, arguments: &str) -> String {
         "glob" => format!("glob {}", text("pattern")),
         "grep" => format!("grep {} {}", text("pattern"), text("path")).trim_end().to_owned(),
         "bash_output" | "bash_kill" => format!("{name} {}", number("id").unwrap_or_default()),
+        "task" => format!("task: {}", text("description")),
         "todo" | "finish" => name.to_owned(),
         _ => format!("{name} {}", clip(arguments, 160)),
     }
@@ -378,6 +408,10 @@ mod tests {
             "write a.py (2 lines)"
         );
         assert_eq!(describe_call("grep", r#"{"pattern": "def main"}"#), "grep def main");
+        assert_eq!(
+            describe_call("task", r#"{"description": "find the parser", "prompt": "…"}"#),
+            "task: find the parser"
+        );
     }
 
     #[test]

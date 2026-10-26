@@ -4,13 +4,16 @@
 //! - check/: mounted at /check only while the checks run, never shown to the agent
 //! - solution/: a reference solution laid over workspace/, used only by `eidra eval validate`
 //!
-//! See evals/README.md.
+//! A directory with an instruction.md is a Harbor-format task instead (harbor.rs). See
+//! evals/README.md.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+use super::harbor;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +79,8 @@ fn default_check_timeout() -> u64 {
 pub struct Task {
     pub spec: Spec,
     pub dir: PathBuf,
+    /// Set for a Harbor-format task, whose spec is made from its instruction.md and task.toml.
+    pub harbor: Option<harbor::Config>,
 }
 
 impl Task {
@@ -108,6 +113,10 @@ pub fn load_suite(suite: &Path) -> Result<Vec<Task>> {
         if !file.is_file() {
             continue;
         }
+        if dir.join("instruction.md").is_file() {
+            tasks.push(load_harbor(&dir)?);
+            continue;
+        }
         let text =
             fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
         let spec: Spec = toml::from_str(&text).with_context(|| format!("{}", file.display()))?;
@@ -121,11 +130,31 @@ pub fn load_suite(suite: &Path) -> Result<Vec<Task>> {
         if spec.checks.is_empty() {
             bail!("{}: a task needs at least one check", file.display());
         }
-        tasks.push(Task { spec, dir });
+        tasks.push(Task { spec, dir, harbor: None });
     }
     if tasks.is_empty() {
         bail!("there are no tasks in {}", suite.display());
     }
     tasks.sort_by(|a, b| a.spec.id.cmp(&b.spec.id));
     Ok(tasks)
+}
+
+/// A Harbor-format task. Harbor has no splits, and outside tasks are not tuned on, so they count
+/// as test tasks.
+fn load_harbor(dir: &Path) -> Result<Task> {
+    let config = harbor::Config::load(dir)?;
+    let prompt = fs::read_to_string(dir.join("instruction.md"))
+        .with_context(|| format!("reading {}", dir.join("instruction.md").display()))?;
+    let id = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_owned();
+    let spec = Spec {
+        id,
+        split: Split::Test,
+        origin: config.source.clone(),
+        image: config.docker_image.clone().unwrap_or_default(),
+        prompt: prompt.trim().to_owned(),
+        max_requests: harbor::MAX_REQUESTS,
+        timeout_s: config.agent_timeout_s.ceil() as u64,
+        checks: Vec::new(),
+    };
+    Ok(Task { spec, dir: dir.to_path_buf(), harbor: Some(config) })
 }

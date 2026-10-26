@@ -27,6 +27,11 @@ pub struct Header {
     pub model: String,
     pub reasoning_effort: String,
     pub tools: Vec<Tool>,
+    /// For a subagent: the session that started it, and the task's description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -172,6 +177,8 @@ mod tests {
             model: "m".into(),
             reasoning_effort: "medium".into(),
             tools: vec![],
+            parent: None,
+            task: None,
         };
         let mut session = Session::create(&root, header).unwrap();
         session.push(Message::user("hi"), None).unwrap();

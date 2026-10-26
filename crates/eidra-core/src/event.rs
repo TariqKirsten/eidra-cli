@@ -24,6 +24,9 @@ pub enum Event {
     Todo { list: String },
     /// Something for the user that is not part of the conversation.
     Notice { text: String },
+    /// Something a subagent did. `task` is the id of the `task` call that started it, and `label`
+    /// its description.
+    Subagent { task: String, label: String, event: Box<Event> },
 }
 
 /// What the server reported about one request, and the seed it was sent with.
