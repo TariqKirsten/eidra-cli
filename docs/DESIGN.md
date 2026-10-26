@@ -575,8 +575,9 @@ Reference: codex-rs `tui`.
   - A git command that fails or takes over 20 s turns checkpoints off for the session, with a
     notice; the turn goes on. Background subagents' changes count towards whichever turn they
     happen in.
-  - Snapshots cost a few git commands per turn, about 10 ms each on a small project. Old
-    objects are never pruned yet.
+  - Snapshots cost a few git commands per turn, about 10 ms each on a small project. A session's
+    snapshots are let go 30 days after its last one, when the next session in that workspace
+    starts, and `git gc --auto` collects them in the background.
 - **Observability:** `tracing` writes to a file. Optionally, OTLP traces go to the local
   Langfuse.
 

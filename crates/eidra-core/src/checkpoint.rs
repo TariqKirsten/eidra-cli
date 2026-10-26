@@ -28,6 +28,8 @@ const LARGEST_FILE: u64 = 8 << 20;
 const MOST_NEW_FILES: usize = 20_000;
 /// A session's index is removed this long after it was last used.
 const INDEX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+/// A session's snapshots are let go this long after its last one, and git then prunes them.
+const SESSION_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Left out on top of the project's own ignore files: caches, environments and build output,
 /// which no undo needs.
 const EXCLUDE: &str = "\
@@ -132,10 +134,33 @@ impl Checkpoints {
         }
         if !self.git_dir.join("HEAD").exists() {
             self.create().await?;
+        } else {
+            self.remove_old_sessions().await;
         }
         self.remove_old_indexes();
         self.ready = true;
         Ok(())
+    }
+
+    /// Lets go of the refs of sessions whose last snapshot is older than `SESSION_AGE`, and asks
+    /// git to collect what they held. `gc --auto` works only past its own thresholds, and in the
+    /// background. Nothing here stops the session if it fails.
+    async fn remove_old_sessions(&self) {
+        let format = "--format=%(refname) %(committerdate:unix)";
+        let Ok(refs) = self.git(&["for-each-ref", format, "refs/eidra/"]).await else {
+            return;
+        };
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        for line in refs.lines() {
+            let Some((name, when)) = line.rsplit_once(' ') else {
+                continue;
+            };
+            let old = when.parse::<u64>().is_ok_and(|t| now.as_secs() > t + SESSION_AGE.as_secs());
+            if old && name != self.reference {
+                let _ = self.git(&["update-ref", "-d", name]).await;
+            }
+        }
+        let _ = self.git(&["gc", "--auto", "--quiet"]).await;
     }
 
     async fn create(&self) -> Result<(), String> {
@@ -624,6 +649,36 @@ mod tests {
         checkpoints.begin("go").await.unwrap();
         checkpoints.end().await.unwrap();
         assert_eq!(checkpoints.git(&["ls-files"]).await.unwrap(), "a.txt\n");
+    }
+
+    #[tokio::test]
+    async fn old_sessions_are_let_go() {
+        if !has_git() {
+            return eprintln!("no git: skipped");
+        }
+        let s = Scratch::new("old");
+        s.write("a.txt", "1\n");
+        let mut old = s.open("old").await;
+        old.begin("long ago").await.unwrap();
+        old.end().await.unwrap();
+        // Its last snapshot, made again as if long ago.
+        let tree = old.git(&["write-tree"]).await.unwrap();
+        let mut command = Command::new("git");
+        command
+            .arg("--git-dir")
+            .arg(&old.git_dir)
+            .args(["commit-tree", tree.trim(), "-m", "after 1"])
+            .env("GIT_COMMITTER_DATE", "@1000000000 +0000")
+            .envs(IDENTITY);
+        let backdated = output(&mut command, "commit-tree").await.unwrap();
+        let backdated = String::from_utf8_lossy(&backdated.stdout).trim().to_owned();
+        old.git(&["update-ref", "refs/eidra/old", &backdated]).await.unwrap();
+
+        let mut new = s.open("new").await;
+        new.begin("now").await.unwrap();
+        new.end().await.unwrap();
+        let refs = new.git(&["for-each-ref", "--format=%(refname)", "refs/eidra/"]).await.unwrap();
+        assert_eq!(refs, "refs/eidra/new\n");
     }
 
     #[test]
