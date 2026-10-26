@@ -339,6 +339,50 @@ def undo(case):
 
 
 @scenario
+def resume(case):
+    """--continue goes on with the last session: its conversation is shown, and the next request
+    holds all of it."""
+    replies = [reply(text="The answer is 42."), reply(text="You asked about the answer.")]
+    with Server(replies) as server:
+        s = case.start(server=server)
+        s.type("what is the answer?\r")
+        s.wait_for(lambda s: s.contains("The answer is 42.") and idle(s), 10, "the reply")
+        quit_cleanly(s)
+        s = case.start("--continue", server=server)
+        case.show(s, "resumed")
+        assert s.contains("› what is the answer?") and s.contains("The answer is 42."), s.dump()
+        assert s.contains("resumed: the conversation goes on from here (3 messages)"), s.dump()
+        s.type("what did I ask?\r")
+        s.wait_for(lambda s: s.contains("You asked about") and idle(s), 10, "the reply")
+        roles = [m["role"] for m in server.requests[1]["messages"]]
+        assert roles == ["system", "user", "assistant", "user"], roles
+        quit_cleanly(s)
+
+
+@scenario
+def bang_and_mention(case):
+    """!command runs in the workspace and the model hears of it with the next message, which also
+    carries the file it mentions; Tab completes the mention."""
+    (case.workspace / "notes.txt").write_text("remember the milk\n")
+    with Server([reply(text="Milk, and it said hello.")]) as server:
+        s = case.start(server=server)
+        s.type("!echo hello from the shell\r")
+        s.wait_for(lambda s: s.contains("⎿ succeeded") and idle(s), 10, "the command")
+        assert s.contains("  hello from the shell"), s.dump()
+        s.type("what do @no")
+        s.type("\t")
+        s.wait_for(lambda s: s.on_screen("what do @notes.txt"), 5, "the completion")
+        s.type("say?\r")
+        s.wait_for(lambda s: s.contains("Milk, and it said") and idle(s), 10, "the reply")
+        case.show(s, "after the reply")
+        assert s.contains("⎿ attached notes.txt: 1 line"), s.dump()
+        message = server.requests[0]["messages"][-1]["content"]
+        assert message.startswith("[The user ran this command in the workspace: `echo hello"), message
+        assert "what do @notes.txt say?" in message and message.endswith("1\tremember the milk")
+        quit_cleanly(s)
+
+
+@scenario
 def sigterm(case):
     """SIGTERM while a command runs: eidra quits cleanly and the command's process group goes."""
     command = "(sleep 2; touch marker) & sleep 30"

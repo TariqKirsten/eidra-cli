@@ -2,12 +2,12 @@
 //! (docs/DESIGN.md §4.2). Nothing in it is ever rewritten, so the prompt only grows.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read as _, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use eidra_llm::{Message, Tool};
+use eidra_llm::{Content, Message, Part, Tool};
 use serde::{Deserialize, Serialize};
 
 use crate::event::RequestStats;
@@ -55,6 +55,11 @@ enum Record<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         stats: Option<&'a RequestStats>,
     },
+    /// The session was taken up again, at this time, with this profile (docs/DESIGN.md §14).
+    Resumed {
+        at: &'a str,
+        profile_hash: &'a str,
+    },
 }
 
 /// A log's records, read back.
@@ -69,6 +74,7 @@ enum Read {
     },
     End {},
     Compaction {},
+    Resumed {},
 }
 
 /// A session log read back, for replaying its requests.
@@ -87,13 +93,21 @@ impl Log {
         let mut header = None;
         let mut messages = Vec::new();
         let mut starts = vec![0];
-        for (i, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
-            let record = serde_json::from_str(line)
-                .with_context(|| format!("{} line {}", path.display(), i + 1))?;
+        let lines: Vec<(usize, &str)> =
+            text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()).collect();
+        for (n, &(i, line)) in lines.iter().enumerate() {
+            let record = match serde_json::from_str(line) {
+                Ok(record) => record,
+                // A line cut short by a crash, at the very end, is left out.
+                Err(_) if n + 1 == lines.len() && !text.ends_with('\n') => break,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("{} line {}", path.display(), i + 1));
+                }
+            };
             match record {
                 Read::Session(h) => header = Some(h),
                 Read::Message { message, stats } => messages.push((message, stats)),
-                Read::End {} => {}
+                Read::End {} | Read::Resumed {} => {}
                 Read::Compaction {} => starts.push(messages.len()),
             }
         }
@@ -140,8 +154,42 @@ impl Session {
         Ok(session)
     }
 
+    /// Opens a log to go on with it: the session's messages are its last conversation's, and
+    /// what follows is appended. The log as read comes back too.
+    pub fn open(path: &Path) -> Result<(Self, Log)> {
+        let log = Log::read(path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // A line cut short by a crash is ended, so that the next record starts on a line of its own.
+        let mut last = [0u8];
+        if file.seek(SeekFrom::End(-1)).is_ok()
+            && file.read_exact(&mut last).is_ok()
+            && last != *b"\n"
+        {
+            file.write_all(b"\n")?;
+        }
+        let dir = path.with_file_name(&log.header.id);
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let start = log.starts.last().copied().unwrap_or(0);
+        let messages = log.messages[start..].iter().map(|(m, _)| m.clone()).collect();
+        let session =
+            Session { header: log.header.clone(), path: path.to_path_buf(), dir, file, messages };
+        Ok((session, log))
+    }
+
     pub fn header(&self) -> &Header {
         &self.header
+    }
+
+    /// Marks where the session was taken up again, with the profile it goes on with.
+    pub fn resumed(&mut self, profile_hash: &str) -> Result<()> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let (y, mo, d, h, mi, s) = utc_datetime(now.as_secs());
+        let at = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z");
+        self.write(&Record::Resumed { at: &at, profile_hash })
     }
 
     /// The log file.
@@ -188,6 +236,65 @@ impl Session {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         self.file.write_all(&line).with_context(|| format!("writing {}", self.path.display()))
+    }
+}
+
+/// A session as `eidra sessions` lists it, from the start of its log.
+#[derive(Debug, Clone)]
+pub struct Summary {
+    pub path: PathBuf,
+    pub header: Header,
+    /// When the log was last written to.
+    pub modified: SystemTime,
+    /// The first thing the user said.
+    pub first: Option<String>,
+}
+
+/// The sessions in `root`, but not subagents', the most recently active first. Only the start of
+/// each log is read.
+pub fn list(root: &Path) -> Vec<Summary> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut sessions: Vec<Summary> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
+        .filter_map(|path| summary(&path))
+        .filter(|summary| summary.header.parent.is_none())
+        .collect();
+    sessions.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
+    sessions
+}
+
+fn summary(path: &Path) -> Option<Summary> {
+    let modified = fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    let mut lines = BufReader::new(File::open(path).ok()?).lines();
+    let Ok(Read::Session(header)) = serde_json::from_str(&lines.next()?.ok()?) else {
+        return None;
+    };
+    // The system prompt comes first, then the user; a few lines are enough.
+    let first = lines.take(4).map_while(Result::ok).find_map(|line| {
+        match serde_json::from_str(&line).ok()? {
+            Read::Message { message: Message::User { content }, .. } => Some(text_of(&content)),
+            _ => None,
+        }
+    });
+    Some(Summary { path: path.to_path_buf(), header, modified, first })
+}
+
+/// The text of a message's content, without its images.
+pub fn text_of(content: &Content) -> String {
+    match content {
+        Content::Text(text) => text.clone(),
+        Content::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 

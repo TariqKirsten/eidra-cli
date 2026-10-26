@@ -108,7 +108,12 @@ terminal's own scrollback; at the bottom are the reply streaming in, the input b
 - Enter sends; a message sent while the agent works waits for its turn to end. Shift+Enter,
   Alt+Enter or Ctrl+J add a newline.
 - Esc interrupts the agent. Ctrl+C interrupts, or clears the input, or quits; Ctrl+D quits.
-- Up and Down (or Ctrl+P and Ctrl+N) walk the history. Ctrl+T shows the model's reasoning whole instead of as one line.
+- Up and Down (or Ctrl+P and Ctrl+N) walk the history. Ctrl+T shows the model's reasoning whole
+  instead of as one line.
+- `@path` attaches a file to the message: an image as an image, a text file as `read` shows it.
+  Tab completes the path.
+- `!command` runs a command in the project; you see its output, and the agent gets it with your
+  next message.
 - A command on the confirm list asks first: y runs it once, a for the rest of the session, n not.
 - `/help`, `/new` (a new session), `/tasks` and `/stop` (subagents in the background),
   `/undo` and `/diff` (below), `/reasoning`, `/quit`.
@@ -116,6 +121,9 @@ terminal's own scrollback; at the bottom are the reply streaming in, the input b
 Ask the agent to do something in the background, such as "start a subagent to build a calculator
 while we chat", and a subagent works on it while you go on talking; its report comes back to the
 agent when it ends.
+
+`eidra --continue` goes on with this directory's latest session, and `eidra --resume ID` with any
+other; `eidra sessions` lists them.
 
 Each turn is checkpointed in a git repository of eidra's own, apart from the project's:
 `/undo` puts back the files the last turn changed (again for the turn before), and `/diff` shows

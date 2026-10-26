@@ -1,6 +1,7 @@
-//! Images attached to a message (docs/DESIGN.md §10): `@path` mentions, and paths pasted or dropped
-//! into the input box, which terminals give quoted, with escaped spaces, or as `file://` URLs. A
-//! plain word such as `photo.png` in a sentence is left alone.
+//! What a message attaches (docs/DESIGN.md §10, §12): images, by `@path` mentions and by paths
+//! pasted or dropped into the input box, which terminals give quoted, with escaped spaces, or as
+//! `file://` URLs; and text files, by `@path` mentions. A plain word such as `photo.png` in a
+//! sentence is left alone. Tab completes an `@path` from the workspace's files.
 
 use std::path::{Path, PathBuf};
 
@@ -39,6 +40,66 @@ pub fn attachments(text: &str, workspace: &Path) -> Vec<Attachment> {
         found.push(Attachment { name: rest, image });
     }
     found
+}
+
+/// The text files `text` mentions with `@path`, each once, as it names them: files that are not
+/// images or PDFs, which go their own ways.
+pub fn mentioned_files(text: &str, workspace: &Path) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for word in words(text) {
+        let Some(name) = word.strip_prefix('@') else {
+            continue;
+        };
+        let path = resolve(name, workspace);
+        if path.is_file() && !media::is_image(&path) && !media::is_pdf(&path) {
+            let name = name.to_owned();
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+    }
+    found
+}
+
+/// What Tab makes of the `@path` a word ends with: the path completed as far as the workspace's
+/// files agree, and those files when there are several. None if the word is not a mention.
+pub fn complete(word: &str, workspace: &Path) -> Option<(String, Vec<String>)> {
+    let partial = word.strip_prefix('@')?;
+    let (dir, prefix) = match partial.rfind('/') {
+        Some(i) => partial.split_at(i + 1),
+        None => ("", partial),
+    };
+    let mut names: Vec<String> = std::fs::read_dir(resolve(dir, workspace))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            // Hidden files only when asked for.
+            if !name.starts_with(prefix) || (name.starts_with('.') && !prefix.starts_with('.')) {
+                return None;
+            }
+            let is_dir = entry.path().is_dir();
+            Some(if is_dir { format!("{name}/") } else { name })
+        })
+        .collect();
+    names.sort();
+    let completed = match names.as_slice() {
+        [] => return Some((word.to_owned(), names)),
+        [one] if one.ends_with('/') => format!("@{dir}{one}"),
+        [one] => format!("@{dir}{one} "),
+        [first, rest @ ..] => {
+            let common = rest.iter().fold(first.as_str(), |common, name| {
+                let same = common.chars().zip(name.chars()).take_while(|(a, b)| a == b).count();
+                let end = common.char_indices().nth(same).map_or(common.len(), |(i, _)| i);
+                &common[..end]
+            });
+            format!("@{dir}{common}")
+        }
+    };
+    if names.len() == 1 {
+        names.clear();
+    }
+    Some((completed, names))
 }
 
 /// `text` split at whitespace, except inside quotes or after a backslash, which are taken out.
@@ -110,6 +171,33 @@ mod tests {
             ["look", "at", "/tmp/My Shots/a.png", "and", "/tmp/b c.png", "then", "@d.png"]
         );
         assert_eq!(percent_decoded("/tmp/My%20Shots/a.png"), "/tmp/My Shots/a.png");
+    }
+
+    #[test]
+    fn mentions_text_files_and_completes_paths() {
+        let dir = std::env::temp_dir().join(format!("eidra-mention-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/parts")).unwrap();
+        for file in ["src/main.rs", "src/model.rs", "src/.hidden", "notes.md", "logo.png"] {
+            std::fs::write(dir.join(file), "x").unwrap();
+        }
+        let text = "fix @src/main.rs, see @notes.md and @logo.png; @src/main.rs again, @nothing.rs";
+        assert_eq!(mentioned_files(text, &dir), ["src/main.rs", "notes.md"]);
+
+        let done = |word: &str| complete(word, &dir).map(|(word, _)| word);
+        assert_eq!(done("@no"), Some("@notes.md ".into()));
+        assert_eq!(done("@sr"), Some("@src/".into()));
+        assert_eq!(
+            complete("@src/m", &dir),
+            Some(("@src/m".into(), vec!["main.rs".into(), "model.rs".into(),]))
+        );
+        assert_eq!(done("@src/mo"), Some("@src/model.rs ".into()));
+        assert_eq!(done("@src/p"), Some("@src/parts/".into()));
+        assert_eq!(complete("@src/", &dir).unwrap().1, ["main.rs", "model.rs", "parts/"]);
+        assert_eq!(complete("@src/.", &dir).unwrap().0, "@src/.hidden ");
+        assert_eq!(complete("@zzz", &dir), Some(("@zzz".into(), vec![])));
+        assert_eq!(complete("src", &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -435,13 +435,32 @@ A step's reasoning, calls and results stay together; a blank line separates ever
 - Shift+Enter, Alt+Enter or Ctrl+J add a newline.
 - Esc interrupts. Ctrl+C interrupts when the agent works, else clears the input, else quits.
   Ctrl+D quits when the input is empty.
-- Up and Down move between rows, and walk the history from the first or the last.
+- Up and Down (or Ctrl+P and Ctrl+N) move between rows, and walk the history from the first or
+  the last.
 - Ctrl+T shows reasoning whole or as one line.
+- Tab after an `@path` completes it from the workspace's files: all of it if one file fits (a
+  directory gets its `/`), else as far as they agree, listing them under the input box. Anywhere
+  else Tab is four spaces.
 - An approval takes y (once), a (this command, for the rest of the session) or n. Keys that arrive
   in the first 0.4 s are ignored, so that typing meant for the input box does not answer it.
 - Commands: `/help`, `/new`, `/tasks` and `/stop [n]` for background tasks, `/undo` and
   `/diff [all]` (§14), `/reasoning`, `/quit` (or `/exit`). Quitting stops the turn and the
   background tasks first, and waits for an undo under way.
+
+**What a message brings along** (M8, 2026-10-27):
+- **`@path` to a text file** attaches it after the message, as `read` shows it, numbered lines
+  and all, in the profile's `attached_file` wrapping (images go as images, §10; PDFs are left for
+  `read`). It goes through the agent's own `read`, so the model has seen the file, and a nested
+  AGENTS.md comes with it the first time.
+- **`!command`** runs a command in the workspace, in a bash of its own (its `cd` and exports do
+  not carry over, to the agent's shell or the next `!`), for up to ten minutes; Esc or Ctrl+C
+  stops it and everything it started. The scrollback shows its first 10 and last 30 lines and how
+  it ended. The agent hears of it with the next message, which starts with the command, how it
+  ended and its output, cut to `[tools] output_limit` (`[prompts] user_command`). It does not
+  start a turn: it is context for the next message. It can run while the agent works; messages
+  sent while it runs wait for it.
+- Notes come first in the message, in order: `interrupted`, then what `/undo` put back and what
+  `!` commands printed, then background reports, then the user's text, then attached files.
 
 **Interrupts.** The agent runs in a future that owns it and hands it back when the turn ends; it
 sends events and approval requests to the UI loop through a channel. Esc stops the run:
@@ -456,12 +475,12 @@ sends events and approval requests to the UI loop through a channel. Esc stops t
 screen with a small terminal emulator:
 - `scripts/tui/offline.py` runs it against a fake server that streams scripted replies: typing and
   commands, a reply with the status line's numbers, tool calls, an approval, an interrupt, a queued
-  message, a background task worked on during the chat, and SIGTERM. About 20 s, no GPU; run it
-  after any change to the TUI.
+  message, a background task worked on during the chat, attachments, PDF pages, `/undo` and
+  `/diff`, `--continue`, `!` commands and `@` mentions, and SIGTERM. About 25 s, no GPU; run it
+  after any change to the TUI. `--docker IMAGE` runs the same in the image (§13).
 - `scripts/tui/smoke.py` does the same against radiance, in about 30 s of GPU. It refuses to run
   unless qwen-assistant is already loaded, since asking for it would unload whatever else is.
 
-Later: an `@` file picker, a `!` shell, and `--continue`/`--resume` (§14).
 
 Reference: codex-rs `tui`.
 
@@ -510,7 +529,25 @@ Reference: codex-rs `tui`.
 
 ## 14. Sessions, checkpoints, observability
 
-- **Sessions:** `--continue`, `--resume` and fork all work from the session log.
+- **Sessions** (M8, 2026-10-27): `eidra --continue` (`-c`) goes on with this directory's latest
+  interactive session, `eidra --resume ID` (`-r`) with any session by its id or the start of it,
+  and `eidra exec` takes both for unattended sessions; `eidra sessions` lists this directory's
+  (`--all`, every directory's), the most recently active first, with the first thing the user
+  said.
+  - A resumed session goes on in its own log and its own workspace, with its system prompt and
+    tools as they were: they are the start of every request, so the server's cache can still hold
+    the conversation (radiance keeps it for four hours). The rest of the profile is the current
+    one, and the TUI says so if it changed. The log gets a `resumed` record.
+  - The conversation goes on from its last compaction. Calls left without results, by a crash or
+    a kill, get results that say eidra stopped before them, and if the last turn did not end, the
+    next message starts with the `interrupted` note. Request numbers, and so seeds, go on from
+    where they were.
+  - The TUI shows the conversation again, its last 80 messages, as they were shown at the time,
+    and finds the session's checkpoints, so `/undo` still works.
+  - A subagent's session cannot be resumed, nor an unattended one in the TUI or the other way
+    round, since the tools and the system prompt differ. A log cut off in the middle of a line by
+    a crash is read up to that line.
+  - Not done: fork (a new session from a point in an old one).
 - **Checkpoints** (M6, 2026-10-27): in an interactive session, a git repository of eidra's own
   records the workspace before and after each turn. It is bare, one per workspace, under
   `~/.local/share/eidra/checkpoints`, and runs with the workspace as its work tree and an index
@@ -604,6 +641,7 @@ Reference: codex-rs `tui`.
 | M5 | uv, ty, ruff, post-edit diagnostics | the agent hears of the problems its edits introduce (done, §9) |
 | M6 | images, PDFs, nested AGENTS.md, compaction, checkpoints | the agent reads images and PDFs, a long session goes on past its context, and a turn can be undone (done, §8, §10, §11, §14) |
 | M7 | runtime image and wrapper | the TUI and `exec` run in the image on any project, as the user (done, §13) |
+| M8 | sessions resumed, `@` files and Tab, `!` commands; scope chosen by the agent on 2026-10-27, for the user to change | a session can be taken up again after quitting, and a message can bring files and command output (done, §12, §14) |
 
 Evals come first so that every later change, subagents included, is measured. Subagents share
 radiance's four slots and its cache, so whether they pay off here is something to measure, not

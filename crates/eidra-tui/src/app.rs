@@ -29,9 +29,10 @@ use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
 use eidra_core::checkpoint::{Checkpoints, Undone};
 use eidra_core::display::{clip, compact, describe_call, duration, summarise, thousands};
 use eidra_core::{
-    Agent, AgentOptions, Approval, Background, Decision, Event, Frontend, Interrupter, Outcome,
-    Profile, Report, RequestStats,
+    Agent, AgentOptions, Approval, Background, Decision, Event, Frontend, Interrupter, Log,
+    Outcome, Profile, Report, RequestStats, text_of,
 };
+use eidra_llm::Message as Logged;
 use futures_util::StreamExt;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -45,6 +46,7 @@ use crate::style::{self, Line, Style, theme};
 use crate::wrap::{wrap, wrap_all};
 
 /// What sessions start from: the first one, and each `/new` after it.
+#[derive(Clone)]
 pub struct Options {
     pub profile: Profile,
     pub workspace: PathBuf,
@@ -53,6 +55,8 @@ pub struct Options {
     pub confirm: Vec<String>,
     /// Where the checkpoint repositories go, one per workspace; None turns checkpoints off.
     pub checkpoints: Option<PathBuf>,
+    /// The log of a session to go on with, instead of starting one.
+    pub resume: Option<PathBuf>,
 }
 
 /// Requests one turn may make before the turn goes back to the user.
@@ -66,6 +70,13 @@ const FRAME: Duration = Duration::from_millis(16);
 const APPROVAL_GRACE: Duration = Duration::from_millis(400);
 /// Lines of a diff /diff shows; the rest are counted.
 const DIFF_LINES: usize = 400;
+/// Messages of a resumed conversation shown when it starts; earlier ones are counted.
+const HISTORY: usize = 80;
+/// How long a command typed after `!` may run.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+/// Lines of such a command's output the scrollback shows, from its start and its end.
+const COMMAND_HEAD: usize = 10;
+const COMMAND_TAIL: usize = 30;
 
 const HELP: &[(&str, &str)] = &[
     ("enter", "send; while the agent works, queue it for when the turn ends"),
@@ -78,6 +89,8 @@ const HELP: &[(&str, &str)] = &[
         "move between rows; from the first or last, walk the history (also ctrl+p, ctrl+n)",
     ),
     ("ctrl+t", "show reasoning in full, or as one line"),
+    ("!command", "run a command in the workspace; the agent sees it with your next message"),
+    ("@path, tab", "attach a file to the message; tab completes the path"),
     ("/undo", "put back the files the last turn changed; again for the turn before"),
     ("/diff [all]", "what changed since the last turn began, or since the session's first"),
     ("/new", "start a new session"),
@@ -89,13 +102,22 @@ const HELP: &[(&str, &str)] = &[
 ];
 
 /// Runs an interactive session in the terminal until the user quits.
-pub async fn run(options: Options) -> Result<()> {
+pub async fn run(mut options: Options) -> Result<()> {
     // The first session starts before the terminal changes, so a bad profile or directory is
     // reported the ordinary way.
-    let agent = start(&options)?;
+    let agent = match &options.resume {
+        Some(log) => Agent::resume(options.profile.clone(), agent_options(&options), log)?,
+        None => start(&options)?,
+    };
+    // A session resumed from another directory goes on in its own, and so does /new after it.
+    options.workspace = agent.workspace().to_path_buf();
+    let resumed = options.resume.is_some();
     let (width, height) = terminal::size().context("reading the terminal's size")?;
     let terminal = Terminal::enter().context("setting up the terminal")?;
     let mut app = App::new(options, agent, Screen::new(io::stdout(), width, height));
+    if resumed {
+        app.resumed().await;
+    }
     let result = app.run().await;
     let end = app.end();
     drop(terminal);
@@ -103,16 +125,17 @@ pub async fn run(options: Options) -> Result<()> {
 }
 
 fn start(options: &Options) -> Result<Agent> {
-    Agent::start(
-        options.profile.clone(),
-        AgentOptions {
-            workspace: options.workspace.clone(),
-            session_root: options.session_root.clone(),
-            headless: false,
-            confirm: options.confirm.clone(),
-            model_socket: None,
-        },
-    )
+    Agent::start(options.profile.clone(), agent_options(options))
+}
+
+fn agent_options(options: &Options) -> AgentOptions {
+    AgentOptions {
+        workspace: options.workspace.clone(),
+        session_root: options.session_root.clone(),
+        headless: false,
+        confirm: options.confirm.clone(),
+        model_socket: None,
+    }
 }
 
 /// What the agent's frontend sends the loop.
@@ -159,6 +182,12 @@ enum Done {
         diff: Result<Option<(usize, String)>, String>,
     },
     Undo(Result<Option<Undone>, String>),
+    /// A command typed after `!`: its output, and how it ended unless with 0.
+    Command {
+        command: String,
+        output: String,
+        status: Option<String>,
+    },
 }
 
 /// A turn of the agent's, while it runs.
@@ -260,6 +289,10 @@ struct App<W: Write> {
     /// The session's checkpoints, or why it has none.
     checkpoints: Result<Arc<Mutex<Checkpoints>>, String>,
     job: Option<Job>,
+    /// The command typed after `!` that the job runs, and when it started.
+    command: Option<(String, Instant)>,
+    /// The files an `@path` could go on to, shown under the input box after a Tab.
+    completions: Vec<String>,
     /// Counts the sessions started, so that a task reports only to its own.
     session: u64,
     /// The last request's numbers, for the status line.
@@ -298,6 +331,8 @@ impl<W: Write> App<W> {
             notes: Vec::new(),
             checkpoints,
             job: None,
+            command: None,
+            completions: Vec::new(),
             session: 0,
             stats: None,
             show_reasoning: false,
@@ -345,7 +380,9 @@ impl<W: Write> App<W> {
                     self.task_ended(i, report);
                 }
                 done = job_done(&mut self.job), if self.job.is_some() => self.job_ended(done),
-                _ = tick.tick(), if self.turn.is_some() => self.dirty = true,
+                _ = tick.tick(), if self.turn.is_some() || self.command.is_some() => {
+                    self.dirty = true;
+                }
                 () = sleep_until(frame.unwrap_or_else(Instant::now)), if frame.is_some() => {}
                 _ = hangup.recv() => self.request_quit(),
                 _ = terminate.recv() => self.request_quit(),
@@ -385,6 +422,80 @@ impl<W: Write> App<W> {
         let second = format!("session {session} · /help for keys and commands");
         let lines = vec![Line::styled(first, theme::BOLD), Line::styled(second, theme::DIM)];
         self.commit(Block::Info, lines);
+    }
+
+    /// Shows the conversation a resumed session goes on from, and finds the checkpoints of its
+    /// turns.
+    async fn resumed(&mut self) {
+        self.history();
+        let Some(agent) = &self.agent else {
+            return;
+        };
+        let (changed, workspace) = (agent.profile_changed(), agent.workspace().to_path_buf());
+        let session = agent.session_id().to_owned();
+        if changed {
+            self.notice(
+                "the profile has changed since this session began; it keeps its system prompt and \
+                 tools, and the rest of the profile is the new one",
+            );
+        }
+        if let Some(root) = &self.options.checkpoints {
+            let found = Checkpoints::resume(root, &workspace, &session).await;
+            self.checkpoints = found.map(|checkpoints| Arc::new(Mutex::new(checkpoints)));
+        }
+    }
+
+    /// The last conversation of the session's log, as it was shown while it happened.
+    fn history(&mut self) {
+        let log = match Log::read(&self.log) {
+            Ok(log) => log,
+            Err(e) => return self.error(&format!("reading the session's log: {}", causes(&e))),
+        };
+        let start = log.starts.last().copied().unwrap_or(0);
+        let messages = &log.messages[start..];
+        let skipped = messages.len().saturating_sub(HISTORY);
+        let mut before = Vec::new();
+        if start > 0 {
+            before.push(format!("it was compacted {} times", log.starts.len() - 1));
+        }
+        if skipped > 0 {
+            before.push(format!("{skipped} earlier messages are not shown"));
+        }
+        let width = self.width();
+        for (message, stats) in &messages[skipped..] {
+            match message {
+                Logged::System { .. } => {}
+                Logged::User { content } => {
+                    let text = text_of(content);
+                    let lines =
+                        hanging(Line::styled("› ", theme::USER), &text, Style::PLAIN, width);
+                    self.commit(Block::User, lines);
+                }
+                Logged::Assistant(reply) => {
+                    let reasoning = reply.reasoning_content.as_deref().unwrap_or_default();
+                    let content = reply.content.as_deref().unwrap_or_default();
+                    self.commit_reply(reasoning, content, stats.as_ref());
+                    for call in &reply.tool_calls {
+                        let what = describe_call(&call.function.name, &call.function.arguments);
+                        self.commit(Block::Tools, call_lines(None, &what, width));
+                    }
+                    if stats.is_some() {
+                        self.stats.clone_from(stats);
+                    }
+                }
+                Logged::Tool { content, .. } => {
+                    let text = text_of(content);
+                    let lines = result_lines(None, &text, text.starts_with("Error"), width);
+                    self.commit(Block::Tools, lines);
+                }
+            }
+        }
+        let mut info =
+            format!("resumed: the conversation goes on from here ({} messages", messages.len());
+        for part in before {
+            info.push_str(&format!("; {part}"));
+        }
+        self.info(&(info + ")"));
     }
 
     // The scrollback.
@@ -680,6 +791,7 @@ impl<W: Write> App<W> {
     }
 
     fn key(&mut self, key: KeyEvent) {
+        self.completions.clear();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -711,6 +823,8 @@ impl<W: Write> App<W> {
                     } else {
                         self.interrupt();
                     }
+                } else if self.command.is_some() {
+                    self.interrupt();
                 } else if !self.editor.is_empty() {
                     self.editor.clear();
                 } else {
@@ -725,12 +839,29 @@ impl<W: Write> App<W> {
                 self.editor.key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
             }
             KeyCode::Char('j') if ctrl => self.editor.insert("\n"),
+            KeyCode::Tab if !ctrl && !alt && self.complete() => {}
             KeyCode::Enter if shift || alt || ctrl => self.editor.insert("\n"),
             KeyCode::Enter => self.submit(),
             _ => {
                 self.editor.key(key);
             }
         }
+    }
+
+    /// Completes the `@path` before the caret, if there is one there.
+    fn complete(&mut self) -> bool {
+        let before = self.editor.before_caret();
+        let start = before
+            .rfind(char::is_whitespace)
+            .map_or(0, |i| i + before[i..].chars().next().map_or(1, char::len_utf8));
+        let word = &before[start..];
+        let Some((completed, names)) = attach::complete(word, &self.workspace) else {
+            return false;
+        };
+        let len = word.len();
+        self.editor.replace_before_caret(len, &completed);
+        self.completions = names;
+        true
     }
 
     fn approving(&self) -> bool {
@@ -744,6 +875,12 @@ impl<W: Write> App<W> {
     }
 
     fn interrupt(&mut self) {
+        // A command typed after `!` stops with its job: dropping it stops its process group.
+        if let Some((command, _)) = self.command.take() {
+            self.job = None;
+            self.notice(&format!("stopped `{}`", clip(&command, 60)));
+            self.after_job();
+        }
         if let Some(turn) = &mut self.turn
             && !turn.interrupted
         {
@@ -794,6 +931,8 @@ impl<W: Write> App<W> {
         if let Some(command) = command(text) {
             let rest = text[command.len()..].trim().to_owned();
             self.command(command, &rest);
+        } else if let Some(command) = text.strip_prefix('!') {
+            self.run_command(command.trim());
         } else if self.busy() {
             self.queued.push(text.to_owned());
         } else {
@@ -913,6 +1052,29 @@ impl<W: Write> App<W> {
         }
     }
 
+    /// Runs a command typed after `!` in the workspace. Its output goes into the scrollback, and
+    /// to the agent with the next message.
+    fn run_command(&mut self, command: &str) {
+        if command.is_empty() {
+            self.notice("type a command after !, such as !git status");
+            return;
+        }
+        if self.job.is_some() {
+            self.notice("the last /diff, /undo or command has not finished yet");
+            return;
+        }
+        let width = self.width();
+        let lines = hanging(Line::styled("! ", theme::USER), command, theme::BOLD, width);
+        self.commit(Block::User, lines);
+        let (workspace, command) = (self.workspace.clone(), command.to_owned());
+        self.command = Some((command.clone(), Instant::now()));
+        self.job = Some(Box::pin(async move {
+            let (output, status) =
+                eidra_core::run_command(&workspace, &command, COMMAND_TIMEOUT).await;
+            Done::Command { command, output, status }
+        }));
+    }
+
     fn checkpoints_for_a_job(&mut self) -> Option<Arc<Mutex<Checkpoints>>> {
         if self.job.is_some() {
             self.notice("the last /diff or /undo has not finished yet");
@@ -948,13 +1110,55 @@ impl<W: Write> App<W> {
             Done::Undo(Ok(Some(undone))) => self.undone(undone),
             Done::Diff { diff: Err(why), .. } => self.error(&format!("/diff: {why}")),
             Done::Undo(Err(why)) => self.error(&format!("/undo: {why}")),
+            Done::Command { command, output, status } => {
+                self.command_ended(command, output, status)
+            }
         }
+        self.after_job();
+    }
+
+    fn after_job(&mut self) {
+        self.dirty = true;
         self.check_quit();
         if !self.quitting && self.turn.is_none() {
             // Messages and reports that waited for it.
             let queued = mem::take(&mut self.queued).join("\n\n");
             self.send(queued);
         }
+    }
+
+    /// Shows what a `!` command printed, its start and end if it is long, and keeps all of it, up
+    /// to the profile's limit for a tool's output, for the agent's next message.
+    fn command_ended(&mut self, command: String, output: String, status: Option<String>) {
+        self.command = None;
+        let rows: Vec<&str> = output.lines().collect();
+        let mut lines: Vec<Line> = Vec::new();
+        let show = |line: &str| Line::styled(format!("  {}", style::expand_tabs(line)), theme::DIM);
+        if rows.len() > COMMAND_HEAD + COMMAND_TAIL + 1 {
+            lines.extend(rows[..COMMAND_HEAD].iter().map(|line| show(line)));
+            let hidden = rows.len() - COMMAND_HEAD - COMMAND_TAIL;
+            lines.push(Line::styled(format!("  … {hidden} lines …"), theme::DIM));
+            lines.extend(rows[rows.len() - COMMAND_TAIL..].iter().map(|line| show(line)));
+        } else {
+            lines.extend(rows.iter().map(|line| show(line)));
+        }
+        let ended = match &status {
+            None => "succeeded".to_owned(),
+            Some(how) => format!("failed ({how})"),
+        };
+        let style = if status.is_some() { theme::ERROR } else { theme::DIM };
+        lines.push(Line::styled(format!("  ⎿ {ended}"), style));
+        self.commit(Block::Tools, lines);
+        let profile = &self.options.profile;
+        let output = if output.is_empty() { "(no output)".to_owned() } else { output };
+        let output = eidra_core::truncate_middle(&output, profile.tools.output_limit, "");
+        let note = profile
+            .prompts
+            .user_command
+            .replace("{command}", &command)
+            .replace("{status}", &ended)
+            .replace("{output}", &output);
+        self.notes.push(note);
     }
 
     /// Shows what an undo did, and keeps a note of it for the agent's next message: without one,
@@ -1002,17 +1206,37 @@ impl<W: Write> App<W> {
         let label =
             if text.is_empty() { "(reports of background tasks)".into() } else { text.clone() };
         let mut images = Vec::new();
+        let mut files = Vec::new();
         if !text.is_empty() {
             let user = Line::styled("› ", theme::USER);
             let mut lines = hanging(user, &text, Style::PLAIN, self.width());
+            let mut attached = Vec::new();
             for attachment in attach::attachments(&text, &self.workspace) {
-                let (what, style) = match attachment.image {
+                attached.push(match attachment.image {
                     Ok(image) => {
                         let what = format!("attached {}: {}", attachment.name, image.describe());
                         images.push(image);
-                        (what, theme::DIM)
+                        Ok(what)
                     }
-                    Err(why) => (format!("not attached {}: {why}", attachment.name), theme::ERROR),
+                    Err(why) => Err(format!("not attached {}: {why}", attachment.name)),
+                });
+            }
+            for name in attach::mentioned_files(&text, &self.workspace) {
+                attached.push(match agent.attach_file(&name) {
+                    Ok(file) => {
+                        files.push(file);
+                        let bytes = std::fs::read(self.workspace.join(&name)).unwrap_or_default();
+                        let lines = bytecount_lines(&bytes);
+                        let plural = if lines == 1 { "" } else { "s" };
+                        Ok(format!("attached {name}: {lines} line{plural}"))
+                    }
+                    Err(why) => Err(format!("not attached {name}: {why}")),
+                });
+            }
+            for what in attached {
+                let (what, style) = match what {
+                    Ok(what) => (what, theme::DIM),
+                    Err(why) => (why, theme::ERROR),
                 };
                 lines.extend(hanging(Line::styled("  ⎿ ", theme::DIM), &what, style, self.width()));
             }
@@ -1023,6 +1247,8 @@ impl<W: Write> App<W> {
         if !text.is_empty() {
             parts.push(text);
         }
+        // Files the message mentions follow it, so that it reads as the user wrote it.
+        parts.extend(files);
         if let Err(e) = agent.push_user_with(&parts.join("\n\n"), images) {
             self.agent = Some(agent);
             self.error(&causes(&e));
@@ -1063,6 +1289,17 @@ impl<W: Write> App<W> {
             bottom.push(Line::new());
             bottom.push(busy_line(turn));
         }
+        if let Some((command, started)) = &self.command {
+            let elapsed = started.elapsed();
+            let frame = SPINNER[(elapsed.as_millis() / SPINNER_STEP.as_millis()) as usize % 10];
+            let took = duration(elapsed.as_secs_f64());
+            bottom.push(Line::new());
+            bottom.push(
+                Line::styled(format!("{frame} "), theme::SPINNER)
+                    .with(&format!("running {}", clip(command, 50)), Style::PLAIN)
+                    .with(&format!(" · {took} · esc to stop"), theme::DIM),
+            );
+        }
         for (i, message) in self.queued.iter().enumerate() {
             if i == 3 {
                 bottom.push(Line::styled(
@@ -1086,6 +1323,10 @@ impl<W: Write> App<W> {
         };
         let approving = self.approving();
         bottom.extend(self.editor.render(width, (height / 2).max(1), !approving, placeholder));
+        if !self.completions.is_empty() {
+            let names = clip(&self.completions.join("  "), width.saturating_sub(3));
+            bottom.push(Line::styled(format!("  {names}"), theme::DIM));
+        }
         bottom.push(self.status_line(width));
 
         let bottom = wrap_all(&bottom, width);
@@ -1163,6 +1404,12 @@ async fn finished(turn: &mut Option<Turn>) -> (Agent, Result<Outcome>) {
         Some(turn) => turn.run.as_mut().await,
         None => std::future::pending().await,
     }
+}
+
+/// Lines in a file's bytes, a last line without a line break among them.
+fn bytecount_lines(bytes: &[u8]) -> usize {
+    let breaks = bytes.iter().filter(|&&b| b == b'\n').count();
+    breaks + usize::from(bytes.last().is_some_and(|&b| b != b'\n'))
 }
 
 async fn job_done(job: &mut Option<Job>) -> Done {
@@ -1404,6 +1651,7 @@ mod tests {
                 session_root: dir.join("sessions"),
                 confirm: Vec::new(),
                 checkpoints: Some(dir.join("checkpoints")),
+                resume: None,
             };
             std::fs::create_dir_all(&options.workspace).unwrap();
             let agent = start(&options).unwrap();
@@ -1713,6 +1961,113 @@ mod tests {
         assert!(t.app.editor.is_empty() && !t.app.quit);
         t.app.key(ctrl_c);
         assert!(t.app.quit);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_shows_its_conversation() {
+        let mut t = Test::new();
+        // A log as a session leaves it: a reply, a call and its result, and a reply to that.
+        let lines = [
+            r#"{"type":"message","message":{"role":"user","content":"what is here?"}}"#,
+            r#"{"type":"message","message":{"role":"assistant","reasoning_content":"Look.","tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]},"stats":{"reasoning_tokens":3}}"#,
+            r#"{"type":"message","message":{"role":"tool","tool_call_id":"c1","content":"a.txt"}}"#,
+            r#"{"type":"message","message":{"role":"assistant","content":"Just **a.txt**."},"stats":{"prompt_tokens":2000,"completion_tokens":20}}"#,
+        ];
+        let mut log = std::fs::read_to_string(&t.app.log).unwrap();
+        for line in lines {
+            log.push_str(line);
+            log.push('\n');
+        }
+        std::fs::write(&t.app.log, log).unwrap();
+        let options = Options { resume: Some(t.app.log.clone()), ..t.app.options.clone() };
+        let agent = Agent::resume(options.profile.clone(), agent_options(&options), &t.app.log);
+        t.app = App::new(options, agent.unwrap(), Screen::new(Vec::new(), 80, 24));
+        t.app.finished.clear();
+        t.app.last_block = None;
+        t.app.resumed().await;
+        assert_eq!(
+            t.finished(),
+            [
+                "› what is here?",
+                "",
+                "∴ thought for 3 tokens",
+                "● $ ls",
+                "  ⎿ a.txt",
+                "",
+                "Just a.txt.",
+                "",
+                "resumed: the conversation goes on from here (5 messages)",
+            ]
+        );
+        assert!(t.live().last().unwrap().contains("2.0K/256K"));
+    }
+
+    #[tokio::test]
+    async fn a_command_after_a_bang_runs_and_the_agent_hears_of_it() {
+        let mut t = Test::new();
+        t.submit("!echo hi; echo oops >&2; exit 3");
+        assert!(t.live().iter().any(|row| row.contains("running echo hi")));
+        // A message sent meanwhile waits for the command.
+        t.submit("why did it fail?");
+        finish_job(&mut t).await;
+        assert_eq!(
+            t.finished(),
+            [
+                "! echo hi; echo oops >&2; exit 3",
+                "",
+                "  hi",
+                "  oops",
+                "  ⎿ failed (exit code 3)",
+                "",
+                "› why did it fail?",
+            ]
+        );
+        let message = t.last_message();
+        assert_eq!(
+            message,
+            "[The user ran this command in the workspace: `echo hi; echo oops >&2; exit 3`. It \
+             failed (exit code 3), and printed:]\n\nhi\noops\n\nwhy did it fail?"
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_stops_a_command() {
+        let mut t = Test::new();
+        t.submit("!sleep 30");
+        let started = std::time::Instant::now();
+        t.key(KeyCode::Esc);
+        assert!(t.app.job.is_none() && t.app.command.is_none());
+        assert!(t.finished().contains(&"! stopped `sleep 30`".to_owned()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_mentioned_file_goes_with_the_message_and_tab_completes_it() {
+        let mut t = Test::new();
+        let work = t.dir.join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
+        t.app.editor.insert("what does @sr");
+        t.key(KeyCode::Tab);
+        assert_eq!(t.app.editor.text(), "what does @src/");
+        t.key(KeyCode::Tab);
+        assert_eq!(t.app.editor.text(), "what does @src/calc.py ");
+        t.app.editor.insert("do?");
+        t.key(KeyCode::Enter);
+        assert_eq!(
+            t.finished(),
+            ["› what does @src/calc.py do?", "  ⎿ attached src/calc.py: 2 lines"]
+        );
+        assert_eq!(
+            t.last_message(),
+            "what does @src/calc.py do?\n\n[The user attached src/calc.py, shown as read shows \
+             it:]\n     1\tdef add(a, b):\n     2\t    return a + b"
+        );
+        // Tab elsewhere is still four spaces.
+        t.app.agent.get_or_insert_with(|| start(&t.app.options).unwrap());
+        t.app.turn = None;
+        t.key(KeyCode::Tab);
+        assert_eq!(t.app.editor.text(), "    ");
     }
 
     #[test]

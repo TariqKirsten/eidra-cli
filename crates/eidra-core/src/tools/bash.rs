@@ -341,6 +341,46 @@ async fn collect(
     Ok(status.expect("the loop ends only after the command exits"))
 }
 
+/// Runs a command the user typed, `!` in the TUI, in a bash of its own in `dir`: nothing carries
+/// over to the agent's shell or to the next command. Returns its output, cleaned of terminal
+/// codes, and how it ended unless with 0. Past `timeout`, or if the future is dropped, the
+/// command and everything it started are stopped.
+pub async fn run_command(dir: &Path, command: &str, timeout: Duration) -> (String, Option<String>) {
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!("exec 2>&1\n{command}"))
+        .current_dir(dir)
+        .envs(NON_INTERACTIVE.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut cmd = Command::from(cmd);
+    cmd.kill_on_drop(true);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return (String::new(), Some(format!("could not start bash: {e}"))),
+    };
+    let mut guard = GroupGuard(child.id().map(|pid| pid as i32));
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut capture = Capture::default();
+    let status =
+        match tokio::time::timeout(timeout, collect(&mut child, &mut stdout, &mut capture)).await {
+            Ok(Ok(status)) => describe_exit(status),
+            Ok(Err(e)) => Some(format!("reading its output failed: {e}")),
+            Err(_) => {
+                if let Some(pgid) = guard.0.take() {
+                    stop_group(pgid).await;
+                }
+                let _ = child.wait().await;
+                Some(format!("timed out after {} s, and was stopped", timeout.as_secs()))
+            }
+        };
+    guard.0 = None;
+    let output = clean_terminal_output(&capture.into_string());
+    (output.trim_end().to_owned(), status)
+}
+
 /// SIGTERM to the whole group, then SIGKILL if it is still there after a moment.
 /// Stops a foreground command's process group if the command is abandoned before it ends:
 /// `kill_on_drop` stops only bash, not what the command started.

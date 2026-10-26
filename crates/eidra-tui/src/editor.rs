@@ -73,6 +73,19 @@ impl Editor {
         text
     }
 
+    /// The text before the caret.
+    pub fn before_caret(&self) -> &str {
+        &self.text[..self.caret]
+    }
+
+    /// Replaces the last `len` bytes before the caret with `text`.
+    pub fn replace_before_caret(&mut self, len: usize, text: &str) {
+        let start = self.caret - len;
+        self.text.replace_range(start..self.caret, text);
+        self.caret = start + text.len();
+        self.edited();
+    }
+
     /// Inserts text at the caret; pasted line endings become line breaks.
     pub fn insert(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");

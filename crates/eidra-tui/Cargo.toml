@@ -10,6 +10,8 @@ publish.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 eidra-core.workspace = true
+# The messages of a resumed session's log, to show them again.
+eidra-llm.workspace = true
 futures-util.workspace = true
 pulldown-cmark.workspace = true
 # Signals, to quit cleanly when the terminal closes or eidra is told to stop.

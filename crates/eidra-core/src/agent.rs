@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use eidra_llm::{
     AssistantTurn, ChatRequest, Client, Content, ImageUrl, Message, Part, StreamEvent, ToolCall,
     Usage,
@@ -223,6 +223,107 @@ impl Agent {
             used: 0,
             uncompactable: false,
         })
+    }
+
+    /// Goes on with the session logged at `log` (docs/DESIGN.md §14), in its workspace and with
+    /// its system prompt and tools, which a session keeps for good; `profile` gives the rest. The
+    /// calls its last reply left without results get results that say so, and the next message
+    /// says the turn was cut short, if it was.
+    pub fn resume(profile: Profile, options: AgentOptions, log: &Path) -> Result<Self> {
+        let (mut session, read) = Session::open(log)?;
+        let header = session.header().clone();
+        if header.parent.is_some() {
+            bail!("{} is a subagent's session, which only its parent goes on with", header.id);
+        }
+        if header.headless != options.headless {
+            let (ran, with) = if header.headless {
+                ("unattended", "eidra exec")
+            } else {
+                ("interactively", "eidra without a command")
+            };
+            bail!("session {} ran {ran}; go on with it with {with}", header.id);
+        }
+        let workspace = PathBuf::from(&header.workspace);
+        if !workspace.is_dir() {
+            bail!("session {}'s workspace {} is not there any more", header.id, header.workspace);
+        }
+        let api_key = profile
+            .api_key_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|key| !key.is_empty());
+        let client = Client::new(&profile.base_url, api_key, options.model_socket.as_deref())?;
+        let tools = Toolbox::new(&profile, &workspace, session.dir(), header.tools.clone())?;
+
+        // The last reply, and whether the turn it belongs to ended: with a reply that calls
+        // nothing, or with finish.
+        let messages = session.messages().to_vec();
+        let last = messages.iter().rposition(|m| matches!(m, Message::Assistant(_)));
+        let mut unanswered = messages.len() > 1;
+        if let Some(i) = last
+            && let Message::Assistant(reply) = &messages[i]
+        {
+            let answered: Vec<&str> = messages[i + 1..]
+                .iter()
+                .filter_map(|m| match m {
+                    Message::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            for call in reply.tool_calls.iter().filter(|c| !answered.contains(&c.id.as_str())) {
+                let text = "Error: not run, because eidra stopped before this call.";
+                session.push(Message::tool(call.id.clone(), text), None)?;
+            }
+            let finished = reply.tool_calls.iter().any(|c| c.function.name == "finish");
+            unanswered = !finished && (!reply.tool_calls.is_empty() || i + 1 < messages.len());
+        }
+        // Requests made before, so that seeds go on from them, and the context the last one took.
+        let replies = read.messages.iter().filter(|(m, _)| matches!(m, Message::Assistant(_)));
+        let requests = replies.count() + read.starts.len() - 1;
+        let start = read.starts.last().copied().unwrap_or(0);
+        let used = read.messages[start..]
+            .iter()
+            .rev()
+            .find(|(m, _)| matches!(m, Message::Assistant(_)))
+            .and_then(|(_, stats)| stats.as_ref())
+            .map_or(0, |s| s.prompt_tokens.unwrap_or(0) + s.completion_tokens.unwrap_or(0));
+        session.resumed(&profile.hash)?;
+
+        let mut patterns = profile.confirm.commands.clone();
+        patterns.extend(options.confirm.iter().cloned());
+        Ok(Agent {
+            client,
+            confirm: ConfirmPolicy::new(&patterns),
+            date: header.created.get(..10).unwrap_or_default().to_owned(),
+            profile,
+            workspace,
+            session,
+            tools,
+            headless: options.headless,
+            requests,
+            session_root: options.session_root,
+            extra_confirm: options.confirm,
+            model_socket: options.model_socket,
+            interrupt: Arc::new(watch::channel(false).0),
+            unanswered,
+            background: Arc::new(AtomicUsize::new(0)),
+            used,
+            uncompactable: false,
+        })
+    }
+
+    /// A text file the user's next message mentions, as text for the message: what `read` would
+    /// show of it, in the profile's `attached_file` wrapping. The model has then seen it.
+    pub fn attach_file(&mut self, path: &str) -> Result<String, String> {
+        let listing = self.tools.read_mentioned(path)?;
+        let template = &self.profile.prompts.attached_file;
+        Ok(template.replace("{path}", path).replace("{content}", listing.trim_end()))
+    }
+
+    /// Whether the profile differs from the one the session began with. The session keeps its
+    /// system prompt and tools either way.
+    pub fn profile_changed(&self) -> bool {
+        self.session.header().profile_hash != self.profile.hash
     }
 
     /// A subagent for one `task` call: a new, unattended session in the same workspace, with this

@@ -3,6 +3,8 @@
 
 mod agents;
 mod bash;
+
+pub use bash::run_command;
 mod diagnostics;
 mod files;
 mod search;
@@ -218,6 +220,13 @@ impl Toolbox {
             _ => return Err(format!("{name} is not implemented")),
         };
         Ok(Reply::Text(text))
+    }
+
+    /// A file the user's message mentions, as `read` shows it, with any nested AGENTS.md it is
+    /// the first to touch. The model has then seen the file, as after a `read`.
+    pub fn read_mentioned(&mut self, path: &str) -> Result<String, String> {
+        let listing = self.files.read(path, None, None)?;
+        Ok(listing + &self.nested.for_path(&resolve(&self.workspace, path)))
     }
 
     /// The reply with the instructions of nested AGENTS.md files it is the first to touch: in the

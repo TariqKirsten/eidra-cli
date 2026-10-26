@@ -18,5 +18,6 @@ pub use agent::{
 pub use confirm::{ConfirmPolicy, Verdict};
 pub use event::{Approval, Decision, Event, Frontend, RequestStats};
 pub use profile::Profile;
-pub use session::{Header, Log};
-pub use text::{fnv1a, utc_datetime};
+pub use session::{Header, Log, Summary, list as list_sessions, text_of};
+pub use text::{fnv1a, truncate_middle, utc_datetime};
+pub use tools::run_command;

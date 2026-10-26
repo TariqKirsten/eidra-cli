@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use eidra_core::display::{describe_call, describe_stats, summarise};
-use eidra_core::{Agent, AgentOptions, Approval, Decision, Event, Frontend, Outcome, Profile};
+use eidra_core::{
+    Agent, AgentOptions, Approval, Decision, Event, Frontend, Outcome, Profile, list_sessions,
+};
 use serde_json::{Value, json};
 
 #[derive(Debug, Args)]
@@ -63,6 +65,14 @@ pub struct AgentArgs {
     /// Where session logs go [default: $XDG_DATA_HOME/eidra/sessions]
     #[arg(long, env = "EIDRA_SESSION_DIR", value_name = "DIR")]
     session_dir: Option<PathBuf>,
+
+    /// Go on with the latest session in this directory
+    #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
+    continue_session: bool,
+
+    /// Go on with this session: its id, as `eidra sessions` lists it, or the start of one
+    #[arg(short = 'r', long, value_name = "ID")]
+    resume: Option<String>,
 }
 
 impl AgentArgs {
@@ -91,6 +101,40 @@ impl AgentArgs {
     pub fn session_root(&self, workspace: &Path) -> PathBuf {
         self.session_dir.clone().unwrap_or_else(|| default_session_dir(workspace))
     }
+
+    /// The log of the session to go on with, if --continue or --resume asks for one: the latest
+    /// of this directory's sessions of the same kind, or the one with that id.
+    pub fn session_to_resume(&self, workspace: &Path, headless: bool) -> Result<Option<PathBuf>> {
+        let root = self.session_root(workspace);
+        if let Some(id) = &self.resume {
+            let exact = root.join(format!("{id}.jsonl"));
+            if exact.is_file() {
+                return Ok(Some(exact));
+            }
+            let sessions = list_sessions(&root);
+            let matching: Vec<_> =
+                sessions.iter().filter(|s| s.header.id.starts_with(id)).collect();
+            return match matching.as_slice() {
+                [one] => Ok(Some(one.path.clone())),
+                [] => bail!("no session {id} in {}; `eidra sessions` lists them", root.display()),
+                _ => bail!("{} sessions start with {id}; give more of the id", matching.len()),
+            };
+        }
+        if !self.continue_session {
+            return Ok(None);
+        }
+        let here = workspace.canonicalize().context("the current directory")?;
+        let latest = list_sessions(&root)
+            .into_iter()
+            .find(|s| s.header.headless == headless && Path::new(&s.header.workspace) == here);
+        match latest {
+            Some(session) => Ok(Some(session.path)),
+            None => {
+                let kind = if headless { "unattended" } else { "interactive" };
+                bail!("no {kind} session in {} to go on with", here.display())
+            }
+        }
+    }
 }
 
 /// Exit codes besides 0 (finished) and 1 (error).
@@ -111,7 +155,10 @@ pub async fn run(args: ExecArgs) -> Result<i32> {
         confirm: args.agent.confirm.clone(),
         model_socket: args.model_socket.clone(),
     };
-    let mut agent = Agent::start(profile, options)?;
+    let mut agent = match args.agent.session_to_resume(&options.workspace, true)? {
+        Some(log) => Agent::resume(profile, options, &log)?,
+        None => Agent::start(profile, options)?,
+    };
 
     let mut output = Output::new(args.json);
     output.start(&agent);
@@ -149,7 +196,7 @@ fn read_task(args: &ExecArgs) -> Result<String> {
 
 /// $XDG_DATA_HOME/eidra/sessions, else ~/.local/share/eidra/sessions, else .eidra/sessions in the
 /// workspace (a container user without a home).
-fn default_session_dir(workspace: &Path) -> PathBuf {
+pub fn default_session_dir(workspace: &Path) -> PathBuf {
     data_dir(workspace).join("sessions")
 }
 

@@ -117,3 +117,9 @@ compacted = "[The conversation so far reached {tokens} tokens and was compacted.
 # workspace. {turn} is the start of the message that began the turn; {restored}, {removed} and
 # {kept} list files, or say none. Without it the model believes its changes are still there.
 undone = "[The user undid what your turn that began with \"{turn}\" changed in the workspace. Files put back as they were before it: {restored}. Files it made, removed: {removed}. Files it changed that changed again afterwards, left as they are: {kept}.]"
+# Starts the user's next message after they ran a command themselves with ! in the TUI: {command}
+# is the command, {status} how it ended, and {output} what it printed, cut to [tools] output_limit.
+user_command = "[The user ran this command in the workspace: `{command}`. It {status}, and printed:]\n\n{output}"
+# A text file the user's message mentions with @path, after the message: {path} is the path and
+# {content} the file as read shows it, numbered lines and all, so that it needs no read of its own.
+attached_file = "[The user attached {path}, shown as read shows it:]\n{content}"

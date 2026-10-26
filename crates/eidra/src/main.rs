@@ -7,6 +7,7 @@ mod interactive;
 mod probe;
 mod relay;
 mod replay;
+mod sessions;
 
 use clap::{Parser, Subcommand};
 
@@ -38,6 +39,8 @@ enum Command {
     Replay(replay::ReplayArgs),
     /// Forward a Unix socket to the model server, for an agent in a container with no network
     Relay(relay::RelayArgs),
+    /// List this directory's sessions, to go on with one with --continue or --resume
+    Sessions(sessions::SessionsArgs),
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -59,5 +62,6 @@ async fn main() -> anyhow::Result<()> {
         Command::Probe(args) => probe::run(args).await,
         Command::Replay(args) => replay::run(args).await,
         Command::Relay(args) => relay::run(args).await,
+        Command::Sessions(args) => sessions::run(args),
     }
 }

@@ -178,6 +178,12 @@ pub struct Prompts {
     /// Starts the user's next message after /undo put back what a turn changed. `{turn}` is the
     /// start of the message that began the turn; `{restored}`, `{removed}` and `{kept}` list files.
     pub undone: String,
+    /// Starts the user's next message after they ran a command themselves (`!` in the TUI);
+    /// `{command}`, `{status}` and `{output}` are replaced.
+    pub user_command: String,
+    /// A text file the user's message mentions with `@path`, after the message; `{path}` and
+    /// `{content}`, as `read` shows it, are replaced.
+    pub attached_file: String,
 }
 
 impl Profile {
