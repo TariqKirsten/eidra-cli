@@ -54,6 +54,15 @@ background_max_requests = 150
 # explorers instead of workers.
 # tools = ["read", "glob", "grep", "bash"]
 
+[diagnostics]
+# After each edit or write, these check the file before and after the change, and the problems the
+# change introduced are added to its result (DESIGN.md §9). "syntax" is a parse, for where ruff is
+# not installed; ty leaves out unresolved imports, which depend on finding the environment. A
+# check's tool is looked for in $EIDRA_TOOLS, the project's .venv and PATH.
+python = ["syntax", "ruff", "ty"]
+# Seconds one check may take.
+timeout_s = 10
+
 [confirm]
 # Commands that need the user's go-ahead: "git" covers every git command, "git push" only pushes.
 commands = []

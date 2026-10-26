@@ -21,3 +21,4 @@ tokio.workspace = true
 toml.workspace = true
 tree-sitter.workspace = true
 tree-sitter-bash.workspace = true
+tree-sitter-python.workspace = true

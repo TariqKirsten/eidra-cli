@@ -129,6 +129,27 @@ struct RunArgs {
     /// then run task by task, so each image is fetched once
     #[arg(long)]
     remove_images: bool,
+
+    /// A directory of the checkers eidra runs after each edit (ruff, ty), mounted into every
+    /// attempt and named by EIDRA_TOOLS, for task images that do not have them. The agent's own
+    /// PATH is left as the image has it
+    #[arg(long, value_name = "DIR")]
+    tools: Option<PathBuf>,
+}
+
+/// Where `--tools` is mounted in an attempt's container.
+pub(super) const TOOLS_IN_CONTAINER: &str = "/opt/eidra-tools";
+
+/// What an attempt's agent gets besides its binary, workspace and sessions directory.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Extras<'a> {
+    /// The relay's socket, for an agent in a vacuum.
+    pub model_socket: Option<&'a Path>,
+    pub profile_dir: Option<&'a Path>,
+    /// The variable holding the API key, passed through.
+    pub api_key_env: Option<&'a str>,
+    /// Checkers for eidra's diagnostics (`--tools`).
+    pub tools: Option<&'a Path>,
 }
 
 /// The network an agent gets.
@@ -162,6 +183,9 @@ pub struct Manifest {
     /// The agents' network; runs from before it was recorded had the host's.
     #[serde(default)]
     pub network: Option<Network>,
+    /// The checkers mounted into each attempt (`--tools`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<String>,
     /// When the checks were last run again on the attempts (`eidra eval regrade`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regraded: Option<String>,
@@ -201,6 +225,8 @@ struct RunContext {
     run_dir: PathBuf,
     /// The relay's socket, for agents in a vacuum.
     model_socket: Option<PathBuf>,
+    /// Checkers for eidra's diagnostics, mounted into each attempt.
+    tools: Option<PathBuf>,
     max_requests: Option<usize>,
     /// How Harbor tasks' agents reach the model server: the host's network, or a relay's socket.
     route: harbor::Route,
@@ -284,6 +310,7 @@ async fn run_suite(args: RunArgs) -> Result<i32> {
         repeats: args.repeats,
         parallel: args.parallel.max(1),
         network: Some(args.network),
+        tools: args.tools.as_ref().map(|dir| dir.display().to_string()),
         regraded: None,
     };
     fs::write(run_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest)? + "\n")?;
@@ -321,6 +348,7 @@ async fn run_suite(args: RunArgs) -> Result<i32> {
             None => harbor::Route::Host,
         },
         model_socket,
+        tools: args.tools.as_deref().map(fs::canonicalize).transpose().context("--tools")?,
         max_requests: args.max_requests,
         images: tokio::sync::Mutex::new(HashMap::new()),
     });
@@ -399,9 +427,12 @@ async fn run_attempt(context: &RunContext, task: &Task, repeat: u32) -> Result<A
         &context.binary,
         &work,
         &sessions,
-        context.model_socket.as_deref(),
-        context.profile_dir.as_deref(),
-        context.api_key_env.as_deref(),
+        &Extras {
+            model_socket: context.model_socket.as_deref(),
+            profile_dir: context.profile_dir.as_deref(),
+            api_key_env: context.api_key_env.as_deref(),
+            tools: context.tools.as_deref(),
+        },
     );
     if context.profile_dir.is_some() {
         command.extend(["--profile", "/profile"]);
@@ -435,10 +466,9 @@ pub(super) fn agent_container(
     binary: &Path,
     work: &Path,
     sessions: &Path,
-    model_socket: Option<&Path>,
-    profile_dir: Option<&Path>,
-    api_key_env: Option<&str>,
+    extras: &Extras,
 ) -> Container {
+    let Extras { model_socket, profile_dir, api_key_env, tools } = *extras;
     let network = if model_socket.is_some() { "none" } else { "host" };
     let mut agent = Container::new(image, network)
         .mount(binary, "/usr/local/bin/eidra", true)
@@ -454,6 +484,10 @@ pub(super) fn agent_container(
     }
     if let Some(var) = api_key_env {
         agent = agent.pass_env(var);
+    }
+    if let Some(tools) = tools {
+        agent =
+            agent.mount(tools, TOOLS_IN_CONTAINER, true).set_env("EIDRA_TOOLS", TOOLS_IN_CONTAINER);
     }
     agent
 }
@@ -660,9 +694,12 @@ mod tests {
             Path::new("/usr/bin/eidra"),
             Path::new("/tmp/work"),
             Path::new("/tmp/sessions"),
-            socket,
-            Some(Path::new("/tmp/profile")),
-            Some("RADIANCE_API_KEY"),
+            &Extras {
+                model_socket: socket,
+                profile_dir: Some(Path::new("/tmp/profile")),
+                api_key_env: Some("RADIANCE_API_KEY"),
+                tools: None,
+            },
         )
         .args("probe", &["eidra", "exec"])
     }

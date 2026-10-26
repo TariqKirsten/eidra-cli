@@ -31,6 +31,8 @@ pub struct Profile {
     pub confirm: ConfirmSettings,
     #[serde(default)]
     pub subagents: SubagentSettings,
+    #[serde(default)]
+    pub diagnostics: DiagnosticsSettings,
     pub prompts: Prompts,
     /// The system prompt template: system.md beside profile.toml.
     #[serde(skip)]
@@ -121,6 +123,31 @@ impl Default for SubagentSettings {
 
 fn background_max_requests() -> usize {
     150
+}
+
+/// The checks that run after the agent changes a file, by language (docs/DESIGN.md §9). Each runs
+/// on the file before and after the change, and the model sees only the problems the change
+/// introduced.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticsSettings {
+    /// For `.py` and `.pyi` files: "ruff", "ty", and "syntax" (a parse, for when ruff is not
+    /// there). A check whose tool cannot be found is left out.
+    #[serde(default)]
+    pub python: Vec<String>,
+    /// Seconds one check may take; a slower one is left out of that change's report.
+    #[serde(default = "check_timeout_s")]
+    pub timeout_s: u64,
+}
+
+impl Default for DiagnosticsSettings {
+    fn default() -> Self {
+        DiagnosticsSettings { python: Vec::new(), timeout_s: check_timeout_s() }
+    }
+}
+
+fn check_timeout_s() -> u64 {
+    10
 }
 
 /// What the model is told beyond the system prompt template.

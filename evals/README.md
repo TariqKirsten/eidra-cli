@@ -164,6 +164,15 @@ a suite, newest first, using each task's `tests/config.json`:
         --language python --exclude verl-project__verl-6506
     eidra eval run --suite evals/harbor/swe-july-python --repeats 1 --remove-images
 
+eidra checks each edit with ruff and ty (docs/DESIGN.md §9), which task images rarely have.
+`--tools DIR` mounts a directory of them into every attempt, named by `EIDRA_TOOLS` and kept off
+the agent's own `PATH`. The runtime image has both:
+
+    mkdir -p evals/runs/tools && id=$(docker create eidra)
+    docker cp "$id:/usr/local/bin/ruff" evals/runs/tools/ && docker cp "$id:/usr/local/bin/ty" evals/runs/tools/
+    docker rm "$id"
+    eidra eval run --suite evals/harbor/swe-july-python --repeats 1 --remove-images --tools evals/runs/tools
+
 Each task's image (`swerebenchv2/<task>`) is 0.4–6.5 GB compressed. `--remove-images` removes a
 task's images once its attempts are done, and runs each task's attempts together so that each
 image is fetched once. Building an image fetches uv. The verifiers parse test logs with plain

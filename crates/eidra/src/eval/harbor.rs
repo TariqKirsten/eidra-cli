@@ -334,6 +334,8 @@ pub struct AgentSetup<'a> {
     pub sessions: &'a Path,
     pub profile_dir: Option<&'a Path>,
     pub api_key_env: Option<&'a str>,
+    /// Checkers for eidra's diagnostics (`--tools`).
+    pub tools: Option<&'a Path>,
 }
 
 /// A running container of a task's image, in which the agent and then the verifier run.
@@ -392,9 +394,15 @@ impl Env {
             if let Some(profile) = agent.profile_dir {
                 mount(profile, "/profile", ":ro");
             }
+            if let Some(tools) = agent.tools {
+                mount(tools, super::TOOLS_IN_CONTAINER, ":ro");
+            }
             if let Some(socket) = &socket {
                 mount(socket, SOCKET_IN_CONTAINER, "");
                 args.extend(["-e".into(), format!("EIDRA_MODEL_SOCKET={SOCKET_IN_CONTAINER}")]);
+            }
+            if agent.tools.is_some() {
+                args.extend(["-e".into(), format!("EIDRA_TOOLS={}", super::TOOLS_IN_CONTAINER)]);
             }
         }
         args.extend(["--entrypoint".into(), "tail".into()]);
@@ -677,6 +685,7 @@ pub async fn run_attempt(
         sessions: &sessions,
         profile_dir: context.profile_dir.as_deref(),
         api_key_env: context.api_key_env.as_deref(),
+        tools: context.tools.as_deref(),
     };
     let mut env = match Env::start(&images.tag, config, Some(&setup)).await {
         Ok(env) => env,

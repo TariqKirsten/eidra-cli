@@ -23,7 +23,7 @@ use clap::Args;
 use eidra_core::Profile;
 
 use super::docker::Container;
-use super::{agent_container, harbor};
+use super::{Extras, agent_container, harbor};
 use crate::relay;
 
 const PROBE: &str = include_str!("vacuum_probe.py");
@@ -180,9 +180,12 @@ async fn no_network(setup: &Setup<'_>, dir: &Path, log: &Path) -> Result<Option<
         setup.binary,
         &work,
         &sessions,
-        Some(setup.socket),
-        setup.profile_dir,
-        setup.api_key_env,
+        &Extras {
+            model_socket: Some(setup.socket),
+            profile_dir: setup.profile_dir,
+            api_key_env: setup.api_key_env,
+            tools: None,
+        },
     )
     .mount(setup.probe_dir, "/probe", true)
     .set_env("EIDRA_PROBE_TARGET", setup.target)
@@ -220,6 +223,7 @@ async fn disconnected(setup: &Setup<'_>, dir: &Path, log: &Path) -> Result<Optio
         sessions: &sessions,
         profile_dir: setup.profile_dir,
         api_key_env: setup.api_key_env,
+        tools: None,
     };
     let mut env = harbor::Env::start(setup.image, &config, Some(&agent)).await?;
     let outcome = probe_in(&mut env, setup, log).await;

@@ -2,6 +2,7 @@
 //! booleans: Qwen3.8 writes tool calls as XML, where those are natural and nested values are not.
 
 mod bash;
+mod diagnostics;
 mod files;
 mod search;
 
@@ -33,6 +34,7 @@ pub struct Toolbox {
     saved: usize,
     files: files::Files,
     shell: bash::Shell,
+    diagnostics: diagnostics::Diagnostics,
 }
 
 enum Reply {
@@ -83,6 +85,7 @@ impl Toolbox {
             outputs: session_dir.join("outputs"),
             saved: 0,
             files: files::Files::new(workspace),
+            diagnostics: diagnostics::Diagnostics::new(workspace, profile.diagnostics.clone()),
             shell: bash::Shell::new(
                 workspace,
                 &session_dir.join("shell"),
@@ -144,13 +147,29 @@ impl Toolbox {
                 number(args, "offset")?,
                 number(args, "limit")?,
             )?,
-            "write" => self.files.write(string(args, "path")?, string(args, "content")?)?,
-            "edit" => self.files.edit(
-                string(args, "path")?,
-                string(args, "old")?,
-                string(args, "new")?,
-                boolean(args, "replace_all")?.unwrap_or(false),
-            )?,
+            "write" | "edit" => {
+                // The file's problems before the change, so that the result names only new ones.
+                let path = string(args, "path")?;
+                let before = self.diagnostics.before(&resolve(&self.workspace, path)).await;
+                let mut text = if name == "write" {
+                    self.files.write(path, string(args, "content")?)?
+                } else {
+                    self.files.edit(
+                        path,
+                        string(args, "old")?,
+                        string(args, "new")?,
+                        boolean(args, "replace_all")?.unwrap_or(false),
+                    )?
+                };
+                if let Some(before) = before {
+                    let problems = self.diagnostics.after(before).await;
+                    if !problems.is_empty() {
+                        text.truncate(text.trim_end().len());
+                        text.push_str(&problems);
+                    }
+                }
+                text
+            }
             "glob" => search::glob(
                 &self.workspace,
                 string(args, "pattern")?,

@@ -312,18 +312,28 @@ The policy guards against model mistakes. It is not a security boundary.
 
 ## 9. Python
 
-- **uv:** detect `pyproject.toml`, `uv.lock` or `.venv`, run `uv sync` with a cached volume, and
-  pass the interpreter to the language server.
-- **Language server and lint:** `ty server` for types and navigation; `ruff check` and
-  `ruff format`. All Rust-native, with no Node. Languages are entries in a config registry, so
-  adding others later is one entry each.
-- **After each edit:**
-  1. tree-sitter parse
-  2. `ruff check`
-  3. ty diagnostics, debounced, with a timeout
-  4. append only the diagnostics this edit introduced
-- **No formatting per edit,** because it would shift the text the model's next `old` refers to.
-  Format at the end of a turn and tell the model.
+Built in M5 (2026-10-26):
+- **After each edit or write** of a `.py` or `.pyi` file, eidra runs the profile's checks
+  (`[diagnostics] python`) on the file before and after the change. The tool's result gains only
+  the problems the change introduced: a problem that was there before is the project's, not the
+  agent's. Problems are compared without their line numbers, since lines move.
+  - `ruff check`, on the content through stdin, as the project configures it, with no fixes and no
+    cache left behind.
+  - `ty check`, on the file on disk, with the project's `.venv` if it has one. Unresolved imports
+    are left out, since they depend on ty finding the environment, and so are undefined names ruff
+    already reported.
+  - A parse with tree-sitter's Python grammar, when ruff is not there: syntax errors need no tool.
+- **Each check has a timeout** (`timeout_s`, 10 s), and one whose tool cannot be found is left
+  out. Tools are looked for in `$EIDRA_TOOLS`, the project's `.venv/bin`, then `PATH`. Task images
+  rarely have ruff or ty, so `eidra eval run --tools DIR` mounts a directory of them into every
+  attempt, off the agent's own `PATH`.
+- **Languages are entries in `[diagnostics]`**: adding one is a key and the code for its checks.
+
+Not done yet:
+- **Formatting at the end of a turn.** It rewrites whole files in projects that do not use ruff's
+  formatter, which makes noisy diffs, so it waits for a measurement.
+- **`uv sync` on its own:** `uv run` syncs the environment before it runs anything.
+- **Navigation** (definition, references, hover) through `ty server`.
 
 ## 10. Images and PDFs
 
@@ -522,7 +532,7 @@ Reference: codex-rs `tui`.
 | M2 | `eidra eval`, first suite, baselines | a suite runs unattended and produces a report |
 | M3 | subagents, measured against the M2 suite | the suite shows whether they help, and in which form |
 | M4 | inline TUI | it's usable day to day |
-| M5 | uv, ty, ruff, post-edit diagnostics | |
+| M5 | uv, ty, ruff, post-edit diagnostics | the agent hears of the problems its edits introduce (done, §9) |
 | M6 | images, PDFs, nested AGENTS.md, compaction, checkpoints | |
 | M7 | runtime image and wrapper | |
 
