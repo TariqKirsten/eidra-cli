@@ -1,0 +1,7 @@
+Requests: 400 (skipped 3)
+Top paths:
+  110  /api/items      p95 125 ms
+   66  /               p95 19 ms
+   49  /static/app.js  p95 6 ms
+   46  /api/orders     p95 209 ms
+   35  /api/login      p95 342 ms

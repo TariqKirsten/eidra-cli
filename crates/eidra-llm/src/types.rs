@@ -132,6 +132,10 @@ pub struct ChatRequest {
     /// Reasoning tokens after which the server closes the reasoning block (vLLM's name).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_token_budget: Option<u32>,
+    /// The sampler's seed. Radiance's RNG is stateless, so the same seed and prompt give the same
+    /// reply, from the cache or not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
     /// A label for the conversation (OpenRouter's name for it); radiance shows it on its
     /// dashboard.
     #[serde(skip_serializing_if = "Option::is_none")]

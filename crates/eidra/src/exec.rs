@@ -11,6 +11,8 @@ use eidra_core::{
 };
 use serde_json::{Value, json};
 
+use crate::format::thousands;
+
 #[derive(Debug, Args)]
 pub struct ExecArgs {
     /// The task. Without it, the task is read from --task-file or stdin
@@ -273,7 +275,7 @@ impl Frontend for Output {
     }
 }
 
-fn describe_stats(stats: &RequestStats) -> String {
+pub(crate) fn describe_stats(stats: &RequestStats) -> String {
     let mut parts = Vec::new();
     if let Some(prompt) = stats.prompt_tokens {
         let cached = stats.cached_tokens.unwrap_or(0);
@@ -303,7 +305,7 @@ fn describe_stats(stats: &RequestStats) -> String {
 }
 
 /// A one-line description of a tool call.
-fn describe_call(name: &str, arguments: &str) -> String {
+pub(crate) fn describe_call(name: &str, arguments: &str) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
     let number = |key: &str| args.get(key).map(|v| v.to_string().trim_matches('"').to_owned());
@@ -351,18 +353,6 @@ fn clip(text: &str, max: usize) -> String {
     } else {
         format!("{}…", text.chars().take(max).collect::<String>())
     }
-}
-
-fn thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 #[cfg(test)]

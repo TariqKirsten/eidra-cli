@@ -9,7 +9,9 @@ mod session;
 mod text;
 mod tools;
 
-pub use agent::{Agent, AgentOptions, Outcome};
+pub use agent::{Agent, AgentOptions, Outcome, reply_request, request_stats};
 pub use confirm::{ConfirmPolicy, Verdict};
 pub use event::{Approval, Decision, Event, Frontend, RequestStats};
 pub use profile::Profile;
+pub use session::{Header, Log};
+pub use text::{fnv1a, utc_datetime};

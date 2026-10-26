@@ -220,9 +220,11 @@ dependencies = [
  "clap",
  "eidra-core",
  "eidra-llm",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]

@@ -1,7 +1,9 @@
 //! `read`, `write` and `edit`.
 //!
-//! A file must have been read before it is edited or replaced, and must not have changed since,
-//! so the model never overwrites what it has not seen.
+//! `write` will not replace a file the model has not seen as it now is: it shows the file instead,
+//! and the same call goes through next time. `edit` needs no read first, because `old` must match
+//! the file exactly; the model often knows a file from grep or cat, and an edit refused for want of
+//! a read costs two steps (DESIGN.md §16.1).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -37,47 +39,25 @@ impl Files {
         if abs.is_dir() {
             return Err(format!("{path} is a directory; list it with bash (ls) or glob"));
         }
-        let bytes = fs::read(&abs).map_err(|e| format!("{path}: {e}"))?;
-        if bytes[..bytes.len().min(8192)].contains(&0) {
-            return Err(format!("{path} is a binary file ({} bytes)", bytes.len()));
-        }
+        let bytes = fs::read(&abs).map_err(|e| self.failed(path, &abs, format!("{path}: {e}")))?;
+        let out = listing(path, &bytes, offset, limit)?;
         self.seen.insert(abs, fnv1a(&bytes));
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = text.lines().collect();
-        if lines.is_empty() {
-            return Ok(format!("({path} is empty)"));
-        }
-        let start = offset.unwrap_or(1).max(1) as usize;
-        if start > lines.len() {
-            return Err(format!(
-                "{path} has {} lines; offset {start} is past the end",
-                lines.len()
-            ));
-        }
-        let end = (start - 1 + limit.map_or(DEFAULT_LINES, |l| l.max(1) as usize)).min(lines.len());
-        let shown: Vec<Cow<str>> = lines[start - 1..end].iter().map(|line| clip(line)).collect();
-        let mut out = numbered(shown.iter().map(|line| &**line), start);
-        if end < lines.len() {
-            out.push_str(&format!(
-                "({} more lines; continue with offset {})\n",
-                lines.len() - end,
-                end + 1
-            ));
-        }
         Ok(out)
     }
 
     pub fn write(&mut self, path: &str, content: &str) -> Result<String, String> {
         let abs = resolve(&self.workspace, path);
         if abs.exists() {
-            let current = fs::read(&abs).map_err(|e| format!("{path}: {e}"))?;
+            let current =
+                fs::read(&abs).map_err(|e| self.failed(path, &abs, format!("{path}: {e}")))?;
             self.check_fresh(path, &abs, &current)?;
         }
         if let Some(parent) = abs.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                self.failed(path, &abs, format!("creating {}: {e}", parent.display()))
+            })?;
         }
-        fs::write(&abs, content).map_err(|e| format!("{path}: {e}"))?;
+        fs::write(&abs, content).map_err(|e| self.failed(path, &abs, format!("{path}: {e}")))?;
         self.seen.insert(abs, fnv1a(content.as_bytes()));
         Ok(format!("Wrote {path} ({} lines).", content.lines().count()))
     }
@@ -90,11 +70,21 @@ impl Files {
         replace_all: bool,
     ) -> Result<String, String> {
         let abs = resolve(&self.workspace, path);
-        let bytes = fs::read(&abs).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => format!("{path} does not exist; create it with write"),
-            _ => format!("{path}: {e}"),
+        let bytes = fs::read(&abs).map_err(|e| {
+            self.failed(
+                path,
+                &abs,
+                match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        format!("{path} does not exist; create it with write")
+                    }
+                    _ => format!("{path}: {e}"),
+                },
+            )
         })?;
-        self.check_fresh(path, &abs, &bytes)?;
+        // An edit shows only the lines around it, so it keeps the model's view of the whole file
+        // current only if that view was current before.
+        let fresh = self.seen.get(&abs) == Some(&fnv1a(&bytes));
         let text = String::from_utf8(bytes).map_err(|_| format!("{path} is not UTF-8 text"))?;
         if old.is_empty() {
             return Err("old is empty: to add text, include a neighbouring line in old".into());
@@ -116,8 +106,10 @@ impl Files {
         }
         let updated =
             if replace_all { text.replace(&*old, &new) } else { text.replacen(&*old, &new, 1) };
-        fs::write(&abs, &updated).map_err(|e| format!("{path}: {e}"))?;
-        self.seen.insert(abs, fnv1a(updated.as_bytes()));
+        fs::write(&abs, &updated).map_err(|e| self.failed(path, &abs, format!("{path}: {e}")))?;
+        if fresh {
+            self.seen.insert(abs, fnv1a(updated.as_bytes()));
+        }
 
         // Show the first replacement in place, numbered as the file now is.
         let first = line_of(&updated, starts[0]);
@@ -138,18 +130,64 @@ impl Files {
         Ok(format!("Edited {path}{count}. Lines {from}–{to} now read:\n{snippet}"))
     }
 
-    fn check_fresh(&self, path: &str, abs: &Path, current: &[u8]) -> Result<(), String> {
-        match self.seen.get(abs) {
-            None => Err(format!(
-                "{path} already exists and you have not read it; read it first, so nothing you \
-                 have not seen is overwritten"
-            )),
-            Some(&hash) if hash != fnv1a(current) => {
-                Err(format!("{path} has changed since you last read it; read it again"))
-            }
-            Some(_) => Ok(()),
+    /// An I/O error on `path`. A path outside the workspace is usually a mistaken absolute path, or
+    /// a project the model has imagined (DESIGN.md §16.2), so the error says where the workspace is.
+    fn failed(&self, path: &str, abs: &Path, error: String) -> String {
+        if abs.starts_with(&self.workspace) {
+            error
+        } else {
+            format!("{error}. {path} is outside the workspace, {}", self.workspace.display())
         }
     }
+
+    /// Refuses to replace a file the model has not seen as it now is, and shows it the file
+    /// instead, so that the same write goes through next time.
+    fn check_fresh(&mut self, path: &str, abs: &Path, current: &[u8]) -> Result<(), String> {
+        let hash = fnv1a(current);
+        let why = match self.seen.get(abs) {
+            Some(&seen) if seen == hash => return Ok(()),
+            Some(_) => "has changed since you last read it",
+            None => "already exists and you have not read it",
+        };
+        self.seen.insert(abs.to_path_buf(), hash);
+        let shown = listing(path, current, None, None).unwrap_or_else(|note| format!("({note})\n"));
+        Err(format!(
+            "{path} {why}, so it was not replaced. It reads:\n{shown}To replace it anyway, call \
+             write again."
+        ))
+    }
+}
+
+/// `bytes` as numbered lines: `limit` of them from line `offset`.
+fn listing(
+    path: &str,
+    bytes: &[u8],
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<String, String> {
+    if bytes[..bytes.len().min(8192)].contains(&0) {
+        return Err(format!("{path} is a binary file ({} bytes)", bytes.len()));
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return Ok(format!("({path} is empty)\n"));
+    }
+    let start = offset.unwrap_or(1).max(1) as usize;
+    if start > lines.len() {
+        return Err(format!("{path} has {} lines; offset {start} is past the end", lines.len()));
+    }
+    let end = (start - 1 + limit.map_or(DEFAULT_LINES, |l| l.max(1) as usize)).min(lines.len());
+    let shown: Vec<Cow<str>> = lines[start - 1..end].iter().map(|line| clip(line)).collect();
+    let mut out = numbered(shown.iter().map(|line| &**line), start);
+    if end < lines.len() {
+        out.push_str(&format!(
+            "({} more lines; continue with offset {})\n",
+            lines.len() - end,
+            end + 1
+        ));
+    }
+    Ok(out)
 }
 
 /// A line cut to a readable length.
@@ -236,24 +274,54 @@ mod tests {
             "     2\ttwo\n(1 more lines; continue with offset 3)\n"
         );
         assert!(files.read("a.txt", Some(9), None).unwrap_err().contains("past the end"));
-        assert!(files.read("missing.txt", None, None).is_err());
+        let missing = files.read("missing.txt", None, None).unwrap_err();
+        assert!(!missing.contains("outside the workspace"), "{missing}");
+        let outside = files.read("/eidra-no-such-dir/report.py", None, None).unwrap_err();
+        assert!(
+            outside.ends_with(&format!("outside the workspace, {}", dir.display())),
+            "{outside}"
+        );
         fs::write(dir.join("b.bin"), [0u8, 1, 2]).unwrap();
         assert!(files.read("b.bin", None, None).unwrap_err().contains("binary"));
     }
 
     #[test]
-    fn will_not_overwrite_what_it_has_not_read() {
+    fn shows_a_file_before_overwriting_it() {
         let dir = workspace("write");
         fs::write(dir.join("a.py"), "x = 1\n").unwrap();
         let mut files = Files::new(&dir);
-        assert!(files.write("a.py", "x = 2\n").unwrap_err().contains("have not read"));
-        files.read("a.py", None, None).unwrap();
-        fs::write(dir.join("a.py"), "x = 3\n").unwrap();
-        assert!(files.write("a.py", "x = 2\n").unwrap_err().contains("changed since"));
-        files.read("a.py", None, None).unwrap();
+        let unread = files.write("a.py", "x = 2\n").unwrap_err();
+        assert!(unread.contains("have not read") && unread.contains("     1\tx = 1\n"), "{unread}");
+        assert_eq!(fs::read_to_string(dir.join("a.py")).unwrap(), "x = 1\n");
         files.write("a.py", "x = 2\n").unwrap();
-        files.write("new/b.py", "y = 1\n").unwrap();
-        assert_eq!(fs::read_to_string(dir.join("new/b.py")).unwrap(), "y = 1\n");
+
+        fs::write(dir.join("a.py"), "x = 3\n").unwrap();
+        let changed = files.write("a.py", "x = 4\n").unwrap_err();
+        assert!(changed.contains("changed since") && changed.contains("\tx = 3\n"), "{changed}");
+        files.write("a.py", "x = 4\n").unwrap();
+        assert_eq!(fs::read_to_string(dir.join("a.py")).unwrap(), "x = 4\n");
+
+        fs::write(dir.join("b.bin"), [0u8, 1, 2]).unwrap();
+        assert!(files.write("b.bin", "text").unwrap_err().contains("binary file (3 bytes)"));
+        files.write("new/c.py", "y = 1\n").unwrap();
+        assert_eq!(fs::read_to_string(dir.join("new/c.py")).unwrap(), "y = 1\n");
+    }
+
+    #[test]
+    fn edits_without_a_read() {
+        let dir = workspace("unread");
+        fs::write(dir.join("a.py"), "x = 1\ny = 2\n").unwrap();
+        fs::write(dir.join("b.py"), "x = 1\n").unwrap();
+        let mut files = Files::new(&dir);
+        files.edit("a.py", "x = 1", "x = 5", false).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("a.py")).unwrap(), "x = 5\ny = 2\n");
+        // The edit showed only its own lines, so replacing the whole file still shows it first.
+        assert!(files.write("a.py", "z = 3\n").unwrap_err().contains("have not read"));
+
+        // A file read before stays known through an edit.
+        files.read("b.py", None, None).unwrap();
+        files.edit("b.py", "x = 1", "x = 2", false).unwrap();
+        files.write("b.py", "x = 3\n").unwrap();
     }
 
     #[test]

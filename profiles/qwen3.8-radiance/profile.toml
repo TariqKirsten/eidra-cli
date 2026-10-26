@@ -6,11 +6,15 @@ model = "qwen3.8-flash-next"
 api_key_env = "RADIANCE_API_KEY"
 
 [request]
-# Counts the reasoning too, so it leaves room for a large file write.
-max_tokens = 16384
-# Fixed for the whole session: low and xhigh rewrite the start of the system prompt (DESIGN.md §3, R2).
-reasoning_effort = "medium"
-thinking_budget = 2048
+# Counts the reasoning too, so it leaves room for the thinking budget and a large file write.
+max_tokens = 32768
+# xhigh is the default for Qwen3.8. It is fixed for the whole session: xhigh writes its
+# instructions at the start of the system prompt. So changing the effort mid-session would mean
+# recomputing the whole prompt, and so would turning thinking off for one step (DESIGN.md §3, R2).
+reasoning_effort = "xhigh"
+# Reasoning tokens per request before the server closes the reasoning block. Set well above what
+# a step needs, so that it only stops runaway reasoning. Tune it with the evals.
+thinking_budget = 8192
 parallel_tool_calls = true
 
 # Other request fields, sent as given. Unset ones use the model's generation config on the server.

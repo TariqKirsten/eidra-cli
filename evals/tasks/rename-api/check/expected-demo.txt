@@ -1,0 +1,6 @@
+depot to the first stop: 5.00
+the whole round trip: 22.87
+the stop nearest the depot: Point(x=-2, y=1)
+  Point(x=0, y=0) -> Point(x=3, y=4): 5.00
+  Point(x=3, y=4) -> Point(x=6, y=8): 5.00
+  Point(x=6, y=8) -> Point(x=-2, y=1): 10.63

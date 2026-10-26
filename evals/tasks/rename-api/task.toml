@@ -1,0 +1,27 @@
+id = "rename-api"
+split = "test"
+image = "python:3.13-slim"
+max_requests = 60
+timeout_s = 600
+prompt = """
+Rename the function calc_dist to distance throughout this project: its definition, every use, the tests, examples/demo.py and README.md. Keep calc_dist importable from geo as a deprecated alias: calling it must emit a DeprecationWarning that points at the caller's line (stacklevel=2, when calc_dist itself issues the warning) and return the same result as distance.
+"""
+
+# The new name works everywhere, the alias warns from the caller, and nothing uses the alias.
+[[checks]]
+name = "hidden"
+run = "cp /check/hidden_checks.py hidden_checks.py && python3 -m unittest -q hidden_checks"
+
+# The agent's tests pass without calling the alias, except to test that it warns.
+[[checks]]
+name = "tests"
+run = "python3 -W error::DeprecationWarning -m unittest -q"
+
+[[checks]]
+name = "demo"
+run = "python3 -W error::DeprecationWarning examples/demo.py > /tmp/out && diff -u /check/expected-demo.txt /tmp/out"
+
+# README.md documents distance, and mentions calc_dist only as deprecated.
+[[checks]]
+name = "readme"
+run = "python3 /check/readme.py"

@@ -1,0 +1,6 @@
+GLOVE-L    Work gloves, large     stock    0  short   15  LATE
+BOLT-M6    M6 bolt, 30 mm         stock  120  short   80  LATE
+GLUE-2K    Two-part epoxy         stock    6  short    4  2.0 days to spare
+DRILL-8    Drill bit, 8 mm        stock    9  short    0  4.2 days to spare
+Coming up: TAPE-50, WASH-M6
+4 of 9 items to reorder

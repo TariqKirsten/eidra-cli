@@ -1,0 +1,31 @@
+id = "todo-json"
+split = "train"
+image = "python:3.13-slim"
+max_requests = 60
+timeout_s = 600
+prompt = """
+Add two options to the `list` command of todo.py:
+
+- `--pending` shows only the items that are not done.
+- `--json` prints the items it would show as a JSON array of objects with the keys id, text and done, in the same order. An empty selection prints `[]`.
+
+The two options can be combined. Without `--json`, when no items are shown, `list` prints `Nothing to do.` as it does now. Document both options in the Usage section of README.md, and add tests for them to tests/test_todo.py.
+"""
+
+# The agent's own tests pass, and cover both options.
+[[checks]]
+name = "tests"
+run = "python3 -m unittest -q && grep -q -- '--json' tests/test_todo.py && grep -q -- '--pending' tests/test_todo.py"
+
+# What worked before still works.
+[[checks]]
+name = "original"
+run = "cp /check/original_checks.py original_checks.py && python3 -m unittest -q original_checks"
+
+[[checks]]
+name = "hidden"
+run = "cp /check/hidden_checks.py hidden_checks.py && python3 -m unittest -q hidden_checks"
+
+[[checks]]
+name = "readme"
+run = "grep -q -- '--json' README.md && grep -q -- '--pending' README.md"

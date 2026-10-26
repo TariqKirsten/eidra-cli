@@ -1,0 +1,16 @@
+date,amount,category,note
+2026-01-03,"1,200.00",Rent,"January rent, flat 2"
+2026-01-05,84.20,groceries,weekly shop
+2026-01-12,23.50,Transport,train pass top-up
+2026-01-19,91.35,Groceries,weekly shop
+2026-01-24,46.00,dining,birthday dinner
+# February
+2026-02-02,"1,200.00",rent,February rent
+2026-02-06,102.10,groceries,
+2026-02-09,-15.00,groceries,refund: damaged eggs
+2026-02-14,68.40,Dining,valentines
+2026-02-20,23.50,transport,train pass top-up
+2026-02-27,131.75,utilities,electricity
+
+2026-03-02,"1,200.00",rent,March rent
+2026-03-04,95.60,groceries,weekly shop

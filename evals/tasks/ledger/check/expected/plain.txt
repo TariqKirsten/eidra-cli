@@ -1,0 +1,22 @@
+Expense report: 13 expenses, 2026-01-03 to 2026-03-04
+Total: $4,251.40
+
+By category
+Category       Total
+---------  ---------
+dining       $114.40
+groceries    $358.25
+rent       $3,600.00
+transport     $47.00
+utilities    $131.75
+
+By month
+Month        Total
+-------  ---------
+2026-01  $1,445.05
+2026-02  $1,510.75
+2026-03  $1,295.60
+
+Monthly average: $1,417.13
+Top categories: rent ($3,600.00), groceries ($358.25), utilities ($131.75)
+[exit 0]

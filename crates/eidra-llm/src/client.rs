@@ -113,6 +113,14 @@ impl Client {
         }
     }
 
+    /// Empties the server's prefix cache (`/reset_prefix_cache`: radiance, vLLM), for everyone
+    /// using it. `root` is as for [`Client::apply_template`].
+    pub async fn reset_prefix_cache(&self, root: &str) -> Result<(), Error> {
+        let url = format!("{}/reset_prefix_cache", root.trim_end_matches('/'));
+        self.send(self.http.post(&url).json(&json!({})), &url).await?;
+        Ok(())
+    }
+
     /// The ids of the models the server lists.
     pub async fn models(&self) -> Result<Vec<String>, Error> {
         let url = format!("{}/models", self.base_url);

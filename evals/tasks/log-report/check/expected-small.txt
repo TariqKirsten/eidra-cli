@@ -1,0 +1,5 @@
+Requests: 4 (skipped 1)
+Top paths:
+  2  /a  p95 2 ms
+  1  /b  p95 -
+  1  /c  p95 1 ms

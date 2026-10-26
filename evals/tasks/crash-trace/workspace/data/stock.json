@@ -1,0 +1,13 @@
+{
+  "items": [
+    {"sku": "BOLT-M6", "name": "M6 bolt, 30 mm", "stock": 120, "reorder_at": 200, "daily_use": 40, "lead_days": 4},
+    {"sku": "NUT-M6", "name": "M6 nut", "stock": 260, "reorder_at": 200, "daily_use": 38, "lead_days": 4},
+    {"sku": "WASH-M6", "name": "M6 washer", "stock": 203, "reorder_at": 200, "daily_use": 30, "lead_days": 3},
+    {"sku": "BRKT-L", "name": "Angle bracket, large", "stock": 0, "reorder_at": null, "daily_use": 0, "lead_days": 21},
+    {"sku": "GLUE-2K", "name": "Two-part epoxy", "stock": 6, "reorder_at": 10, "daily_use": 0.5, "lead_days": 10},
+    {"sku": "SAW-BLD", "name": "Saw blade, 250 mm", "stock": 3, "reorder_at": null, "daily_use": 0.2, "lead_days": 14},
+    {"sku": "TAPE-50", "name": "Duct tape, 50 m", "stock": 14, "reorder_at": 12, "daily_use": 1.5, "lead_days": 5},
+    {"sku": "DRILL-8", "name": "Drill bit, 8 mm", "stock": 9, "reorder_at": 9, "daily_use": 0.8, "lead_days": 7},
+    {"sku": "GLOVE-L", "name": "Work gloves, large", "stock": 0, "reorder_at": 15, "daily_use": 2, "lead_days": 6}
+  ]
+}

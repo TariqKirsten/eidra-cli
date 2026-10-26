@@ -1,0 +1,20 @@
+id = "ledger"
+split = "train"
+origin = "radiance's agent demo (~/radiance/examples/agent-demo), with a second, hidden data set"
+image = "python:3.13-slim"
+max_requests = 80
+timeout_s = 900
+prompt = """
+Implement the ledger package described in SPEC.md. ledger/models.py is finished; write ledger/parse.py, ledger/stats.py, ledger/budget.py, ledger/fmt.py and ledger/cli.py. Do not change SPEC.md, ledger/models.py or anything in tests/. The tests run with `python3 -m unittest -q` from the project directory: get them all passing, then finish.
+"""
+
+# The original tests, whatever the agent did to tests/, with models.py untouched.
+[[checks]]
+name = "tests"
+run = "cmp -s /check/models.py ledger/models.py && rm -rf tests && cp -r /check/tests tests && python3 -m unittest -q"
+
+# The CLI's report against the reference solution's, on the sample data and on a hidden second
+# data set; errors only need the right shape.
+[[checks]]
+name = "report"
+run = "sh /check/report.sh"

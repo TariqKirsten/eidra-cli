@@ -1,7 +1,8 @@
 # eidra: design
 
-Status, 2026-10-26: M0 and M1 are done. The probe confirmed R2–R5 on the live server (§3.1), and
-`eidra exec` completed the ledger task unattended (§16.1). M2, the eval runner, is next.
+Status, 2026-10-26: M0 and M1 are done, and M2 is under way. The probe confirmed R2–R5 on the
+live server (§3.1), `eidra exec` completed the ledger task unattended (§16.1), and the first suite
+runs are in §16.2.
 
 ## 1. What and why
 
@@ -50,15 +51,16 @@ so the request builder follows these rules:
 - **R1. Freeze these per session:** the system prompt text, the tool list (names, descriptions,
   schemas, order), the reasoning effort and any `chat_template_kwargs`. The template renders the
   tools into the system prompt.
-- **R2. Per-request thinking control uses only `none` and the budget.**
+- **R2. Effort is fixed per session; a single request is controlled only through the budget.**
   - The template writes `low` and `xhigh` instructions at the top of the system prompt.
   - `medium` and `none` render the same system prompt and differ only in the generation prompt
     at the end.
   - The sampler, not the prompt, applies `thinking_token_budget`.
 
-  So sessions run at `medium`, and a single step can turn thinking off with `none` or shorten it
-  with the budget. Effort is always sent explicitly, because the profile default `low` renders
-  differently from `none`.
+  Sessions run at `xhigh` by default, the user's choice for Qwen3.8. At `xhigh`, a step can only
+  be shortened, with the budget: switching it to `none` would drop the `xhigh` instructions from
+  the top of the prompt. (A `medium` session could also turn single steps to `none` at no cost.)
+  Effort is always sent explicitly, because the server's default, `low`, renders differently.
 - **R3. Replay assistant turns exactly:** `content`, `reasoning_content` (verbatim, untrimmed),
   and `tool_calls` with the same ids and the `arguments` string byte for byte as received. This
   keeps the history's rendering stable. The reply itself is recomputed in the next request either
@@ -140,7 +142,9 @@ started and finished, approval requests and per-turn stats.
 Each session is an append-only JSONL file at `~/.local/share/eidra/sessions/<id>.jsonl`.
 
 - It starts with the frozen session header: profile hash, system prompt, tools and effort.
-- Every message follows exactly as it was sent or received, with per-turn stats.
+- Every message follows exactly as it was sent or received, with per-turn stats and the seed the
+  request was sent with. Radiance is deterministic for a seed and a prompt, so any request can be
+  sent again and give the same reply (§16.2).
 
 The next request is built from the log alone. Resume, fork and replay read the same file.
 
@@ -180,8 +184,8 @@ Initial set (M1):
 | `bash` | `command`, `timeout_s?`, `background?` | §6 |
 | `bash_output`, `bash_kill` | `id` | background jobs |
 | `read` | `path`, `offset?`, `limit?` | text with line numbers; images as image parts; PDFs as text, with page images on request; `.ipynb` as cells |
-| `edit` | `path`, `old`, `new`, `replace_all?` | exact match, which must be unique unless `replace_all`; tolerates a differing leading or trailing newline; refuses files not read this session or changed since |
-| `write` | `path`, `content` | |
+| `edit` | `path`, `old`, `new`, `replace_all?` | exact match, which must be unique unless `replace_all`; tolerates a differing leading or trailing newline and CRLF endings; needs no read first |
+| `write` | `path`, `content` | an existing file not read this session, or changed since, is shown instead of replaced, and the same call then goes through |
 | `glob` | `pattern`, `path?` | gitignore-aware, in-process (`ignore`) |
 | `grep` | `pattern`, `path?`, `glob?` | in-process (`grep-searcher`) |
 | `todo` | `list` | a markdown checklist as one string, which keeps the schema flat |
@@ -242,8 +246,8 @@ The policy guards against model mistakes. It is not a security boundary.
   The threshold is a profile setting, starting at 120K, tuned by evals.
 - **Compaction:** summarise with a prompt that keeps decisions, open work and exact details, then
   start a new conversation with the summary. That costs one cold prefill, about 30–55 s at 120K.
-- **Reasoning stays in history (R3)** and counts against the window. Evals decide how often steps
-  run with thinking off.
+- **Reasoning stays in history (R3)** and counts against the window. Evals decide the thinking
+  budget.
 
 ## 9. Python
 
@@ -321,16 +325,44 @@ Reference: codex-rs `tui`.
 
 - **`eidra exec`:** headless, emits JSON events, sets an exit code, and uses
   `tool_choice: "required"` with `finish`.
-- **`eidra eval`** runs a task suite over N seeds. For each run it records:
-  - pass or fail
+- **`eidra eval run`** runs each task of a suite N times. Each attempt runs in its own container,
+  with the static binary mounted and a fresh copy of the task's workspace. Checks then run with
+  no network, on a copy of what the agent left, with the task's hidden `check/` directory
+  mounted. Each attempt records:
+  - pass or fail, per check
   - wall-clock time
-  - turns, tool calls, tool errors and edit misses
+  - requests, tool calls and tool errors
   - prompt, cached, computed, generated and reasoning tokens
-- **Suites:**
-  - radiance's agent-demo ledger project (a smoke test)
-  - a SWE-bench Verified subset (all Python)
-  - a Terminal-Bench subset
+
+  `eidra eval compare` shows two runs side by side, task by task. `eidra eval validate` checks the
+  tasks themselves, without the model: their checks must fail on the starting workspace and pass
+  on a reference solution. `eidra eval regrade` runs the current checks again on what a recorded
+  run's attempts left, after a check is fixed. The format and the rules for writing tasks are in
+  evals/README.md.
+- **`eidra replay`** sends one request of a recorded session again. Radiance is deterministic for
+  a seed and a prompt, so with the recorded seed it should reproduce the reply exactly; a reply
+  that differs means the server computed something else. Other seeds show what else the model
+  might have done at that step, and `--cold` empties the server's prefix cache first. It tests a
+  change at one decision point in seconds, before a suite run tests it everywhere.
+- **The suite** (M2) is seven tasks: four train, three held-out test:
+  - building from a spec, with a hidden data set
+  - a bug fix with a second, undocumented-by-tests bug
+  - a feature with docs and tests
+  - a crash with a second crash behind it
+  - a log summariser checked on unseen logs
+  - a cross-package rename with a deprecated alias
+  - one default changed in code, config, docs and tests, among decoys
+
+  Tuning looks only at train attempts; test results show whether the tuning generalises.
+- **To add next:** harder tasks, since this suite saturates (§16.2).
+  - Harbor-format tasks (`instruction.md`, `task.toml`, `environment/`, `tests/test.sh` writing a
+    reward to `/logs/verifier/reward.txt`). The agent and the verifier run inside the task's own
+    container. One adapter opens Terminal-Bench, SWE-bench and SWE-rebench.
+  - SWE-rebench's monthly splits, newer than the model. Qwen3.8 recalls SWE-bench and
+    Terminal-Bench environments (§16.2), so tasks it cannot have seen measure the harness, not
+    memory. Their images are large, so each is pulled for its task and removed after.
   - tasks from the user's own repos
+  - larger codebases, for M3's subagents to show what they are worth
 - **Baselines on the same model:** Codex (`/v1/responses`), Claude Code (`/v1/messages`) and pi
   (chat completions).
 - **Later:** radiance serves LoRA adapters, so successful trajectories could fine-tune the model
@@ -387,6 +419,64 @@ with a per-module task split, so it is a reference point, not a controlled compa
   writing all the modules. Measure whether a larger budget for that kind of step helps.
 - **Short prompts.** A first prompt under 2048 tokens left nothing for the next request to reuse.
   It costs about half a second, once per session.
+
+### 16.2 M2: first suite runs (2026-10-26)
+
+Each run used the seven-task suite, one attempt per task:
+
+| run | effort | passed | agent time | tokens generated | tool errors |
+|---|---|---|---|---|---|
+| first-pass | medium | 7/7 | 4.2 min | 40K | 11 |
+| xhigh | xhigh | 7/7 | 15.6 min | 139K | 13 |
+| file-tools | xhigh | 7/7 | 10.1 min | 95K | 3 |
+
+xhigh's rename-api attempt first failed a check that was wrong. The check judged the README line
+by line, and the agent's deprecation note had wrapped onto a second line. The check now reads
+paragraphs, and `eidra eval regrade` re-ran it on both runs.
+
+**The suite saturates.** Every attempt passes at both efforts, so the suite measures cost but not
+quality. It cannot show what xhigh buys. Harder tasks are next (§15).
+
+**xhigh costs 3.7 times the time.** Most of it is the ledger (80 s → 9.6 min). Its tests passed by
+about request 19 at both efforts, but at xhigh the model kept probing edge cases (NaN, malformed
+amounts) until the task's 80-request limit. Its hidden checks pass either way.
+
+**Read-before refusals.** These are 22 of the 24 tool errors across the two runs. The model knew
+the files from grep or cat, and its `old` strings matched, but only `read` counted as reading.
+The change now waiting to be measured:
+- `edit` needs no read, since `old` must match the file exactly
+- `write` shows an unread or changed file instead of only refusing, and the same call then goes
+  through
+
+**Drift into an imagined task.** At request 25 of the xhigh ledger attempt (34K tokens), the
+model's reasoning switched to another task. It planned a `pipeline.py` with init, add, delete and
+report commands, in `/testbed` and `/app`, with a `task.yaml`. Those are SWE-bench's and
+Terminal-Bench's layouts. The tool calls stayed on the ledger for 34 more requests. Then the model
+wrote `/app/pipeline.py`, got "Permission denied", ran `ls /`, and went back to the task.
+
+In a later run, log-report drifted from request 1. With only the system prompt and the task in
+context, the model's reasoning began mid-thought about a database-backed `report.py`. By request 3
+it was recalling a detailed history (patch scripts, digests, a tool error eidra never produces).
+It spent 16 requests on that before reading SPEC.md.
+
+That request had a recorded seed. Replayed with the cache emptied first, it gave the same reply,
+bit for bit: the model produces the drift from the prompt. Radiance is not at fault:
+- Every conversation radiance held was eidra's (`/sessions`), and none contained that content.
+- Radiance is deterministic for a seed and a prompt, and a reply resumed from a snapshot is
+  bit-identical to one computed from scratch.
+
+It looks like recall of training trajectories. It appeared in 2 of the 14 xhigh attempts and none
+of the 7 medium ones. Replaying log-report's first request with 30 new seeds, 1 drifted, again
+starting mid-thought. Listing the workspace in the system prompt did not help: 1 of the same 30
+seeds drifted, and the spec was read first in 28 replies against 23 without it, so the listing
+was dropped. Errors for paths outside the workspace now name the workspace, which is what brought
+the model back the first time.
+
+**The file-tool change** (run file-tools, xhigh, one attempt per task): tool errors fell from 13 to
+3. Two of the three were the new refusals, which showed the file. The third was an `edit` whose
+`old` did not match, which is the cost of not requiring a read. It took one step, as the refusal
+did. Times moved both ways (ledger 9.6 → 1.6 min, log-report 2.6 → 5.4 min with its drift), so at
+xhigh, one attempt per task cannot show a time effect; that needs repeats.
 
 ## 17. Open questions
 

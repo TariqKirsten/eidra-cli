@@ -1,0 +1,31 @@
+Expense report: 10 expenses, 2026-01-01 to 2026-04-18
+Total: $2,560.64
+
+By category
+Category           Total
+-------------  ---------
+dining            $45.00
+entertainment     $12.50
+groceries        $104.09
+household         -$5.00
+rent           $2,400.00
+transport          $4.05
+
+By month
+Month        Total
+-------  ---------
+2026-01  $1,291.60
+2026-04  $1,269.04
+
+Monthly average: $640.16
+Top categories: rent ($2,400.00), groceries ($104.09), dining ($45.00)
+
+Budgets for 2026-04
+Category      Budget      Spent  Remaining         Used
+---------  ---------  ---------  ---------  -----------
+dining        $40.00     $45.00     -$5.00  112.5% OVER
+rent       $1,200.00  $1,200.00      $0.00       100.0%
+groceries    $150.50     $19.99    $130.51        13.3%
+fun           $25.00      $0.00     $25.00         0.0%
+transport      $0.00      $4.05     -$4.05    0.0% OVER
+[exit 0]

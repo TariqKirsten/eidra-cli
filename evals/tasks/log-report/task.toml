@@ -1,0 +1,27 @@
+id = "log-report"
+split = "test"
+image = "python:3.13-slim"
+max_requests = 60
+timeout_s = 600
+prompt = """
+Write report.py as described in SPEC.md. The logs in logs/ are a sample to try it on; it will be run on other logs as well.
+"""
+
+# The sample logs, given in either order.
+[[checks]]
+name = "sample"
+run = "python3 report.py logs/access-1.log logs/access-2.log > /tmp/a && python3 report.py logs/access-2.log logs/access-1.log > /tmp/b && diff -u /check/expected-visible.txt /tmp/a && diff -u /check/expected-visible.txt /tmp/b"
+
+# Logs the agent never saw: a tie for fifth place, a path whose every response failed, a time
+# that rounds up from exactly half a millisecond, malformed and blank lines.
+[[checks]]
+name = "hidden"
+run = "python3 report.py /check/logs/access-3.log > /tmp/out && diff -u /check/expected-hidden.txt /tmp/out"
+
+[[checks]]
+name = "small"
+run = "python3 report.py /check/small.log > /tmp/out && diff -u /check/expected-small.txt /tmp/out"
+
+[[checks]]
+name = "empty"
+run = "python3 report.py /check/empty.log > /tmp/out && diff -u /check/expected-empty.txt /tmp/out"

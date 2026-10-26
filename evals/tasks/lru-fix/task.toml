@@ -1,0 +1,19 @@
+id = "lru-fix"
+split = "train"
+image = "python:3.13-slim"
+max_requests = 60
+timeout_s = 600
+prompt = """
+LRUCache in cachekit/lru.py doesn't do what its docstring says, and tests/test_lru.py has a failing test that shows one case of it. Fix the cache so that it behaves as documented. Don't change the tests.
+"""
+
+# The visible tests as they were, whatever the agent did to them.
+[[checks]]
+name = "tests"
+run = "rm -rf tests && cp -r /check/tests tests && python3 -m unittest -q"
+
+# Everything the docstring promises, including a long random run against a model of it.
+[[checks]]
+name = "hidden"
+run = "cp /check/hidden_checks.py hidden_checks.py && python3 -m unittest -q hidden_checks"
+timeout_s = 120

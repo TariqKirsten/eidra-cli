@@ -1,2 +1,4 @@
 /target
 /dist
+/evals/runs
+__pycache__/

@@ -14,7 +14,7 @@ use crate::confirm::ConfirmPolicy;
 use crate::event::{Event, Frontend, RequestStats};
 use crate::profile::Profile;
 use crate::session::{Header, Session};
-use crate::text::utc_datetime;
+use crate::text::{fnv1a, utc_datetime};
 use crate::tools::{self, ToolOutput, Toolbox};
 
 pub struct AgentOptions {
@@ -147,7 +147,7 @@ impl Agent {
                 })
                 .await
                 .with_context(|| format!("request {}", self.requests))?;
-            let stats = stats(&turn);
+            let stats = request_stats(&turn, request.seed);
             frontend.event(Event::Reply { stats: stats.clone() });
             let AssistantTurn { message, finish_reason, .. } = turn;
             let calls = message.tool_calls.clone();
@@ -215,20 +215,9 @@ impl Agent {
 
     /// The next request: everything in the log, with the settings fixed at the start.
     fn request(&self) -> Result<ChatRequest> {
-        let settings = &self.profile.request;
-        let thinking = settings.reasoning_effort != "none";
-        Ok(ChatRequest {
-            model: self.profile.model.clone(),
-            messages: self.session.messages().to_vec(),
-            tools: self.tools.definitions().to_vec(),
-            tool_choice: Some(if self.headless { "required" } else { "auto" }.into()),
-            parallel_tool_calls: settings.parallel_tool_calls,
-            max_tokens: Some(settings.max_tokens),
-            reasoning_effort: Some(settings.reasoning_effort.clone()),
-            thinking_token_budget: settings.thinking_budget.filter(|_| thinking),
-            session_id: Some(self.session.header().id.clone()),
-            extra: self.profile.extra_fields()?,
-        })
+        let header = self.session.header();
+        let messages = self.session.messages().to_vec();
+        reply_request(&self.profile, header, messages, seed(&header.id, self.requests))
     }
 
     fn cut_off_message(&self) -> String {
@@ -239,10 +228,44 @@ impl Agent {
     }
 }
 
-fn stats(turn: &AssistantTurn) -> RequestStats {
+/// The request for the reply that follows `messages` in a session: the tools, effort and mode the
+/// session's header fixed (R1), and the profile's other settings. `eidra replay` builds its requests
+/// here too, so a replay sends what the agent sent.
+pub fn reply_request(
+    profile: &Profile,
+    header: &Header,
+    messages: Vec<Message>,
+    seed: u64,
+) -> Result<ChatRequest> {
+    let settings = &profile.request;
+    let thinking = header.reasoning_effort != "none";
+    Ok(ChatRequest {
+        model: header.model.clone(),
+        messages,
+        tools: header.tools.clone(),
+        tool_choice: Some(if header.headless { "required" } else { "auto" }.into()),
+        parallel_tool_calls: settings.parallel_tool_calls,
+        max_tokens: Some(settings.max_tokens),
+        reasoning_effort: Some(header.reasoning_effort.clone()),
+        thinking_token_budget: settings.thinking_budget.filter(|_| thinking),
+        seed: Some(seed),
+        session_id: Some(header.id.clone()),
+        extra: profile.extra_fields()?,
+    })
+}
+
+/// A request's seed: fixed by the session and the request's number, and recorded with the reply,
+/// so that any request can be sent again and give the same reply (DESIGN.md §16.2).
+fn seed(session: &str, request: usize) -> u64 {
+    fnv1a(format!("{session}/{request}").as_bytes()) & 0x7fff_ffff
+}
+
+/// What the server reported about a reply, with the seed its request was sent with.
+pub fn request_stats(turn: &AssistantTurn, seed: Option<u64>) -> RequestStats {
     let timings = turn.timings.clone().unwrap_or_default();
     let usage = turn.usage.as_ref();
     RequestStats {
+        seed,
         prompt_tokens: match (timings.cache_n, timings.prompt_n) {
             (Some(cached), Some(computed)) => Some(cached + computed),
             _ => usage.map(|u| u.prompt_tokens),
@@ -279,4 +302,16 @@ fn agents_md(workspace: &Path) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seeds_are_fixed_per_request_and_fit_in_31_bits() {
+        assert_eq!(seed("20261026-174612-cb29", 25), seed("20261026-174612-cb29", 25));
+        assert_ne!(seed("20261026-174612-cb29", 25), seed("20261026-174612-cb29", 26));
+        assert!(seed("20261026-174612-cb29", 25) < 1 << 31);
+    }
 }

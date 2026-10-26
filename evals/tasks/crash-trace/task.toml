@@ -1,0 +1,22 @@
+id = "crash-trace"
+split = "train"
+image = "python:3.13-slim"
+max_requests = 60
+timeout_s = 600
+prompt = """
+`python3 -m inventory data/stock.json` crashes. The data file is right: as README.md says, an item whose reorder_at is null is never reordered. Fix the code so that the report works with such items, and add a test that covers them. Don't change data/stock.json.
+"""
+
+# The report for the sample data, from the data file as it was.
+[[checks]]
+name = "report"
+run = "cmp -s /check/stock.json data/stock.json && python3 -m inventory data/stock.json > /tmp/out && diff -u /check/expected.txt /tmp/out"
+
+[[checks]]
+name = "hidden"
+run = "cp /check/hidden_checks.py hidden_checks.py && python3 -m unittest -q hidden_checks"
+
+# What worked before still works, and the agent's tests pass with at least one more than before.
+[[checks]]
+name = "tests"
+run = "cp /check/original_checks.py original_checks.py && python3 -m unittest -q original_checks && python3 -m unittest -q && [ \"$(grep -rh 'def test_' tests | wc -l)\" -gt \"$(grep -c 'def test_' /check/original_checks.py)\" ]"

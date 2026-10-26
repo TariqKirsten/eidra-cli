@@ -148,7 +148,7 @@ mod tests {
     fn the_builtin_profile_parses() {
         let profile = Profile::builtin().unwrap();
         assert_eq!(profile.model, "qwen3.8-flash-next");
-        assert_eq!(profile.request.reasoning_effort, "medium");
+        assert_eq!(profile.request.reasoning_effort, "xhigh");
         assert!(profile.tools.enabled.iter().any(|t| t == "bash"));
         assert_eq!(profile.hash.len(), 16);
         assert!(profile.extra_fields().unwrap().is_empty());

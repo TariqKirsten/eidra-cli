@@ -17,6 +17,7 @@ use clap::{Args, ValueEnum};
 use eidra_llm::{AssistantTurn, ChatRequest, Client, Message, Usage};
 use serde::Serialize;
 
+use crate::format::thousands;
 use fixture::{Fixture, MODULES, TASK};
 
 /// radiance snapshots a conversation every 2048 tokens (and at the end of a long enough prompt),
@@ -647,18 +648,7 @@ fn print_summary(reports: &[VariantReport]) {
 }
 
 fn count(n: Option<u64>) -> String {
-    let Some(n) = n else {
-        return "-".into();
-    };
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
+    n.map_or("-".into(), thousands)
 }
 
 fn percent(part: Option<u64>, whole: Option<u64>) -> String {

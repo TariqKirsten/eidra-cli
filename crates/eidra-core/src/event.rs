@@ -2,7 +2,7 @@
 
 use std::future::Future;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Something the agent did or saw, in the order it happened.
 #[derive(Debug, Clone, Serialize)]
@@ -26,9 +26,10 @@ pub enum Event {
     Notice { text: String },
 }
 
-/// What the server reported about one request.
-#[derive(Debug, Clone, Default, Serialize)]
+/// What the server reported about one request, and the seed it was sent with.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RequestStats {
+    pub seed: Option<u64>,
     pub prompt_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,

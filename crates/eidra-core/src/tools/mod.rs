@@ -72,10 +72,6 @@ impl Toolbox {
         })
     }
 
-    pub fn definitions(&self) -> &[Tool] {
-        &self.definitions
-    }
-
     pub async fn call<F: Frontend>(
         &mut self,
         call: &ToolCall,
@@ -271,7 +267,7 @@ fn definition(name: &str, description: Option<&String>) -> Result<Tool> {
         ),
         "read" => (
             "Read a text file. Lines come back numbered; read a long file in parts with offset and \
-             limit. Read a file before you edit or replace it.",
+             limit.",
             json!({
                 "path": {"type": "string", "description": "The file, relative to the working directory or absolute."},
                 "offset": {"type": "integer", "description": "The line to start at, counting from 1."},
@@ -281,8 +277,7 @@ fn definition(name: &str, description: Option<&String>) -> Result<Tool> {
         ),
         "edit" => (
             "Replace text in a file. old must match the file exactly, indentation included, and occur \
-             only once unless replace_all is true; include a few surrounding lines to make it unique. \
-             Read the file first.",
+             only once unless replace_all is true; include a few surrounding lines to make it unique.",
             json!({
                 "path": {"type": "string", "description": "The file to change."},
                 "old": {"type": "string", "description": "The exact text to replace."},
@@ -293,7 +288,7 @@ fn definition(name: &str, description: Option<&String>) -> Result<Tool> {
         ),
         "write" => (
             "Create a file, or replace a whole file, with the given content. To change part of a file, \
-             use edit. Read an existing file before you replace it.",
+             use edit. Read an existing file with read before you replace it.",
             json!({
                 "path": {"type": "string", "description": "The file to write. Missing directories are created."},
                 "content": {"type": "string", "description": "The complete new content of the file."}

@@ -6,15 +6,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use eidra_llm::{Message, Tool};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::event::RequestStats;
 use crate::text::utc_datetime;
 
 /// What a session started with: the log's first line.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Header {
     pub version: u32,
     pub id: String,
@@ -42,6 +42,48 @@ enum Record<'a> {
         outcome: &'a str,
         detail: &'a str,
     },
+}
+
+/// A log's records, read back.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Read {
+    Session(Header),
+    Message {
+        message: Message,
+        #[serde(default)]
+        stats: Option<RequestStats>,
+    },
+    End {},
+}
+
+/// A session log read back, for replaying its requests.
+pub struct Log {
+    pub header: Header,
+    /// Every message in order, each reply with the stats of the request that produced it.
+    pub messages: Vec<(Message, Option<RequestStats>)>,
+}
+
+impl Log {
+    pub fn read(path: &Path) -> Result<Log> {
+        let text =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut header = None;
+        let mut messages = Vec::new();
+        for (i, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
+            let record = serde_json::from_str(line)
+                .with_context(|| format!("{} line {}", path.display(), i + 1))?;
+            match record {
+                Read::Session(h) => header = Some(h),
+                Read::Message { message, stats } => messages.push((message, stats)),
+                Read::End {} => {}
+            }
+        }
+        let Some(header) = header else {
+            bail!("{} has no session header", path.display());
+        };
+        Ok(Log { header, messages })
+    }
 }
 
 pub struct Session {
@@ -138,6 +180,9 @@ mod tests {
         let text = fs::read_to_string(session.path()).unwrap();
         let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines.len(), 3);
+        let log = Log::read(session.path()).unwrap();
+        assert_eq!(log.header.id, session.header().id);
+        assert_eq!(log.messages, vec![(Message::user("hi"), None)]);
         assert_eq!(lines[0]["type"], "session");
         assert_eq!(lines[0]["id"], session.header().id.as_str());
         assert_eq!(lines[1]["message"]["content"], "hi");

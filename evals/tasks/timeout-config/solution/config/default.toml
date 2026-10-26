@@ -1,0 +1,16 @@
+# fetchkit's default configuration. Copy it and change what you need.
+
+[request]
+# Seconds the whole request may take.
+timeout = 45
+# Seconds to wait for the connection.
+connect_timeout = 5
+retries = 3
+
+[cache]
+# Seconds a cached response stays fresh.
+ttl = 300
+max_entries = 30
+
+[listing]
+page_size = 30

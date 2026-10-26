@@ -1,0 +1,22 @@
+id = "timeout-config"
+split = "test"
+image = "python:3.13-slim"
+max_requests = 80
+timeout_s = 900
+prompt = """
+fetchkit's default request timeout is 30 seconds; make it 45 seconds. Change the default everywhere it is defined or documented, in the code, the configuration, the docs and the tests, so that the whole project agrees, and change nothing else.
+"""
+
+# The agent's tests, updated where they encoded the old default, pass.
+[[checks]]
+name = "tests"
+run = "python3 -m unittest -q"
+
+# 45 s wherever the request timeout's default is set or described; every other 30 untouched.
+[[checks]]
+name = "hidden"
+run = "cp /check/hidden_checks.py hidden_checks.py && python3 -m unittest -q hidden_checks"
+
+[[checks]]
+name = "docs"
+run = "python3 /check/docs.py"
