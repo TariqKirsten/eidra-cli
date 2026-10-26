@@ -86,7 +86,12 @@ impl Editor {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let goal = self.goal.take();
-        match key.code {
+        let code = match key.code {
+            KeyCode::Char('p') if ctrl => KeyCode::Up,
+            KeyCode::Char('n') if ctrl => KeyCode::Down,
+            code => code,
+        };
+        match code {
             KeyCode::Char(ch) if !ctrl && !alt => self.insert(ch.encode_utf8(&mut [0; 4])),
             KeyCode::Char('a') if ctrl => self.caret = self.line_start(),
             KeyCode::Char('e') if ctrl => self.caret = self.line_end(),
@@ -487,6 +492,12 @@ mod tests {
         press(&mut editor, KeyCode::Down);
         assert_eq!(editor.text(), "second\nentry");
         press(&mut editor, KeyCode::Down);
+        assert_eq!(editor.text(), "draft");
+        // Ctrl+P and Ctrl+N do the same, as in a shell.
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        editor.key(ctrl(KeyCode::Char('p')));
+        assert_eq!(editor.text(), "second\nentry");
+        editor.key(ctrl(KeyCode::Char('n')));
         assert_eq!(editor.text(), "draft");
         // Sending the same thing twice keeps one entry.
         editor.set("first".into());

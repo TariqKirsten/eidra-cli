@@ -7,6 +7,7 @@ model.
     scripts/tui/offline.py                    # every scenario, with target/debug/eidra
     scripts/tui/offline.py approval queue -v  # these two, printing the screen as they go
     scripts/tui/offline.py --binary target/release/eidra
+    scripts/tui/offline.py --docker eidra     # in the image, through scripts/eidra-docker
 
 Each scenario prints one line, and the script exits non-zero if any failed. Standard library only.
 """
@@ -45,9 +46,10 @@ class Case:
     """One scenario's world: a workspace and a session directory, removed afterwards, and the
     eidra sessions it starts."""
 
-    def __init__(self, binary, verbose):
+    def __init__(self, binary, verbose, image=None):
         self.binary = binary
         self.verbose = verbose
+        self.image = image
         self.dir = Path(tempfile.mkdtemp(prefix="eidra-tui-"))
         self.workspace = self.dir / "work"
         self.workspace.mkdir()
@@ -55,12 +57,17 @@ class Case:
 
     def start(self, *args, server=None, cols=90, rows=24):
         url = server.url if server else f"http://127.0.0.1:{free_port()}/v1"
-        argv = [str(self.binary), "-C", str(self.workspace), "--base-url", url]
-        argv += ["--session-dir", str(self.dir / "sessions"), *args]
-        # Checkpoints go under the data directory: the scenario's own, not the user's.
+        # Sessions and checkpoints go under the data directory: the scenario's own, not the user's.
         env = dict(os.environ, TERM="xterm-256color", XDG_DATA_HOME=str(self.dir / "data"))
         env.pop("RADIANCE_API_KEY", None)
-        s = Session(argv, cols=cols, rows=rows, env=env)
+        if self.image:
+            # The wrapper works in the current directory and keeps sessions in the data directory.
+            argv = [str(ROOT / "scripts/eidra-docker"), "--base-url", url, *args]
+            env["EIDRA_IMAGE"] = self.image
+        else:
+            argv = [str(self.binary), "-C", str(self.workspace), "--base-url", url]
+            argv += ["--session-dir", str(self.dir / "sessions"), *args]
+        s = Session(argv, cols=cols, rows=rows, env=env, cwd=self.workspace)
         self.sessions.append(s)
         s.wait_for(idle, 10, "eidra to start")
         return s
@@ -360,6 +367,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("names", nargs="*", metavar="SCENARIO", help="the scenarios to run")
     parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/eidra")
+    parser.add_argument("--docker", metavar="IMAGE",
+                        help="run eidra in this image through scripts/eidra-docker instead")
     parser.add_argument("-v", "--verbose", action="store_true", help="print the screens")
     args = parser.parse_args()
     chosen = [f for f in SCENARIOS if not args.names or f.__name__ in args.names]
@@ -367,14 +376,16 @@ def main():
     if unknown:
         known = ", ".join(f.__name__ for f in SCENARIOS)
         sys.exit(f"no scenario {', '.join(sorted(unknown))}; there are {known}")
-    if not args.binary.exists():
+    if args.docker:
+        pass
+    elif not args.binary.exists():
         sys.exit(f"{args.binary} does not exist: build it with scripts/cargo build")
-    if stale(args.binary):
+    elif stale(args.binary):
         print(f"warning: {args.binary} is older than the sources: scripts/cargo build rebuilds it")
 
     failed = 0
     for fn in chosen:
-        case = Case(args.binary.resolve(), args.verbose)
+        case = Case(args.binary.resolve(), args.verbose, args.docker)
         started = time.time()
         try:
             fn(case)

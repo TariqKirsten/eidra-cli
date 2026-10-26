@@ -61,6 +61,7 @@ What it mounts and passes in:
 | `~/.local/share/eidra` | the same path, with `XDG_DATA_HOME` | session logs and checkpoints, kept after the container is gone |
 | `~/.cache/uv` | the same path, with `UV_CACHE_DIR` | Python packages are downloaded once |
 | `~/.gitconfig`, if there is one | `/home/eidra/.gitconfig`, read-only | your name and email on the agent's commits |
+| `/etc/localtime` | the same path, read-only | your time zone |
 | `$EIDRA_PROFILE`, if set | the same path, read-only | a profile of your own |
 
 | variable | |
@@ -69,6 +70,10 @@ What it mounts and passes in:
 | `EIDRA_BASE_URL`, `EIDRA_MODEL` | another server or model than the profile's |
 | `EIDRA_PROFILE` | a profile directory instead of the built-in one |
 | `EIDRA_IMAGE` | the image `scripts/eidra-docker` runs (default `eidra`) |
+| `TERM`, `COLORTERM` | your terminal's, for colours and keys |
+
+In the TUI, Docker's keys for detaching from a container are ctrl+^ then ctrl+q, not its default
+ctrl+p ctrl+q, which would hold back the ctrl+p the TUI uses for its history.
 
 It runs with `--user "$(id -u):$(id -g)"`, so the files the agent writes are yours, and HOME is
 `/home/eidra`, which anyone can write to. It shares the host's network (`--network host`): radiance listens on the host's
@@ -103,7 +108,7 @@ terminal's own scrollback; at the bottom are the reply streaming in, the input b
 - Enter sends; a message sent while the agent works waits for its turn to end. Shift+Enter,
   Alt+Enter or Ctrl+J add a newline.
 - Esc interrupts the agent. Ctrl+C interrupts, or clears the input, or quits; Ctrl+D quits.
-- Up and Down walk the history. Ctrl+T shows the model's reasoning whole instead of as one line.
+- Up and Down (or Ctrl+P and Ctrl+N) walk the history. Ctrl+T shows the model's reasoning whole instead of as one line.
 - A command on the confirm list asks first: y runs it once, a for the rest of the session, n not.
 - `/help`, `/new` (a new session), `/tasks` and `/stop` (subagents in the background),
   `/undo` and `/diff` (below), `/reasoning`, `/quit`.
@@ -166,4 +171,5 @@ loads `qwen-assistant` if another model is loaded.
     scripts/cargo clippy --workspace --all-targets
     scripts/cargo test --workspace
     scripts/tui/offline.py       # the TUI end to end against a fake server, no GPU, about 20 s
+    scripts/tui/offline.py --docker eidra   # the same, in the image through scripts/eidra-docker
     scripts/tui/smoke.py         # the TUI against radiance, about 30 s of GPU

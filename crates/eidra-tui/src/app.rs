@@ -73,7 +73,10 @@ const HELP: &[(&str, &str)] = &[
     ("esc", "interrupt the agent"),
     ("ctrl+c", "interrupt; or clear the input; or quit when it is empty"),
     ("ctrl+d", "quit, when the input is empty"),
-    ("up, down", "move between rows; from the first or last, walk the history"),
+    (
+        "up, down",
+        "move between rows; from the first or last, walk the history (also ctrl+p, ctrl+n)",
+    ),
     ("ctrl+t", "show reasoning in full, or as one line"),
     ("/undo", "put back the files the last turn changed; again for the turn before"),
     ("/diff [all]", "what changed since the last turn began, or since the session's first"),

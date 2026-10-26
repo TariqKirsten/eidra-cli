@@ -4,9 +4,9 @@
 # docker build -t eidra .
 #
 # The directory is mounted at the same path, so paths read the same inside and out. Session logs
-# go to the host's ~/.local/share/eidra and uv's cache to ~/.cache/uv. Commands run as you, so
-# files the agent writes are yours. The host's network is shared, since radiance listens on the
-# host's localhost.
+# and checkpoints go to the host's ~/.local/share/eidra and uv's cache to ~/.cache/uv. Commands run
+# as you, so files the agent writes are yours. The host's network is shared, since radiance
+# listens on the host's localhost.
 set -euo pipefail
 
 image=${EIDRA_IMAGE:-eidra}
@@ -21,9 +21,16 @@ args=(
   -v "$data/eidra:$data/eidra" -e "XDG_DATA_HOME=$data"
   -v "$cache:$cache" -e "UV_CACHE_DIR=$cache"
   -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e EIDRA_MODEL
+  # The terminal as the host has it, for colours and keys.
+  -e TERM -e COLORTERM
 )
 if [ -t 0 ] && [ -t 1 ]; then
-  args+=(-t)
+  # Docker's own detach keys, ctrl+p then ctrl+q, would hold back every ctrl+p the TUI is sent.
+  args+=(-t --detach-keys "ctrl-^,ctrl-q")
+fi
+# The host's time zone, for dates the agent reads or writes.
+if [ -e /etc/localtime ]; then
+  args+=(-v /etc/localtime:/etc/localtime:ro)
 fi
 # Your git identity, so the agent's commits are yours.
 if [ -f "$HOME/.gitconfig" ]; then

@@ -166,13 +166,15 @@ class Term:
 class Session:
     """A program running in a pty, and the terminal it sees."""
 
-    def __init__(self, argv, cols=100, rows=30, env=None):
+    def __init__(self, argv, cols=100, rows=30, env=None, cwd=None):
         self.term = Term(cols, rows)
         pid, fd = pty.fork()
         if pid == 0:
             # The size is set before the program starts, so that it reads the right one.
             try:
                 fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+                if cwd:
+                    os.chdir(cwd)
                 os.execvpe(argv[0], argv, env or os.environ)
             finally:
                 os._exit(127)  # not on into the caller's code, in the child

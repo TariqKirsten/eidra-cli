@@ -24,7 +24,9 @@ RUN apt-get update \
       tree unzip \
  && ln -s /usr/bin/fdfind /usr/local/bin/fd \
  && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir uv ruff ty
+# Pinned, so that an image built later checks code the same way; raise them together, on purpose.
+ARG UV_VERSION=0.13.5 RUFF_VERSION=0.17.2 TY_VERSION=0.0.92
+RUN pip install --no-cache-dir "uv==$UV_VERSION" "ruff==$RUFF_VERSION" "ty==$TY_VERSION"
 COPY --from=build /usr/local/bin/eidra /usr/local/bin/eidra
 RUN mkdir -m 1777 /home/eidra
 ENV HOME=/home/eidra

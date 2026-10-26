@@ -470,15 +470,22 @@ Reference: codex-rs `tui`.
 - **Build:** the `Dockerfile` builds a static musl binary on `rust:1.99.1-alpine`.
   `docker build --target export --output dist .` writes it to `dist/`. For development,
   `scripts/cargo` runs cargo in the same image, so the host needs only Docker.
-- **Runtime image (M7):**
-  - Debian slim plus bash, git, ripgrep, fd, jq, curl, poppler-utils, uv, ruff, ty and tini, with
-    the binary copied in.
-  - A non-root user matching the host UID and GID; `--init`.
-  - `--network host`, because the ufw rule admits only the LAN to port 8000. Or a vacuum (below).
-  - Volumes for the workspace, `~/.local/share/eidra` and the uv cache.
-  - `RADIANCE_API_KEY` passed at run time only.
-  - `--detach-keys` changed so Ctrl-P reaches the TUI.
-- **Host wrapper:** a script runs the container in the current directory.
+- **Runtime image (M7, done 2026-10-27):** the `Dockerfile`'s last stage.
+  - Python 3.13 on Debian slim, with bash, git, ripgrep, fd, jq, curl, poppler-utils and tini, uv,
+    ruff and ty at pinned versions (build arguments, raised together on purpose), and the binary.
+  - It runs as the host's user (`--user` with the host's UID and GID), so the agent's files are
+    the user's; HOME is a directory anyone can write to. tini is PID 1, so signals reach eidra and
+    orphaned processes are reaped.
+  - `--network host`, because radiance listens on the host's localhost and the ufw rule admits
+    only the LAN to port 8000. Or a vacuum (below).
+  - `RADIANCE_API_KEY` is passed at run time only, never stored in the image.
+- **Host wrapper:** `scripts/eidra-docker` runs the image in the current directory, mounted at the
+  same path so that paths read the same inside and out: the TUI with no arguments, or any eidra
+  command. It mounts `~/.local/share/eidra` (sessions and checkpoints), the uv cache,
+  `~/.gitconfig` read-only, `/etc/localtime`, and `$EIDRA_PROFILE` if set, and passes `TERM` and
+  `COLORTERM`. Docker's detach keys become ctrl+^ ctrl+q: its default, ctrl+p ctrl+q, holds back
+  every ctrl+p, which the TUI uses for the history. `scripts/tui/offline.py --docker eidra` runs
+  the TUI's scenarios in the image through the wrapper; all eleven pass.
 - **Vacuum:** the agent gets no network at all except the model. Its container runs with
   `--network none`, and eidra reaches the model through a Unix socket mounted into it
   (`EIDRA_MODEL_SOCKET`, or `--model-socket`). Outside the container, `eidra relay` forwards that
@@ -596,7 +603,7 @@ Reference: codex-rs `tui`.
 | M4 | inline TUI | it's usable day to day |
 | M5 | uv, ty, ruff, post-edit diagnostics | the agent hears of the problems its edits introduce (done, §9) |
 | M6 | images, PDFs, nested AGENTS.md, compaction, checkpoints | the agent reads images and PDFs, a long session goes on past its context, and a turn can be undone (done, §8, §10, §11, §14) |
-| M7 | runtime image and wrapper | |
+| M7 | runtime image and wrapper | the TUI and `exec` run in the image on any project, as the user (done, §13) |
 
 Evals come first so that every later change, subagents included, is measured. Subagents share
 radiance's four slots and its cache, so whether they pay off here is something to measure, not
