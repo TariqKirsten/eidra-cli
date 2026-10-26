@@ -478,8 +478,10 @@ screen with a small terminal emulator:
   message, a background task worked on during the chat, attachments, PDF pages, `/undo` and
   `/diff`, `--continue`, `!` commands and `@` mentions, and SIGTERM. About 25 s, no GPU; run it
   after any change to the TUI. `--docker IMAGE` runs the same in the image (§13).
-- `scripts/tui/smoke.py` does the same against radiance, in about 30 s of GPU. It refuses to run
-  unless qwen-assistant is already loaded, since asking for it would unload whatever else is.
+- `scripts/tui/smoke.py` does much the same against radiance, and checks that the model hears a
+  `!` command and an `@` file, and that `--continue` goes on with the conversation: about 25 s of
+  GPU (21 s on 2026-10-27). It refuses to run unless qwen-assistant is already loaded, since
+  asking for it would unload whatever else is.
 
 
 Reference: codex-rs `tui`.

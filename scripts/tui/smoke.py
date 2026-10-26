@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Tries eidra's TUI against the real model: Qwen3.8 on radiance, through llama-swap. eidra runs in
 a pseudo-terminal, gets a trivial reply, runs a tool with a message queued behind it, is
-interrupted mid-reply, asks to run a command on its confirm list, shows reasoning in full, and
-quits. About 30 s of GPU.
+interrupted mid-reply, asks to run a command on its confirm list, shows reasoning in full, hears of
+a `!` command and an `@` file, quits, and goes on with --continue. About 40 s of GPU.
 
     export RADIANCE_API_KEY=...       # as for any eidra run
     scripts/tui/smoke.py              # with target/debug/eidra
@@ -73,7 +73,8 @@ def main():
     (workspace / "scratch.txt").write_text("delete me\n")
     argv = [str(args.binary.resolve()), "-C", str(workspace), "--confirm", "rm"]
     argv += ["--session-dir", str(work / "sessions")]
-    s = Session(argv, cols=100, rows=32, env=dict(os.environ, TERM="xterm-256color"))
+    env = dict(os.environ, TERM="xterm-256color", XDG_DATA_HOME=str(work / "data"))
+    s = Session(argv, cols=100, rows=32, env=env)
     started = time.time()
 
     def busy(s):
@@ -81,6 +82,11 @@ def main():
 
     def idle(s):
         return s.on_screen("› Message eidra") and not busy(s)
+
+    def after(s, mark, *words):
+        """Whether everything shown after the last `mark` has all of `words`."""
+        tail = s.dump().split(mark)[-1]
+        return mark in s.dump() and all(word in tail for word in words)
 
     def step(what):
         print(f"{time.time() - started:5.1f} s  {what}", flush=True)
@@ -136,6 +142,15 @@ def main():
         s.wait_for(lambda s: s.contains("51") and idle(s), 120, "the reply")
         step("reasoning shown in full")
 
+        s.send("\x14")  # ctrl+t, back to one line
+        s.type("!echo the code word is $((6 * 7))-kestrel\r")
+        s.wait_for(lambda s: s.contains("⎿ succeeded") and idle(s), 20, "the command")
+        s.type("What code word did my command print, and what is the last line of @notes.txt? "
+               "Reply with just the two, separated by a space.\r")
+        s.wait_for(lambda s: after(s, "separated by a space.", "42-kestrel", "gamma") and idle(s),
+                   180, "the reply")
+        step("a ! command and an @ file, heard by the model")
+
         s.send("\x04")
         code = s.wait_exit(15)
         assert code == 0, f"exit code {code}"
@@ -143,6 +158,16 @@ def main():
             assert mode in s.term.modes, f"{mode} was not restored"
         assert not s.term.wraps, f"the terminal wrapped rows itself: {s.term.wraps}"
         step("quit")
+
+        s = Session(argv + ["--continue"], cols=100, rows=32, env=env)
+        s.wait_for(idle, 15, "the session to resume")
+        assert s.contains("resumed: the conversation goes on from here"), "no resumed conversation"
+        s.type("What was the code word my command printed? Reply with just it.\r")
+        s.wait_for(lambda s: after(s, "Reply with just it.", "42-kestrel") and idle(s), 180,
+                   "the reply")
+        step("--continue: the conversation goes on")
+        s.send("\x04")
+        assert s.wait_exit(15) == 0
         print(f"ok: the smoke test passed in {time.time() - started:.0f} s")
     except AssertionError as e:
         print(f"FAIL: {e}\n{s.dump()}")
