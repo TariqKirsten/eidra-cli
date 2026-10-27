@@ -6,8 +6,11 @@ so other servers work too, but its defaults, prompts and tools are chosen and me
 radiance.
 
 It has:
-- `eidra`: an interactive session in the terminal, drawn inline like Claude Code's
+- `eidra`: an interactive session in the terminal, drawn inline like Claude Code's, with every turn
+  checkpointed for `/undo`, sessions you can `--continue`, `@file` attachments and `!` commands
 - `eidra exec`: one task, unattended, for scripts and evals
+- after each edit of a Python file, the problems it introduced (ruff, ty), and images and PDFs
+  the model can see
 - subagents, which the model can start with the `task` tool; in an interactive session they can
   work in the background while you keep talking to the agent
 - `eidra eval`: task suites run in containers, including Harbor-format tasks (SWE-rebench,
