@@ -187,7 +187,7 @@ Initial set (M1):
 |---|---|---|
 | `bash` | `command`, `timeout_s?`, `background?` | §6 |
 | `bash_output`, `bash_kill` | `id`, `wait_s?` | background jobs; `wait_s` waits for new output or the end |
-| `read` | `path`, `offset?`, `limit?` | text with line numbers; images as image parts; PDFs as text, with page images on request; `.ipynb` as cells |
+| `read` | `path`, `offset?`, `limit?` | text with line numbers; images as image parts; PDFs page by page, each as its text layer and its image (§10); `.ipynb` as cells |
 | `edit` | `path`, `old`, `new`, `replace_all?` | exact match, which must be unique unless `replace_all`; tolerates a differing leading or trailing newline and CRLF endings; needs no read first |
 | `write` | `path`, `content` | an existing file not read this session, or changed since, is shown instead of replaced, and the same call then goes through |
 | `glob` | `pattern`, `path?` | gitignore-aware, in-process (`ignore`) |
@@ -195,7 +195,7 @@ Initial set (M1):
 | `todo` | `list` | a markdown checklist as one string, which keeps the schema flat |
 | `finish` | `summary` | headless runs |
 
-Later: LSP navigation (definition, references, hover), PDF page images and web fetch.
+Later: LSP navigation (definition, references, hover) and web fetch.
 
 ### 5.1 Subagents (M3)
 
@@ -799,11 +799,11 @@ Sixteen Python tasks from SWE-rebench's July 2026 snapshot, from issues of 2026-
 2026-06-15, in Harbor's format, run in the vacuum one attempt each, two at a time, with the
 binary of e659b8a (M4: no diagnostics, compaction or the changes below).
 
-**Baseline: 8 of the first 14 passed** (the last two were still running when this was written).
-Attempts took 6 to 50 minutes and 51 to 200 requests, with 97–99% of prompt tokens from the
-cache. None of the six failures ran into a limit, and every one ended with `finish` after long,
-lint-clean testing, so the diagnostics of §9 would not have changed them. Why they failed, from
-their logs (a background agent read every session):
+**Baseline: 9 of 16 passed.** Attempts took 6 to 50 minutes and 50 to 200 requests, with 97–99%
+of prompt tokens from the cache. Rapid-MLX-426 ran out of context, before compaction existed. The
+other six failures ran into no limit, and every one ended with `finish` after long, lint-clean
+testing, so the diagnostics of §9 would not have changed them. Why they failed, from their logs
+(a background agent read every session):
 - three changed existing tests until their own design passed them, where the hidden tests keep
   the old ones: Soju06/codex-lb-744 rewrote a test file, HKUDS/nanobot-4274 changed four tests'
   setup, marimo-9754 changed a public method's return type and two tests;
@@ -821,6 +821,33 @@ changes a committed test says so (§9); `timeout` is taken for `timeout_s`, and 
 timeouts are explained (§6); `bash_output` shows the job's command and run time and can wait
 (§6); an unattended run hears once when 15% of its requests or of the time the eval gives it
 (`--time-limit`) are left; and an agent in the vacuum is told there is no network.
+
+**v2: 19 of 32 passed (59%)**, two attempts per task with the binary of a5d4a7c, which also has
+the diagnostics (§9) and compaction (§8). Counting each task by the share of its attempts that
+passed, that is 9.5 of 16 against the baseline's 9: no difference that one baseline attempt per
+task can show. Underneath:
+- **Rewritten tests, mostly gone.** codex-lb-744 and nanobot-4274 passed both attempts,
+  marimo-9754 one. The changed-tests note fired once in 32 attempts (deepagents-3866, which
+  passed), so the system prompt's line, not the note, is what changed this, if anything did. The
+  one such failure left changed a function's return type and then two existing assertions with a
+  Python script run through bash, which the note does not see; a check against the commit at
+  `finish` would.
+- **Unstated choices still fail:** agno-8148 0/2, apm-1553 0/2, livekit-5944 1/2.
+- **Compaction works:** both Rapid-MLX-426 attempts compacted once at about 200K tokens and
+  finished, where the baseline hit the context limit, but both failed 7 of the hidden tests.
+- **New losses:** notebooklm-py-826 failed both attempts the same way, taking any settled future
+  in the registry for a refresh of this cycle, where the hidden test leaves one from an earlier
+  cycle there; the baseline's attempt told them apart. nanobot-4129, marimo-9626 and
+  hermes-webui-3069 passed one attempt of two. The failing ones left the existing tests alone,
+  and hermes's ran out of requests.
+- **Cost:** 17.3 minutes and 66K generated tokens per attempt, against 15.4 and 54K. Tool errors
+  doubled to 1.0 per attempt: mostly multi-line `old` texts whose later lines did not match, in
+  long attempts on very large files (agno's module of over 5,000 lines), and six writes refused
+  because the file had changed since it was read. The budget note came in 8 attempts, 2 of which
+  passed.
+
+Next: the check at `finish`, measured against v2 itself, two attempts per task, so that a change
+is compared with the same harness.
 
 ## 17. Open questions
 
