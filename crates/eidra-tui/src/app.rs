@@ -764,17 +764,26 @@ impl<W: Write> App<W> {
         if self.quitting {
             return;
         }
-        let queued = mem::take(&mut self.queued).join("\n\n");
-        if normal {
+        if normal && self.job.is_none() {
             // What was queued, after the reports that came in meanwhile.
+            let queued = mem::take(&mut self.queued).join("\n\n");
             self.send(queued);
-        } else if !queued.is_empty() {
-            // After an interrupt or an error, what was queued goes back to the input box, to send
-            // or change. Reports wait for the next message.
-            let draft = self.editor.text().trim();
-            let text = if draft.is_empty() { queued } else { format!("{queued}\n\n{draft}") };
-            self.editor.set(text);
+        } else if !normal {
+            self.return_queued();
         }
+        // With a /diff, /undo or ! command still running, what was queued waits for it.
+    }
+
+    /// After an interrupt or an error, what was queued goes back to the input box, to send or
+    /// change. Reports wait for the next message.
+    fn return_queued(&mut self) {
+        let queued = mem::take(&mut self.queued).join("\n\n");
+        if queued.is_empty() {
+            return;
+        }
+        let draft = self.editor.text().trim();
+        let text = if draft.is_empty() { queued } else { format!("{queued}\n\n{draft}") };
+        self.editor.set(text);
     }
 
     // What the user does.
@@ -878,8 +887,14 @@ impl<W: Write> App<W> {
         // A command typed after `!` stops with its job: dropping it stops its process group.
         if let Some((command, _)) = self.command.take() {
             self.job = None;
+            self.dirty = true;
             self.notice(&format!("stopped `{}`", clip(&command, 60)));
-            self.after_job();
+            // What waited for it goes back to the input box, as after an interrupted turn: the
+            // user stopped things, so nothing starts by itself.
+            if self.turn.is_none() {
+                self.return_queued();
+            }
+            self.check_quit();
         }
         if let Some(turn) = &mut self.turn
             && !turn.interrupted
@@ -950,6 +965,9 @@ impl<W: Write> App<W> {
                 self.commit(Block::Info, lines);
             }
             "/quit" | "/exit" => self.request_quit(),
+            "/new" if self.job.is_some() => {
+                self.notice("a /diff, /undo or ! command is still running: /new once it ends");
+            }
             "/new" if self.turn.is_some() => {
                 self.after = After::NewSession;
                 self.interrupt();
@@ -1067,10 +1085,12 @@ impl<W: Write> App<W> {
         let lines = hanging(Line::styled("! ", theme::USER), command, theme::BOLD, width);
         self.commit(Block::User, lines);
         let (workspace, command) = (self.workspace.clone(), command.to_owned());
+        let secret = self.options.profile.api_key_env.clone();
         self.command = Some((command.clone(), Instant::now()));
         self.job = Some(Box::pin(async move {
             let (output, status) =
-                eidra_core::run_command(&workspace, &command, COMMAND_TIMEOUT).await;
+                eidra_core::run_command(&workspace, &command, COMMAND_TIMEOUT, secret.as_deref())
+                    .await;
             Done::Command { command, output, status }
         }));
     }
@@ -2028,6 +2048,29 @@ mod tests {
             "[The user ran this command in the workspace: `echo hi; echo oops >&2; exit 3`. It \
              failed (exit code 3), and printed:]\n\nhi\noops\n\nwhy did it fail?"
         );
+    }
+
+    #[tokio::test]
+    async fn stopping_a_command_starts_nothing_and_a_turn_waits_for_one() {
+        let mut t = Test::new();
+        t.submit("!sleep 30");
+        t.submit("then explain");
+        t.key(KeyCode::Esc);
+        // Nothing starts by itself after the user stopped things: the message goes back.
+        assert!(t.app.turn.is_none() && t.app.job.is_none());
+        assert_eq!(t.app.editor.text(), "then explain");
+        assert!(t.app.notes.is_empty());
+
+        // A turn that ends while a command runs leaves what was queued for the command's end.
+        t.app.editor.clear();
+        let agent = t.begin();
+        t.submit("!echo out");
+        t.submit("now fix it");
+        t.app.turn_ended(agent, Ok(Outcome::Replied));
+        assert_eq!(t.app.queued, ["now fix it"]);
+        finish_job(&mut t).await;
+        assert!(t.last_message().starts_with("[The user ran this command in the workspace: `echo"));
+        assert!(t.last_message().ends_with("now fix it"));
     }
 
     #[tokio::test]

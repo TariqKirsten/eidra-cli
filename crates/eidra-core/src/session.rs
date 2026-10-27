@@ -163,13 +163,14 @@ impl Session {
             .append(true)
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
-        // A line cut short by a crash is ended, so that the next record starts on a line of its own.
-        let mut last = [0u8];
-        if file.seek(SeekFrom::End(-1)).is_ok()
-            && file.read_exact(&mut last).is_ok()
-            && last != *b"\n"
-        {
-            file.write_all(b"\n")?;
+        // A line cut short by a crash goes, so that what follows starts on a line of its own and
+        // the log reads back whole.
+        let mut text = Vec::new();
+        file.read_to_end(&mut text)?;
+        if !text.is_empty() && !text.ends_with(b"\n") {
+            let end = text.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            file.set_len(end as u64)?;
+            file.seek(SeekFrom::End(0))?;
         }
         let dir = path.with_file_name(&log.header.id);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -367,6 +368,44 @@ mod tests {
         assert_eq!(log.messages.len(), 4);
         assert_eq!(log.starts, [0, 2]);
         assert_eq!((log.start_of(1), log.start_of(3)), (0, 2));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_line_cut_short_by_a_crash_goes_when_the_session_goes_on() {
+        let root = std::env::temp_dir().join(format!("eidra-crash-test-{}", std::process::id()));
+        let header = Header {
+            version: 1,
+            id: String::new(),
+            created: String::new(),
+            workspace: "/work".into(),
+            headless: false,
+            profile: "p".into(),
+            profile_hash: "h".into(),
+            base_url: "http://x/v1".into(),
+            model: "m".into(),
+            reasoning_effort: "medium".into(),
+            tools: vec![],
+            parent: None,
+            task: None,
+        };
+        let mut session = Session::create(&root, header).unwrap();
+        session.push(Message::system("s"), None).unwrap();
+        session.push(Message::user("first"), None).unwrap();
+        let path = session.path().to_path_buf();
+        drop(session);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#"{"type":"message","message":{"role":"assis"#).unwrap();
+        drop(file);
+
+        assert_eq!(Log::read(&path).unwrap().messages.len(), 2);
+        let (mut session, _) = Session::open(&path).unwrap();
+        assert_eq!(session.messages().len(), 2);
+        session.resumed("h").unwrap();
+        session.push(Message::user("again"), None).unwrap();
+        let log = Log::read(&path).unwrap();
+        assert_eq!(log.messages.len(), 3);
+        assert!(!fs::read_to_string(&path).unwrap().contains("assis"));
         fs::remove_dir_all(root).unwrap();
     }
 }

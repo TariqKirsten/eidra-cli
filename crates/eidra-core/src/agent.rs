@@ -664,6 +664,8 @@ impl Agent {
             .replace("{summary}", summary);
         self.session.compact(tokens, summary, Some(&stats), vec![system, Message::user(first)])?;
         self.used = 0;
+        // The results that carried nested AGENTS.md files are gone: they come again when needed.
+        self.tools.forget_nested();
         frontend.event(Event::Notice {
             text: format!(
                 "compacted: the conversation goes on from a summary of {} tokens",

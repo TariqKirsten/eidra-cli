@@ -98,14 +98,17 @@ impl Shell {
         for (key, value) in NON_INTERACTIVE {
             env.insert((*key).into(), (*value).into());
         }
-        Ok(Shell {
+        let mut shell = Shell {
             cwd: workspace.to_path_buf(),
             env,
             workspace: workspace.to_path_buf(),
             state: state.to_path_buf(),
             jobs: BTreeMap::new(),
             next_job: 1,
-        })
+        };
+        // A resumed session's shell is where its last command left it.
+        shell.load_state();
+        Ok(shell)
     }
 
     /// The directory the next command starts in.
@@ -385,9 +388,18 @@ async fn collect(
 /// Runs a command the user typed, `!` in the TUI, in a bash of its own in `dir`: nothing carries
 /// over to the agent's shell or to the next command. Returns its output, cleaned of terminal
 /// codes, and how it ended unless with 0. Past `timeout`, or if the future is dropped, the
-/// command and everything it started are stopped.
-pub async fn run_command(dir: &Path, command: &str, timeout: Duration) -> (String, Option<String>) {
+/// command and everything it started are stopped. `secret_env` names a variable it must not see,
+/// as the agent's commands do not: its output goes to the model.
+pub async fn run_command(
+    dir: &Path,
+    command: &str,
+    timeout: Duration,
+    secret_env: Option<&str>,
+) -> (String, Option<String>) {
     let mut cmd = std::process::Command::new("bash");
+    if let Some(name) = secret_env {
+        cmd.env_remove(name);
+    }
     cmd.arg("-c")
         .arg(format!("exec 2>&1\n{command}"))
         .current_dir(dir)
@@ -555,6 +567,10 @@ mod tests {
         assert_eq!(run(&mut shell, "echo $GREETING; echo oops >&2").await, "hi\noops");
         assert_eq!(run(&mut shell, "exit 3").await, "[exit code 3]");
         assert_eq!(run(&mut shell, "echo $PAGER $TERM").await, "cat dumb");
+        // A resumed session's shell starts where the last command left it.
+        let mut again = Shell::new(&_dir, &_dir.join(".state"), Some("HOME")).unwrap();
+        assert!(run(&mut again, "pwd").await.ends_with("/sub"));
+        assert_eq!(run(&mut again, "echo $GREETING").await, "hi");
     }
 
     #[tokio::test]

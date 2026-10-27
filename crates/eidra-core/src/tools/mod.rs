@@ -195,7 +195,8 @@ impl Toolbox {
                 let abs = resolve(&self.workspace, path);
                 let before = self.diagnostics.before(&abs).await;
                 // A test file as it was, to see which of the project's tests the change touches.
-                let tests_before = if test_changes::is_test_file(&abs) {
+                let inside = abs.strip_prefix(&self.workspace).unwrap_or(&abs);
+                let tests_before = if test_changes::is_test_file(inside) {
                     fs::read_to_string(&abs).ok()
                 } else {
                     None
@@ -245,6 +246,12 @@ impl Toolbox {
             _ => return Err(format!("{name} is not implemented")),
         };
         Ok(Reply::Text(text))
+    }
+
+    /// Forgets which nested AGENTS.md files were given, after a compaction dropped the results
+    /// that carried them.
+    pub fn forget_nested(&mut self) {
+        self.nested = agents::Nested::new(&self.workspace);
     }
 
     /// The note for a change to a test file that altered tests of the project's last commit.

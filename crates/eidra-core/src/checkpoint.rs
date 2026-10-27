@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::{Duration, SystemTime};
 
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::text::fnv1a;
@@ -89,6 +90,8 @@ pub struct Checkpoints {
     last: Option<String>,
     /// Why checkpoints stopped, once a snapshot failed.
     off: Option<String>,
+    /// The number the next turn gets: past every turn's, undone ones too.
+    next: usize,
     /// The repository has been made, if it had to be.
     ready: bool,
 }
@@ -114,6 +117,7 @@ impl Checkpoints {
             turns: Vec::new(),
             last: None,
             off: None,
+            next: 1,
             ready: false,
         })
     }
@@ -168,7 +172,7 @@ impl Checkpoints {
         let mut init = Command::new("git");
         init.args(["init", "--quiet", "--bare"]).arg(&self.git_dir);
         init.env_remove("GIT_DIR").env_remove("GIT_WORK_TREE");
-        output(&mut init, "init").await.and_then(|o| succeeded(o, "init"))?;
+        output(&mut init, "init", None).await.and_then(|o| succeeded(o, "init"))?;
         let mut exclude = EXCLUDE.to_owned();
         // eidra's own data, when the workspace holds it: its data directory, or else this root.
         let root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
@@ -214,6 +218,7 @@ impl Checkpoints {
             if let Some((number, label)) = subject.strip_prefix("before ").and_then(turn_number) {
                 let label = label.strip_prefix(": ").unwrap_or(label).to_owned();
                 let before = commit.to_owned();
+                self.next = self.next.max(number + 1);
                 self.turns.push(Turn { number, label, before, after: None });
             } else if let Some((number, _)) = subject.strip_prefix("after ").and_then(turn_number) {
                 if let Some(turn) = self.turns.last_mut().filter(|t| t.number == number) {
@@ -244,11 +249,12 @@ impl Checkpoints {
         if self.off.is_some() {
             return Ok(());
         }
-        let number = self.turns.iter().map(|t| t.number).max().unwrap_or(0) + 1;
+        let number = self.next;
         let label = label.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
         let label = crate::display::clip(label, 60);
         match self.snapshot(&format!("before {number}: {label}")).await {
             Ok(before) => {
+                self.next = number + 1;
                 self.turns.push(Turn { number, label, before, after: None });
                 Ok(())
             }
@@ -319,14 +325,20 @@ impl Checkpoints {
             let now = self.tree().await?;
             let since =
                 self.git(&["diff", "--name-only", "--no-renames", "-z", &after, &now]).await?;
-            let since: HashSet<&str> = since.split('\0').filter(|p| !p.is_empty()).collect();
+            let since: Vec<&str> = since.split('\0').filter(|p| !p.is_empty()).collect();
+            // A path changed after the turn, or with something changed at a path above or below
+            // it (a file that became a directory, or the other way), is left as it is: putting
+            // it back would clear what is in the way.
+            let touched =
+                |path: &str| since.iter().any(|s| *s == path || nested(s, path) || nested(path, s));
             let mut undone =
                 Undone { turn: turn.number, label: turn.label.clone(), ..Undone::default() };
+            let mut made = Vec::new();
             for (status, path) in changes {
-                if since.contains(path.as_str()) {
+                if touched(&path) {
                     undone.kept.push(path);
                 } else if status == 'A' {
-                    undone.removed.push(path);
+                    made.push(path);
                 } else {
                     undone.restored.push(path);
                 }
@@ -335,14 +347,64 @@ impl Checkpoints {
                 let paths: Vec<&str> = chunk.iter().map(String::as_str).collect();
                 self.git(&[&["checkout", &turn.before, "--"][..], &paths].concat()).await?;
             }
-            for path in &undone.removed {
-                self.remove(path);
+            // A file is new to the snapshots when the turn made it, but also when the turn stopped
+            // ignoring it (a .gitignore replaced, say): under the rules put back, an ignored file
+            // stays. So does one behind a symbolic link, which may lead out of the workspace.
+            let (made, behind_links): (Vec<String>, Vec<String>) =
+                made.into_iter().partition(|path| self.removable(path));
+            undone.kept.extend(behind_links);
+            let ignored = self.ignored(&made).await;
+            for path in made {
+                if ignored.contains(&path) {
+                    undone.kept.push(path);
+                } else {
+                    self.remove(&path);
+                    undone.removed.push(path);
+                }
             }
+            undone.kept.sort();
             self.snapshot(&format!("undid {}", turn.number)).await?;
             self.turns.pop();
             return Ok(Some(undone));
         }
         Ok(None)
+    }
+
+    /// Which of `paths` the ignore files on disk ignore now. When git cannot say, all of them:
+    /// a file kept by mistake costs less than one removed.
+    async fn ignored(&self, paths: &[String]) -> HashSet<String> {
+        let mut ignored = HashSet::new();
+        for chunk in paths.chunks(100) {
+            let args = ["check-ignore", "--no-index", "-z", "--stdin"];
+            // check-ignore takes paths, not pathspecs, and refuses the literal setting.
+            let mut command = self.command(&args);
+            command.env_remove("GIT_LITERAL_PATHSPECS");
+            let input: Vec<u8> =
+                chunk.iter().flat_map(|p| [p.as_bytes(), b"\0"]).flatten().copied().collect();
+            match output(&mut command, "check-ignore", Some(&input)).await {
+                // 1 is none of them ignored.
+                Ok(output) if matches!(output.status.code(), Some(0 | 1)) => {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    ignored.extend(text.split('\0').filter(|p| !p.is_empty()).map(str::to_owned));
+                }
+                _ => ignored.extend(chunk.iter().cloned()),
+            }
+        }
+        ignored
+    }
+
+    /// Whether `path` can be removed without following a symbolic link: no directory between the
+    /// workspace and it may be one.
+    fn removable(&self, path: &str) -> bool {
+        let mut dir = self.workspace.clone();
+        let parts: Vec<&str> = path.split('/').collect();
+        for part in &parts[..parts.len().saturating_sub(1)] {
+            dir.push(part);
+            if fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Removes a file the turn made, and the directories it made for it once they are empty.
@@ -425,6 +487,12 @@ impl Checkpoints {
 
     /// Runs git on the workspace, with this repository and the session's index.
     async fn output(&self, args: &[&str]) -> Result<Output, String> {
+        output(&mut self.command(args), args[0], None).await
+    }
+
+    /// git on the workspace, with this repository, the session's index, and the settings eidra's
+    /// snapshots need.
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new("git");
         command.arg("--git-dir").arg(&self.git_dir).arg("--work-tree").arg(&self.workspace);
         // The user's settings apply, except those that would change what is recorded or run
@@ -448,16 +516,22 @@ impl Checkpoints {
             .env_remove("GIT_OBJECT_DIRECTORY")
             .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .env_remove("GIT_NAMESPACE");
-        output(&mut command, args[0]).await
+        command
     }
 }
 
-async fn output(command: &mut Command, what: &str) -> Result<Output, String> {
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    let child = command.spawn().map_err(|e| match e.kind() {
+/// Runs git, with `input` on its stdin, and returns what it wrote.
+async fn output(command: &mut Command, what: &str, input: Option<&[u8]>) -> Result<Output, String> {
+    let stdin = if input.is_some() { Stdio::piped() } else { Stdio::null() };
+    command.stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let mut child = command.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => "git is not installed".to_owned(),
         _ => format!("running git: {e}"),
     })?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        // Short lists of paths, which fit in the pipe while git waits to read them.
+        let _ = stdin.write_all(input).await;
+    }
     tokio::time::timeout(TIMEOUT, child.wait_with_output())
         .await
         .map_err(|_| format!("git {what} took over {} s", TIMEOUT.as_secs()))?
@@ -472,6 +546,11 @@ fn failure(what: &str, output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let why = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("it failed");
     format!("git {what}: {}", why.trim())
+}
+
+/// Whether `inner` is below the directory `outer`.
+fn nested(inner: &str, outer: &str) -> bool {
+    inner.len() > outer.len() && inner.starts_with(outer) && inner.as_bytes()[outer.len()] == b'/'
 }
 
 /// `3: label` or `3` as the turn's number and the rest.
@@ -652,6 +731,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn undo_never_deletes_through_a_link_nor_what_the_turn_did_not_make() {
+        if !has_git() {
+            return eprintln!("no git: skipped");
+        }
+        let s = Scratch::new("safe");
+        // Outside the workspace, reached through a link in it.
+        let outside = s.0.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("notes.md"), "keep me\n").unwrap();
+        std::os::unix::fs::symlink(&outside, s.work().join("docs")).unwrap();
+        // Ignored before the turn: the turn's new .gitignore stops ignoring it.
+        s.write(".gitignore", "*.local\n");
+        s.write("db.local", "secret\n");
+        // A file the turn deletes, where the user then makes a directory.
+        s.write("build", "old\n");
+        let mut checkpoints = s.open("s1").await;
+
+        checkpoints.begin("tidy up").await.unwrap();
+        fs::remove_file(s.work().join("docs")).unwrap();
+        s.write("docs/notes.md", "keep me\n");
+        s.write(".gitignore", "__pycache__/\n");
+        fs::remove_file(s.work().join("build")).unwrap();
+        checkpoints.end().await.unwrap();
+        s.write("build/mine.txt", "the user's\n");
+
+        let undone = checkpoints.undo().await.unwrap().unwrap();
+        assert_eq!(undone.restored, [".gitignore", "docs"]);
+        assert_eq!(undone.kept, ["build", "db.local", "docs/notes.md"]);
+        assert!(undone.removed.is_empty());
+        assert_eq!(fs::read_to_string(outside.join("notes.md")).unwrap(), "keep me\n");
+        assert_eq!(s.read("db.local").as_deref(), Some("secret\n"));
+        assert_eq!(s.read("build/mine.txt").as_deref(), Some("the user's\n"));
+        assert!(fs::symlink_metadata(s.work().join("docs")).unwrap().file_type().is_symlink());
+    }
+
+    #[tokio::test]
+    async fn turn_numbers_are_never_used_twice() {
+        if !has_git() {
+            return eprintln!("no git: skipped");
+        }
+        let s = Scratch::new("numbers");
+        s.write("a.txt", "1\n");
+        let mut checkpoints = s.open("s1").await;
+        for (label, text) in [("one", "2\n"), ("two", "3\n")] {
+            checkpoints.begin(label).await.unwrap();
+            s.write("a.txt", text);
+            checkpoints.end().await.unwrap();
+        }
+        assert_eq!(checkpoints.undo().await.unwrap().unwrap().turn, 2);
+        checkpoints.begin("three").await.unwrap();
+        checkpoints.end().await.unwrap();
+        let numbers: Vec<usize> = checkpoints.turns().iter().map(|t| t.number).collect();
+        assert_eq!(numbers, [1, 3]);
+        let resumed = s.open("s1").await;
+        let numbers: Vec<usize> = resumed.turns().iter().map(|t| t.number).collect();
+        assert_eq!(numbers, [1, 3]);
+    }
+
+    #[tokio::test]
     async fn old_sessions_are_let_go() {
         if !has_git() {
             return eprintln!("no git: skipped");
@@ -670,7 +808,7 @@ mod tests {
             .args(["commit-tree", tree.trim(), "-m", "after 1"])
             .env("GIT_COMMITTER_DATE", "@1000000000 +0000")
             .envs(IDENTITY);
-        let backdated = output(&mut command, "commit-tree").await.unwrap();
+        let backdated = output(&mut command, "commit-tree", None).await.unwrap();
         let backdated = String::from_utf8_lossy(&backdated.stdout).trim().to_owned();
         old.git(&["update-ref", "refs/eidra/old", &backdated]).await.unwrap();
 

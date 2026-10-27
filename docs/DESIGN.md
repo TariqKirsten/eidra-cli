@@ -465,7 +465,8 @@ A step's reasoning, calls and results stay together; a blank line separates ever
   AGENTS.md comes with it the first time.
 - **`!command`** runs a command in the workspace, in a bash of its own (its `cd` and exports do
   not carry over, to the agent's shell or the next `!`), for up to ten minutes; Esc or Ctrl+C
-  stops it and everything it started. The scrollback shows its first 10 and last 30 lines and how
+  stops it and everything it started, and messages queued behind it go back to the input box.
+  The scrollback shows its first 10 and last 30 lines and how
   it ended. The agent hears of it with the next message, which starts with the command, how it
   ended and its output, cut to `[tools] output_limit` (`[prompts] user_command`). It does not
   start a turn: it is context for the next message. It can run while the agent works; messages
@@ -554,7 +555,8 @@ Reference: codex-rs `tui`.
   - The conversation goes on from its last compaction. Calls left without results, by a crash or
     a kill, get results that say eidra stopped before them, and if the last turn did not end, the
     next message starts with the `interrupted` note. Request numbers, and so seeds, go on from
-    where they were.
+    where they were, and the shell starts in the directory, with the exports, its last command
+    left. A log line cut short by a crash is cut off.
   - The TUI shows the conversation again, its last 80 messages, as they were shown at the time,
     and finds the session's checkpoints, so `/undo` still works.
   - A subagent's session cannot be resumed, nor an unattended one in the TUI or the other way
@@ -576,7 +578,11 @@ Reference: codex-rs `tui`.
   - **`/undo`** puts back what the latest turn that changed files changed: files it modified or
     deleted come back as they were before it, and files it made are removed, with any directories
     it made for them. A file changed again after the turn, by the user or anything else, is left
-    as it is and listed. Undo again for the turn before. The agent's next message starts with a
+    as it is and listed, and so is one with something changed above or below it (a file that
+    became a directory, or the other way), which putting it back would clear. A file new to the
+    snapshots is removed only if the ignore rules put back do not ignore it (a turn that replaced
+    a `.gitignore` makes old ignored files look new), and never through a symbolic link, which
+    could lead out of the workspace. Undo again for the turn before. The agent's next message starts with a
     note of what was undone (`[prompts] undone`); without it the model believes its changes are
     still there. The conversation itself stays as it was: the model keeps what it tried, and the
     prompt stays append-only.
