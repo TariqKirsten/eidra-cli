@@ -38,8 +38,14 @@ impl<W: Write> Screen<W> {
     }
 
     pub fn resize(&mut self, width: u16, height: u16) {
-        self.width = usize::from(width.max(2));
-        self.height = usize::from(height.max(2));
+        let size = (usize::from(width.max(2)), usize::from(height.max(2)));
+        // Docker forwards SIGWINCH to the container as well as resizing its terminal, and the
+        // forwarded one can come first, with the old size: drawn again at it, rows as wide as
+        // before would wrap in a terminal already narrower, and the region would be lost track of.
+        if size == (self.width, self.height) {
+            return;
+        }
+        (self.width, self.height) = size;
         self.stale = true;
     }
 
@@ -333,6 +339,11 @@ mod tests {
         assert!(screen.out.is_empty());
         screen.draw(&lines(&["new"]), &lines(&["same"])).unwrap();
         assert!(!screen.out.is_empty());
+        // A resize to the size it already has, as docker's forwarded SIGWINCH can report.
+        screen.out.clear();
+        screen.resize(20, 6);
+        screen.draw(&[], &lines(&["same"])).unwrap();
+        assert!(screen.out.is_empty());
     }
 
     #[test]
