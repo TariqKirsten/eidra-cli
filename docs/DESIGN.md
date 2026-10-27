@@ -143,7 +143,7 @@ started and finished, approval requests and per-turn stats.
 
 ### 4.2 Session log
 
-Each session is an append-only JSONL file at `~/.local/share/eidra/sessions/<id>.jsonl`.
+Each session is an append-only JSONL file at `~/.eidra/sessions/<id>.jsonl` (§14).
 
 - It starts with the frozen session header: profile hash, system prompt, tools and effort.
 - Every message follows exactly as it was sent or received, with per-turn stats and the seed the
@@ -391,8 +391,7 @@ pixels.
 
 ## 11. AGENTS.md
 
-- The root `AGENTS.md` and `~/.config/eidra/AGENTS.md` go into the system prompt at session
-  start.
+- The root `AGENTS.md` and `~/.eidra/AGENTS.md` go into the system prompt at session start.
 - A nested `AGENTS.md` (M6, 2026-10-27) is appended to the first tool result that touches its
   directory or one below it, headed with where it came from, and never again in that session
   (R5). `read`, `edit`, `write`, `glob` and `grep` touch the directory of the path they name;
@@ -514,7 +513,7 @@ Reference: codex-rs `tui`.
   - `RADIANCE_API_KEY` is passed at run time only, never stored in the image.
 - **Host wrapper:** `scripts/eidra-docker` runs the image in the current directory, mounted at the
   same path so that paths read the same inside and out: the TUI with no arguments, or any eidra
-  command. It mounts `~/.local/share/eidra` (sessions and checkpoints), the uv cache,
+  command. It mounts `~/.eidra` (the user's AGENTS.md, sessions and checkpoints), the uv cache,
   `~/.gitconfig` read-only, `/etc/localtime`, and `$EIDRA_PROFILE` if set, and passes `TERM` and
   `COLORTERM`. Docker's detach keys become ctrl+^ ctrl+q: its default, ctrl+p ctrl+q, holds back
   every ctrl+p, which the TUI uses for the history. `scripts/tui/offline.py --docker eidra` runs
@@ -543,6 +542,10 @@ Reference: codex-rs `tui`.
 
 ## 14. Sessions, checkpoints, observability
 
+- **eidra's own directory** (2026-10-27) is `~/.eidra`, or `$EIDRA_HOME`, and `.eidra` in the
+  workspace for a user without a home. It holds the user's `AGENTS.md` (§11), `sessions/` and
+  `checkpoints/`: one directory rather than the XDG split of `~/.config` and `~/.local/share`, so
+  that a container keeps all of it with one mount or one volume (the user's choice).
 - **Sessions** (M8, 2026-10-27): `eidra --continue` (`-c`) goes on with this directory's latest
   interactive session, `eidra --resume ID` (`-r`) with any session by its id or the start of it,
   and `eidra exec` takes both for unattended sessions; `eidra sessions` lists this directory's
@@ -565,7 +568,7 @@ Reference: codex-rs `tui`.
   - Not done: fork (a new session from a point in an old one).
 - **Checkpoints** (M6, 2026-10-27): in an interactive session, a git repository of eidra's own
   records the workspace before and after each turn. It is bare, one per workspace, under
-  `~/.local/share/eidra/checkpoints`, and runs with the workspace as its work tree and an index
+  `~/.eidra/checkpoints`, and runs with the workspace as its work tree and an index
   per session, so it never touches the project's repository, index or branches, and sees what
   commands changed as well as what the file tools did. Each snapshot is a commit on
   `refs/eidra/<session>` whose subject names its turn (`before 3: <message>`, `after 3`,

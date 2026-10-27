@@ -3,22 +3,22 @@
 # or any eidra command (scripts/eidra-docker exec "make the tests pass"). Build the image first:
 # docker build -t eidra .
 #
-# The directory is mounted at the same path, so paths read the same inside and out. Session logs
-# and checkpoints go to the host's ~/.local/share/eidra and uv's cache to ~/.cache/uv. Commands run
-# as you, so files the agent writes are yours. The host's network is shared, since radiance
-# listens on the host's localhost.
+# The directory is mounted at the same path, so paths read the same inside and out, and so is
+# eidra's own directory, ~/.eidra: your AGENTS.md, session logs and checkpoints. uv's cache is the
+# host's ~/.cache/uv. Commands run as you, so files the agent writes are yours. The host's network
+# is shared, since radiance listens on the host's localhost.
 set -euo pipefail
 
 image=${EIDRA_IMAGE:-eidra}
-data=${XDG_DATA_HOME:-$HOME/.local/share}
+eidra_home=${EIDRA_HOME:-$HOME/.eidra}
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/uv
-mkdir -p "$data/eidra" "$cache"
+mkdir -p "$eidra_home" "$cache"
 
 args=(
   --rm -i --network host
   --user "$(id -u):$(id -g)"
   -v "$PWD:$PWD" -w "$PWD"
-  -v "$data/eidra:$data/eidra" -e "XDG_DATA_HOME=$data"
+  -v "$eidra_home:$eidra_home" -e "EIDRA_HOME=$eidra_home"
   -v "$cache:$cache" -e "UV_CACHE_DIR=$cache"
   -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e EIDRA_MODEL
   # The terminal as the host has it, for colours and keys.

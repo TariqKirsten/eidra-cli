@@ -73,7 +73,7 @@ def main():
     (workspace / "scratch.txt").write_text("delete me\n")
     argv = [str(args.binary.resolve()), "-C", str(workspace), "--confirm", "rm"]
     argv += ["--session-dir", str(work / "sessions")]
-    env = dict(os.environ, TERM="xterm-256color", XDG_DATA_HOME=str(work / "data"))
+    env = dict(os.environ, TERM="xterm-256color", EIDRA_HOME=str(work / "eidra"))
     s = Session(argv, cols=100, rows=32, env=env)
     started = time.time()
 

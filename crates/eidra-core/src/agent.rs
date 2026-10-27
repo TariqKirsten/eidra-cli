@@ -22,6 +22,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use crate::confirm::ConfirmPolicy;
 use crate::display::thousands;
 use crate::event::{Approval, Decision, Event, Frontend, RequestStats};
+use crate::home::eidra_home;
 use crate::media;
 use crate::profile::Profile;
 use crate::session::{Header, Session};
@@ -968,17 +969,10 @@ fn tool_message(id: &str, text: String, images: Vec<(media::Image, String)>) -> 
     Message::Tool { tool_call_id: id.to_owned(), content: Content::Parts(parts) }
 }
 
-/// AGENTS.md from the user's config directory and from the workspace, for the system prompt.
+/// AGENTS.md from eidra's own directory and from the workspace, for the system prompt.
 fn agents_md(workspace: &Path) -> String {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
     let mut out = String::new();
-    for path in config
-        .map(|dir| dir.join("eidra/AGENTS.md"))
-        .into_iter()
-        .chain([workspace.join("AGENTS.md")])
-    {
+    for path in [eidra_home(workspace).join("AGENTS.md"), workspace.join("AGENTS.md")] {
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };

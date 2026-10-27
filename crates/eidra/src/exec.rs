@@ -8,7 +8,8 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use eidra_core::display::{describe_call, describe_stats, summarise};
 use eidra_core::{
-    Agent, AgentOptions, Approval, Decision, Event, Frontend, Outcome, Profile, list_sessions,
+    Agent, AgentOptions, Approval, Decision, Event, Frontend, Outcome, Profile, eidra_home,
+    list_sessions,
 };
 use serde_json::{Value, json};
 
@@ -67,7 +68,7 @@ pub struct AgentArgs {
     #[arg(long = "confirm", value_name = "PATTERN")]
     pub confirm: Vec<String>,
 
-    /// Where session logs go [default: $XDG_DATA_HOME/eidra/sessions]
+    /// Where session logs go [default: ~/.eidra/sessions]
     #[arg(long, env = "EIDRA_SESSION_DIR", value_name = "DIR")]
     session_dir: Option<PathBuf>,
 
@@ -202,23 +203,9 @@ fn read_task(args: &ExecArgs) -> Result<String> {
     Ok(task.trim().to_owned())
 }
 
-/// $XDG_DATA_HOME/eidra/sessions, else ~/.local/share/eidra/sessions, else .eidra/sessions in the
-/// workspace (a container user without a home).
+/// `sessions` in eidra's own directory: ~/.eidra/sessions, unless $EIDRA_HOME moves it.
 pub fn default_session_dir(workspace: &Path) -> PathBuf {
-    data_dir(workspace).join("sessions")
-}
-
-/// eidra's data: $XDG_DATA_HOME/eidra, else ~/.local/share/eidra, else .eidra in the workspace.
-pub fn data_dir(workspace: &Path) -> PathBuf {
-    if let Some(data) = std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
-        return PathBuf::from(data).join("eidra");
-    }
-    match std::env::var_os("HOME") {
-        Some(home) if !home.is_empty() && home != "/" => {
-            PathBuf::from(home).join(".local/share/eidra")
-        }
-        _ => workspace.join(".eidra"),
-    }
+    eidra_home(workspace).join("sessions")
 }
 
 /// Headless output. Nobody can approve a command, so those are declined.

@@ -61,7 +61,7 @@ What it mounts and passes in:
 | on the host | in the container | why |
 |---|---|---|
 | the current directory | the same path, as the working directory | the agent's workspace; paths read the same inside and out |
-| `~/.local/share/eidra` | the same path, with `XDG_DATA_HOME` | session logs and checkpoints, kept after the container is gone |
+| `~/.eidra` | the same path, with `EIDRA_HOME` | your `AGENTS.md`, session logs and checkpoints, kept after the container is gone |
 | `~/.cache/uv` | the same path, with `UV_CACHE_DIR` | Python packages are downloaded once |
 | `~/.gitconfig`, if there is one | `/home/eidra/.gitconfig`, read-only | your name and email on the agent's commits |
 | `/etc/localtime` | the same path, read-only | your time zone |
@@ -72,6 +72,7 @@ What it mounts and passes in:
 | `RADIANCE_API_KEY` | the server's API key (the profile names the variable) |
 | `EIDRA_BASE_URL`, `EIDRA_MODEL` | another server or model than the profile's |
 | `EIDRA_PROFILE` | a profile directory instead of the built-in one |
+| `EIDRA_HOME` | eidra's own directory instead of `~/.eidra` |
 | `EIDRA_IMAGE` | the image `scripts/eidra-docker` runs (default `eidra`) |
 | `TERM`, `COLORTERM` | your terminal's, for colours and keys |
 
@@ -88,7 +89,7 @@ The same thing without the script:
 
     docker run --rm -it --network host --user "$(id -u):$(id -g)" \
       -v "$PWD:$PWD" -w "$PWD" \
-      -v "$HOME/.local/share/eidra:$HOME/.local/share/eidra" -e "XDG_DATA_HOME=$HOME/.local/share" \
+      -v "$HOME/.eidra:$HOME/.eidra" -e "EIDRA_HOME=$HOME/.eidra" \
       -v "$HOME/.cache/uv:$HOME/.cache/uv" -e "UV_CACHE_DIR=$HOME/.cache/uv" \
       -e RADIANCE_API_KEY \
       eidra
@@ -137,8 +138,10 @@ Past 200K tokens the conversation is summarised and goes on from the summary, so
 stop at the context window. If no summary can be made, it stops at the profile's limit (256K
 tokens of the server's 262,144), and `/new` starts another.
 
-Each session is logged as JSON lines under `~/.local/share/eidra/sessions`, or wherever
-`--session-dir` says, and the path is printed when you quit.
+eidra keeps what is its own in `~/.eidra`, or wherever `$EIDRA_HOME` says: an `AGENTS.md` of
+yours, whose instructions go into every session, the session logs and the checkpoints. Each
+session is logged as JSON lines under `~/.eidra/sessions`, or wherever `--session-dir` says, and
+the path is printed when you quit.
 
 ## Unattended runs
 

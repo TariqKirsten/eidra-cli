@@ -15,7 +15,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         profile: args.profile()?,
         session_root: args.session_root(&workspace),
         resume: args.session_to_resume(&workspace, false)?,
-        checkpoints: Some(crate::exec::data_dir(&workspace).join("checkpoints")),
+        checkpoints: Some(eidra_core::eidra_home(&workspace).join("checkpoints")),
         workspace,
         confirm: args.confirm.clone(),
     })

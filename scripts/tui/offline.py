@@ -57,11 +57,11 @@ class Case:
 
     def start(self, *args, server=None, cols=90, rows=24):
         url = server.url if server else f"http://127.0.0.1:{free_port()}/v1"
-        # Sessions and checkpoints go under the data directory: the scenario's own, not the user's.
-        env = dict(os.environ, TERM="xterm-256color", XDG_DATA_HOME=str(self.dir / "data"))
+        # Sessions and checkpoints go to an eidra directory of the scenario's own, not the user's.
+        env = dict(os.environ, TERM="xterm-256color", EIDRA_HOME=str(self.dir / "eidra"))
         env.pop("RADIANCE_API_KEY", None)
         if self.image:
-            # The wrapper works in the current directory and keeps sessions in the data directory.
+            # The wrapper works in the current directory and keeps sessions in EIDRA_HOME.
             argv = [str(ROOT / "scripts/eidra-docker"), "--base-url", url, *args]
             env["EIDRA_IMAGE"] = self.image
         else:

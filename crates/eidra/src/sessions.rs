@@ -25,7 +25,7 @@ pub struct SessionsArgs {
     #[arg(short = 'n', long, default_value_t = 20)]
     limit: usize,
 
-    /// Where session logs are [default: $XDG_DATA_HOME/eidra/sessions]
+    /// Where session logs are [default: ~/.eidra/sessions]
     #[arg(long, env = "EIDRA_SESSION_DIR", value_name = "DIR")]
     session_dir: Option<PathBuf>,
 }
