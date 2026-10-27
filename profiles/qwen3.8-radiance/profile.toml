@@ -126,14 +126,24 @@ user_command = "[The user ran this command in the workspace: `{command}`. It {st
 # {content} the file as read shows it, numbered lines and all, so that it needs no read of its own.
 attached_file = "[The user attached {path}, shown as read shows it:]\n{content}"
 # Added to the result of an edit or write that altered tests of the project's last commit; {tests}
-# names them. In the July SWE-rebench baseline, three of six failures were the agent changing the
+# names them, each once a session. It asks why they changed, as finish_changed_tests does: told
+# that tests "say what the code must go on doing", on every edit, the model put back a test the
+# task had asked it to rename. In the July SWE-rebench baseline, three of six failures were the agent changing the
 # project's tests until its change passed them (DESIGN.md §16.5).
-changed_tests = "\n\n[This changed tests the project already had: {tests}. They say what the code must go on doing. Unless the task asks for the behaviour they check to change, put them back as they were and change the code instead.]"
+changed_tests = "\n\n[This changed tests the project already had: {tests}. If the task asks for that, go on. If instead you changed them because your code failed them, they are probably right and the code wrong: put them back as they were and fix the code.]"
 # The result of an unattended run's first finish, which then does not end the run, when tests of
 # the commit the run began at are altered or removed, however that was done; {tests} names them,
 # by file. The next finish ends the run. In the v2 run the one rewritten-test failure left changed
 # them with a Python script run through bash, which changed_tests does not see (DESIGN.md §16.5).
-finish_changed_tests = "[Not finished yet. Your changes alter tests the project already had: {tests}. They say what the code must go on doing. Unless the task asks for the behaviour they check to change, put them back as they were (git diff shows how they changed), change the code instead, and run them again; then call finish. If the task does ask for that change, call finish again now.]"
+# It asks why they changed, and says to leave a change the task asked for: worded as changed_tests
+# is, a task that asked to rename a function in its tests too had the old test put back "to be
+# safest", twice, and failed its own checks; asked only why, still once in three.
+finish_changed_tests = "[Before you finish: your changes alter tests the project already had: {tests}. If the task asks for that, your changes are right: call finish again now, leaving them as they are. If instead you changed them because your code failed them, they are probably right and the code wrong: put them back as they were (git diff shows how they changed), fix the code, run them again, then call finish.]"
+# The result of an unattended run's first finish, which then does not end the run, when no other
+# tool has run in it yet. From its first request Qwen sometimes recalls a task it imagines it has
+# done (DESIGN.md §16.2); a live run of rename-api finished at once that way, on files that do not
+# exist.
+finish_unstarted = "[Not finished: nothing has been done in this session yet. No tool has run, so no file has been read or changed here, whatever you recall. Start the task, which is in the first message, from the beginning.]"
 # Added to the last tool result once an unattended run has 15% of its requests or time left; {left}
 # says how much. In the baseline one attempt ran into both limits still editing code.
 budget = "\n\n[Only {left} left for this task. Leave the work in a finished, tested state, and call finish before then.]"

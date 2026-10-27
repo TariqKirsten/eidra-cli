@@ -193,6 +193,9 @@ pub struct Prompts {
     /// The result of an unattended run's first `finish`, instead of finishing, when tests of the
     /// commit it began at are altered or removed; `{tests}` names them. Empty, there is no check.
     pub finish_changed_tests: String,
+    /// The result of an unattended run's first `finish`, instead of finishing, when no other tool
+    /// has run in it yet. Empty, there is no check.
+    pub finish_unstarted: String,
     /// Added to the last tool result once an unattended run has 15% of its requests or time left;
     /// `{left}` says how much.
     pub budget: String,

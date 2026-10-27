@@ -96,14 +96,21 @@ async fn git(dir: &Path, args: &[&str], timeout: Duration) -> Option<String> {
 }
 
 /// The tests of `head`, the file as committed, that a change from `before` to `after` altered or
-/// removed, by name: `test_x`, or `TestY.test_x` in a class. Tests the change added, or that were
-/// not in the commit, do not count.
+/// removed, by name: `test_x`, or `TestY.test_x` in a class. Tests the change added, that were
+/// not in the commit, or that it put back as committed, do not count.
 pub fn changed(head: &str, before: &str, after: &str) -> Vec<String> {
     let (head, after) = (tests(head), tests(after));
     tests(before)
         .into_iter()
-        .filter(|(name, _)| head.iter().any(|(n, _)| n == name))
-        .filter(|(name, text)| after.iter().find(|(n, _)| n == name).is_none_or(|(_, t)| t != text))
+        .filter(|(name, text)| {
+            let Some((_, committed)) = head.iter().find(|(n, _)| n == name) else {
+                return false;
+            };
+            match after.iter().find(|(n, _)| n == name) {
+                Some((_, now)) => now != text && now != committed,
+                None => true,
+            }
+        })
         .map(|(name, _)| name)
         .collect()
 }
@@ -200,6 +207,8 @@ class TestCache:
         );
         let removed = HEAD.replace("def test_adds():\n    assert add(1, 2) == 3\n", "");
         assert_eq!(changed(HEAD, HEAD, &removed), ["test_adds"]);
+        // Putting a test back as committed is no change to it.
+        assert!(changed(HEAD, &edited, HEAD).is_empty());
         // A test the session added and then changed is its own business.
         let added = format!("{HEAD}\ndef test_new():\n    assert True\n");
         let changed_added = added.replace("assert True", "assert False");

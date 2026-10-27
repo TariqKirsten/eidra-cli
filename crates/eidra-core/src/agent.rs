@@ -191,7 +191,9 @@ impl Agent {
         };
         let mut session = Session::create(&options.session_root, header)?;
         let mut tools = Toolbox::new(&profile, &workspace, session.dir(), definitions)?;
+        // Not for a subagent, which may answer from its task alone, to an agent that reads it.
         if options.headless && !subagent {
+            tools.check_unstarted_finish();
             tools.check_tests_at_finish();
         }
 
@@ -557,6 +559,9 @@ impl Agent {
                     end += 1;
                 }
                 let batch = &calls[next..end.max(next + 1)];
+                if batch.iter().any(|call| call.function.name != "finish") {
+                    self.tools.started();
+                }
                 for call in batch {
                     frontend.event(Event::ToolCall {
                         id: call.id.clone(),

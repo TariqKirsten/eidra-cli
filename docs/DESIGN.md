@@ -188,12 +188,12 @@ Initial set (M1):
 | `bash` | `command`, `timeout_s?`, `background?` | §6 |
 | `bash_output`, `bash_kill` | `id`, `wait_s?` | background jobs; `wait_s` waits for new output or the end |
 | `read` | `path`, `offset?`, `limit?` | text with line numbers; images as image parts; PDFs page by page, each as its text layer and its image (§10); `.ipynb` as cells |
-| `edit` | `path`, `old`, `new`, `replace_all?` | exact match, which must be unique unless `replace_all`; tolerates a differing leading or trailing newline and CRLF endings; needs no read first |
+| `edit` | `path`, `old`, `new`, `replace_all?` | exact match, which must be unique unless `replace_all`; tolerates a differing leading or trailing newline and CRLF endings; needs no read first; a miss shows where `old` stopped matching, and the file's lines there |
 | `write` | `path`, `content` | an existing file not read this session, or changed since, is shown instead of replaced, and the same call then goes through |
 | `glob` | `pattern`, `path?` | gitignore-aware, in-process (`ignore`) |
 | `grep` | `pattern`, `path?`, `glob?` | in-process (`grep-searcher`) |
 | `todo` | `list` | a markdown checklist as one string, which keeps the schema flat |
-| `finish` | `summary` | headless runs |
+| `finish` | `summary` | headless runs; the run's first `finish` is sent back once if no other tool has run yet (§16.2), or if tests of the commit the run began at are changed (§9) |
 
 Later: LSP navigation (definition, references, hover) and web fetch.
 
@@ -362,7 +362,22 @@ Built in M5 (2026-10-26):
   profile's `changed_tests` note, naming them. Tests the session added do not count, nor helpers,
   imports or blank lines. It only says so: some tasks do ask for a tested behaviour to change. In
   the July baseline three of six failures were the agent rewriting existing tests until its
-  change passed them (§16.5).
+  change passed them (§16.5). An edit that puts a test back as committed is no change to it.
+  Each test is named once a session, and the note asks why it changed rather than saying the
+  tests are right (2026-10-28): told on every edit that tests "say what the code must go on
+  doing", the model put back a test `rename-api` had asked it to rename ("the guardrail pushes
+  again").
+- **And checked at `finish`** (2026-10-28): an unattended run notes the commit the workspace is
+  at when it starts, and its first `finish` compares the tests of that commit with the work tree
+  (`git diff --name-only`, then the same comparison per test). Tests altered or removed any way
+  at all, through bash or a script too, send the `finish` back with `finish_changed_tests`,
+  which names them by file; the next `finish` ends the run. In v2 the one rewritten-test failure
+  left had changed two assertions with a Python script. Not for subagents, which share the
+  workspace with the agent that started them.
+  - The note's wording matters: on `rename-api`, a task that asks for the tests to change too,
+    the first two wordings had the model put the old test back "to be safest", in 2 of 2 and 1 of
+    3 live runs, failing the task's own checks. The note now asks why the tests changed, and says
+    to leave a change the task asked for as it is.
 
 Not done yet:
 - **Formatting at the end of a turn.** It rewrites whole files in projects that do not use ruff's
@@ -782,6 +797,11 @@ starting mid-thought. Listing the workspace in the system prompt did not help: 1
 seeds drifted, and the spec was read first in 28 replies against 23 without it, so the listing
 was dropped. Errors for paths outside the workspace now name the workspace, which is what brought
 the model back the first time.
+
+A live run of `rename-api` on 2026-10-28 drifted at its first request straight to `finish`, with a
+summary of work on files that do not exist. An unattended run's first `finish` before any other
+tool has run is now sent back once (`finish_unstarted`), saying nothing has been done yet. None of
+the 48 SWE-July attempts so far finished within three requests, so it does not change those runs.
 
 **The file-tool change** (run file-tools, xhigh, one attempt per task): tool errors fell from 13 to
 3. Two of the three were the new refusals, which showed the file. The third was an `edit` whose

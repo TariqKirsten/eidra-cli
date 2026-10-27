@@ -1,6 +1,6 @@
 //! What the harness tells the model beyond the tools' own results: an edit that changes the
-//! project's tests, a finish that leaves them changed, a budget nearly spent, a timeout under
-//! another name, and no network.
+//! project's tests, a finish that leaves them changed or comes before anything was done, a budget
+//! nearly spent, a timeout under another name, and no network.
 
 mod common;
 
@@ -51,12 +51,17 @@ async fn changing_a_committed_test_is_pointed_out() {
             "edit",
             json!({"path": "tests/test_calc.py", "old": "add(1, 2) == 3", "new": "add(1, 2) == 4"}),
         )),
+        // Named once: changed again, it is not named again.
+        Reply::Chunks(tool_call(
+            "edit",
+            json!({"path": "tests/test_calc.py", "old": "add(1, 2) == 4", "new": "add(1, 2) == 5"}),
+        )),
         Reply::Chunks(text("Done.")),
     ])
     .await;
     let mut agent = agent_with(url, &dir, |_| {});
     agent.push_user("go").unwrap();
-    assert_eq!(agent.run(&mut Quiet, 5).await.unwrap(), Outcome::Replied);
+    assert_eq!(agent.run(&mut Quiet, 6).await.unwrap(), Outcome::Replied);
     let results = tool_results(&log_messages(&agent));
     assert!(!results[0].contains("already had"), "{}", results[0]);
     assert!(
@@ -64,6 +69,7 @@ async fn changing_a_committed_test_is_pointed_out() {
         "{}",
         results[1]
     );
+    assert!(!results[2].contains("already had"), "{}", results[2]);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -108,8 +114,8 @@ async fn an_unattended_run_that_changed_committed_tests_hears_so_at_its_first_fi
     assert_eq!(outcome, Outcome::Finished("done".into()));
     assert!(
         results[1].starts_with(
-            "[Not finished yet. Your changes alter tests the project already had: test_adds in \
-             tests/test_calc.py. They say"
+            "[Before you finish: your changes alter tests the project already had: test_adds in \
+             tests/test_calc.py. If the task asks for that"
         ),
         "{}",
         results[1]
@@ -127,6 +133,29 @@ async fn an_unattended_run_that_changed_committed_tests_hears_so_at_its_first_fi
     assert_eq!(outcome, Outcome::Finished("done".into()));
     assert_eq!(results[2], "Finished.");
     assert!(fs::read_to_string(work.join("tests/test_calc.py")).unwrap().contains("test_more"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_finish_before_anything_ran_is_sent_back_once() {
+    let dir = scratch("unstarted");
+    let finish = || Reply::Chunks(tool_call("finish", json!({"summary": "imagined"})));
+    let url = fake_server(vec![finish(), finish()]).await;
+    let mut profile = Profile::builtin().unwrap();
+    profile.base_url = url;
+    let options = AgentOptions {
+        workspace: dir.join("work"),
+        session_root: dir.join("sessions"),
+        headless: true,
+        confirm: vec![],
+        model_socket: None,
+    };
+    let mut agent = Agent::start(profile, options).unwrap();
+    agent.push_user("go").unwrap();
+    assert_eq!(agent.run(&mut Quiet, 5).await.unwrap(), Outcome::Finished("imagined".into()));
+    let results = tool_results(&log_messages(&agent));
+    assert!(results[0].starts_with("[Not finished: nothing has been done"), "{}", results[0]);
+    assert_eq!(results[1], "Finished.");
     let _ = fs::remove_dir_all(&dir);
 }
 

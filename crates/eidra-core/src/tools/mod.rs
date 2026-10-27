@@ -10,6 +10,7 @@ mod files;
 mod search;
 mod test_changes;
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -52,10 +53,16 @@ pub struct Toolbox {
     nested: agents::Nested,
     /// The note for a change to the project's tests (`[prompts] changed_tests`).
     changed_tests_note: String,
+    /// The tests that note has named, each as `path::name`: it names each once, since named again
+    /// and again the model put back tests the task had asked it to change.
+    noted_tests: HashSet<String>,
     /// The commit the run began at, until its first `finish` checks the tests against it
     /// (`[prompts] finish_changed_tests`).
     base: Option<String>,
     finish_note: String,
+    /// No tool but `finish` has run in this new run yet (`[prompts] finish_unstarted`).
+    idle: bool,
+    unstarted_note: String,
 }
 
 enum Reply {
@@ -111,8 +118,11 @@ impl Toolbox {
             diagnostics: diagnostics::Diagnostics::new(workspace, profile.diagnostics.clone()),
             nested: agents::Nested::new(workspace),
             changed_tests_note: profile.prompts.changed_tests.clone(),
+            noted_tests: HashSet::new(),
             base: None,
             finish_note: profile.prompts.finish_changed_tests.clone(),
+            idle: false,
+            unstarted_note: profile.prompts.finish_unstarted.clone(),
             shell: bash::Shell::new(
                 workspace,
                 &session_dir.join("shell"),
@@ -249,6 +259,11 @@ impl Toolbox {
             }
             "finish" => {
                 let summary = string(args, "summary")?.to_owned();
+                // A run's first finish before anything ran: the model recalled work it imagined,
+                // as it sometimes does from its first request (DESIGN.md §16.2).
+                if std::mem::take(&mut self.idle) {
+                    return Ok(Reply::Text(self.unstarted_note.clone()));
+                }
                 // Once: the next finish ends the run whatever the tests are.
                 if let Some(base) = self.base.take()
                     && let Some(note) = self.tests_changed_since(&base).await
@@ -272,6 +287,17 @@ impl Toolbox {
         }
     }
 
+    /// Has a `finish` before any other tool ran say that nothing has been done, once, in a run that
+    /// starts now.
+    pub fn check_unstarted_finish(&mut self) {
+        self.idle = !self.unstarted_note.is_empty();
+    }
+
+    /// A tool other than `finish` is about to run.
+    pub fn started(&mut self) {
+        self.idle = false;
+    }
+
     /// Forgets which nested AGENTS.md files were given, after a compaction dropped the results
     /// that carried them.
     pub fn forget_nested(&mut self) {
@@ -279,11 +305,12 @@ impl Toolbox {
     }
 
     /// The note for a change to a test file that altered tests of the project's last commit.
-    async fn changed_tests(&self, path: &Path, before: &str) -> Option<String> {
+    async fn changed_tests(&mut self, path: &Path, before: &str) -> Option<String> {
         const MOST: usize = 8;
         let after = fs::read_to_string(path).ok()?;
         let head = test_changes::at_head(path).await?;
-        let changed = test_changes::changed(&head, before, &after);
+        let mut changed = test_changes::changed(&head, before, &after);
+        changed.retain(|name| self.noted_tests.insert(format!("{}::{name}", path.display())));
         if changed.is_empty() {
             return None;
         }
