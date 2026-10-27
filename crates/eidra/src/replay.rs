@@ -48,7 +48,9 @@ pub struct ReplayArgs {
 }
 
 pub async fn run(args: ReplayArgs) -> Result<()> {
-    let log = Log::read(&args.session)?;
+    let here = std::env::current_dir().context("the current directory")?;
+    let vault = crate::vault::open(&eidra_core::eidra_home(&here), false)?;
+    let log = Log::read(&args.session, vault.as_deref())?;
     let header = &log.header;
     let profile = match &args.profile {
         Some(dir) => Profile::load(dir)?,

@@ -7,6 +7,10 @@
 //! commit on a ref of the session's own, `refs/eidra/<session>`, whose subjects say which turn it
 //! belongs to, so a resumed session finds its turns again. The project's ignore files apply, and
 //! a few defaults for caches and environments; a new file over 8 MiB is left out for good.
+//!
+//! In an encrypted eidra directory (§18) git sends every file through eidra's filter, which
+//! seals what goes into a snapshot and opens what comes out, and each turn's label goes into the
+//! commit's message sealed. The names of the files stay readable.
 
 use std::collections::HashSet;
 use std::fs;
@@ -14,12 +18,18 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use zeroize::Zeroizing;
 
+use crate::snapshot_filter::{KEY_ENV, key_hex};
 use crate::text::fnv1a;
+use crate::vault::{Purpose, Vault};
 
 /// The longest one git command may take. Past it, checkpoints are off for the session.
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -45,6 +55,12 @@ __pycache__/
 .tox/
 /target/
 ";
+/// Every file goes through eidra's filter, and is compared through it; the repository's own
+/// attributes come before the project's, so no filter or diff driver of the project's applies.
+/// With no filter set up, in an eidra directory that is not encrypted, these do nothing.
+const ATTRIBUTES: &str = "* filter=eidra diff=eidra\n";
+/// What a sealed label starts with in a snapshot's message.
+const LABEL: &str = "label ";
 const IDENTITY: [(&str, &str); 4] = [
     ("GIT_AUTHOR_NAME", "eidra"),
     ("GIT_AUTHOR_EMAIL", "eidra@localhost"),
@@ -94,6 +110,17 @@ pub struct Checkpoints {
     next: usize,
     /// The repository has been made, if it had to be.
     ready: bool,
+    sealed: Option<Sealed>,
+}
+
+/// What the snapshots of an encrypted eidra directory need.
+struct Sealed {
+    /// The eidra binary, which git runs as the filter.
+    program: PathBuf,
+    /// The snapshot key, as the filter gets it.
+    key: Zeroizing<String>,
+    /// For the turns' labels.
+    vault: Arc<Vault>,
 }
 
 impl Checkpoints {
@@ -105,9 +132,7 @@ impl Checkpoints {
         if workspace == Path::new("/") || home.is_some_and(|home| home == workspace) {
             return Err("they are off in the home and root directories, too big to snapshot".into());
         }
-        let name = workspace.file_name().map(|n| n.to_string_lossy().into_owned());
-        let hash = fnv1a(workspace.as_os_str().as_bytes()) as u32;
-        let git_dir = root.join(format!("{}-{hash:08x}", name.unwrap_or_default()));
+        let git_dir = root.join(repository_name(&workspace));
         Ok(Checkpoints {
             root: root.to_path_buf(),
             index: git_dir.join(format!("eidra-index-{session}")),
@@ -119,16 +144,29 @@ impl Checkpoints {
             off: None,
             next: 1,
             ready: false,
+            sealed: None,
         })
+    }
+
+    /// Seals the snapshots with `vault`'s key, through `program`, the eidra binary, which git
+    /// runs as its filter (`eidra snapshot-filter`).
+    pub fn sealed(mut self, program: &Path, vault: Arc<Vault>) -> Self {
+        let key = key_hex(&vault.snapshot_key());
+        self.sealed = Some(Sealed { program: program.to_path_buf(), key, vault });
+        self
     }
 
     /// The checkpoints of a session that may have turns already, read from its ref.
     pub async fn resume(root: &Path, workspace: &Path, session: &str) -> Result<Self, String> {
-        let mut checkpoints = Self::new(root, workspace, session)?;
-        if checkpoints.git_dir.join("HEAD").exists() {
-            checkpoints.load().await?;
+        Self::new(root, workspace, session)?.resumed().await
+    }
+
+    /// These checkpoints, with the turns a session that goes on already had.
+    pub async fn resumed(mut self) -> Result<Self, String> {
+        if self.git_dir.join("HEAD").exists() {
+            self.load().await?;
         }
-        Ok(checkpoints)
+        Ok(self)
     }
 
     /// Makes the repository if there is none yet.
@@ -142,6 +180,11 @@ impl Checkpoints {
             self.remove_old_sessions().await;
         }
         self.remove_old_indexes();
+        // Repositories from before the attributes get them too.
+        let attributes = self.git_dir.join("info/attributes");
+        if fs::read_to_string(&attributes).ok().as_deref() != Some(ATTRIBUTES) {
+            fs::write(&attributes, ATTRIBUTES).map_err(|e| e.to_string())?;
+        }
         self.ready = true;
         Ok(())
     }
@@ -210,13 +253,19 @@ impl Checkpoints {
             return Ok(());
         }
         self.last = Some(String::from_utf8_lossy(&found.stdout).trim().to_owned());
-        let log = self.git(&["log", "--reverse", "--format=%H %s", &self.reference]).await?;
-        for line in log.lines() {
-            let Some((commit, subject)) = line.split_once(' ') else {
+        let format = "--format=%H%x00%s%x00%b%x1e";
+        let log = self.git(&["log", "--reverse", format, &self.reference]).await?;
+        for record in log.split('\x1e') {
+            let mut fields = record.trim_start_matches('\n').splitn(3, '\0');
+            let (Some(commit), Some(subject)) = (fields.next(), fields.next()) else {
                 continue;
             };
+            let body = fields.next().unwrap_or_default();
             if let Some((number, label)) = subject.strip_prefix("before ").and_then(turn_number) {
-                let label = label.strip_prefix(": ").unwrap_or(label).to_owned();
+                let label = match self.open_label(body) {
+                    Some(label) => label,
+                    None => label.strip_prefix(": ").unwrap_or(label).to_owned(),
+                };
                 let before = commit.to_owned();
                 self.next = self.next.max(number + 1);
                 self.turns.push(Turn { number, label, before, after: None });
@@ -252,7 +301,15 @@ impl Checkpoints {
         let number = self.next;
         let label = label.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
         let label = crate::display::clip(label, 60);
-        match self.snapshot(&format!("before {number}: {label}")).await {
+        // Sealed, the label goes into the message's body, and the subject names the turn alone.
+        let message = match &self.sealed {
+            Some(sealed) => {
+                let label = sealed.vault.seal(Purpose::File, LABEL.as_bytes(), label.as_bytes());
+                format!("before {number}\n\n{LABEL}{}", STANDARD.encode(label))
+            }
+            None => format!("before {number}: {label}"),
+        };
+        match self.snapshot(&message).await {
             Ok(before) => {
                 self.next = number + 1;
                 self.turns.push(Turn { number, label, before, after: None });
@@ -301,9 +358,19 @@ impl Checkpoints {
             return Ok(None);
         };
         let now = self.tree().await?;
-        let args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--stat=100"];
+        // Sealed snapshots are compared through eidra's filter, which opens them; nothing else's.
+        let textconv = if self.sealed.is_some() { "--textconv" } else { "--no-textconv" };
+        let args = ["diff", "--no-color", "--no-ext-diff", textconv, "--stat=100"];
         let diff = self.git(&[&args[..], &["--patch", &before, &now]].concat()).await?;
         Ok(Some((number, diff)))
+    }
+
+    /// A turn's label, sealed in its message's body, if it was and it opens.
+    fn open_label(&self, body: &str) -> Option<String> {
+        let sealed = &self.sealed.as_ref()?.vault;
+        let line = body.lines().find_map(|line| line.strip_prefix(LABEL))?;
+        let label = sealed.open(Purpose::File, LABEL.as_bytes(), &STANDARD.decode(line).ok()?);
+        String::from_utf8(label.ok()?).ok()
     }
 
     /// Puts back the files the latest turn changed, the turns that changed nothing aside. A file
@@ -421,9 +488,9 @@ impl Checkpoints {
     }
 
     /// Records the workspace as a commit after the last one, on the session's ref.
-    async fn snapshot(&mut self, subject: &str) -> Result<String, String> {
+    async fn snapshot(&mut self, message: &str) -> Result<String, String> {
         let tree = self.tree().await?;
-        let mut args = vec!["commit-tree", &tree, "-m", subject];
+        let mut args = vec!["commit-tree", &tree, "-m", message];
         let last = self.last.clone();
         if let Some(parent) = &last {
             args.extend(["-p", parent]);
@@ -507,6 +574,18 @@ impl Checkpoints {
         ] {
             command.args(["-c", setting]);
         }
+        if let Some(sealed) = &self.sealed {
+            // git runs these through the shell.
+            let program = shell_quote(&sealed.program.to_string_lossy());
+            command
+                .arg("-c")
+                .arg(format!("filter.eidra.process={program} snapshot-filter process"));
+            command.args(["-c", "filter.eidra.required=true"]);
+            command
+                .arg("-c")
+                .arg(format!("diff.eidra.textconv={program} snapshot-filter textconv"));
+            command.env(KEY_ENV, sealed.key.as_str());
+        }
         command
             .args(args)
             .current_dir(&self.workspace)
@@ -518,6 +597,68 @@ impl Checkpoints {
             .env_remove("GIT_NAMESPACE");
         command
     }
+}
+
+/// The name of the repository, under the checkpoints' root, that keeps the snapshots of
+/// `workspace`, a canonical path.
+pub fn repository_name(workspace: &Path) -> String {
+    let name = workspace.file_name().map(|n| n.to_string_lossy().into_owned());
+    let hash = fnv1a(workspace.as_os_str().as_bytes()) as u32;
+    format!("{}-{hash:08x}", name.unwrap_or_default())
+}
+
+/// Lets go of the snapshots of the sessions `ids` in every repository under `root`, and has git
+/// remove what only they held: at once, rather than after git's two weeks, except in the
+/// repositories named in `busy`, where an open session may be adding a snapshot as it goes.
+/// Returns how many sessions' snapshots went.
+pub async fn forget_sessions(
+    root: &Path,
+    ids: &HashSet<String>,
+    busy: &HashSet<String>,
+) -> Result<usize, String> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Ok(0);
+    };
+    let mut forgotten = 0;
+    for entry in entries.flatten() {
+        let git_dir = entry.path();
+        if !git_dir.join("HEAD").exists() {
+            continue;
+        }
+        for id in ids {
+            let index = git_dir.join(format!("eidra-index-{id}"));
+            let _ = fs::remove_file(index.with_extension("lock"));
+            let _ = fs::remove_file(index);
+        }
+        let refs = repository_git(&git_dir, &["for-each-ref", "--format=%(refname)"], None).await?;
+        let gone: Vec<&str> = refs
+            .lines()
+            .filter(|r| r.strip_prefix("refs/eidra/").is_some_and(|id| ids.contains(id)))
+            .collect();
+        if gone.is_empty() {
+            continue;
+        }
+        let input: String = gone.iter().map(|r| format!("delete {r}\n")).collect();
+        repository_git(&git_dir, &["update-ref", "--stdin"], Some(input.as_bytes())).await?;
+        forgotten += gone.len();
+        if !busy.contains(&entry.file_name().to_string_lossy().into_owned()) {
+            repository_git(&git_dir, &["gc", "--prune=now", "--quiet"], None).await?;
+        }
+    }
+    Ok(forgotten)
+}
+
+/// git on a snapshot repository alone, with no work tree.
+async fn repository_git(
+    git_dir: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.arg("--git-dir").arg(git_dir).args(["-c", "core.hooksPath=/dev/null"]).args(args);
+    command.env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE").env_remove("GIT_NAMESPACE");
+    let output = succeeded(output(&mut command, args[0], input).await?, args[0])?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Runs git, with `input` on its stdin, and returns what it wrote.
@@ -546,6 +687,11 @@ fn failure(what: &str, output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let why = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("it failed");
     format!("git {what}: {}", why.trim())
+}
+
+/// `text` quoted for the shell.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Whether `inner` is below the directory `outer`.

@@ -37,7 +37,9 @@ pub fn run(args: SessionsArgs) -> Result<()> {
     };
     let here = here.canonicalize().with_context(|| format!("{}", here.display()))?;
     let root = args.session_dir.clone().unwrap_or_else(|| default_session_dir(&here));
-    let sessions: Vec<Summary> = list_sessions(&root)
+    // What was said in an encrypted session shows once its password is given.
+    let vault = crate::vault::open(&eidra_core::eidra_home(&here), false)?;
+    let sessions: Vec<Summary> = list_sessions(&root, vault.as_deref())
         .into_iter()
         .filter(|s| args.all || Path::new(&s.header.workspace) == here)
         .collect();
@@ -56,7 +58,12 @@ pub fn run(args: SessionsArgs) -> Result<()> {
         if session.header.headless {
             line.push_str("  (exec)");
         }
-        let first = session.first.as_deref().unwrap_or("").split_whitespace();
+        let first = match (&session.first, session.sealed) {
+            (Some(first), _) => first.as_str(),
+            (None, true) => "(encrypted)",
+            (None, false) => "",
+        };
+        let first = first.split_whitespace();
         line.push_str(&format!("  {}", clip(&first.collect::<Vec<_>>().join(" "), 70)));
         println!("{}", line.trim_end());
     }

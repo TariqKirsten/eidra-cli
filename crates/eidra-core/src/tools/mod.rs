@@ -11,7 +11,9 @@ mod search;
 mod test_changes;
 
 use std::fs;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -23,6 +25,7 @@ use crate::event::{Event, Frontend};
 use crate::media;
 use crate::profile::Profile;
 use crate::text::truncate_middle;
+use crate::vault::Vault;
 
 /// What a tool call produced.
 pub struct ToolOutput {
@@ -52,6 +55,36 @@ pub struct Toolbox {
     nested: agents::Nested,
     /// The note for a change to the project's tests (`[prompts] changed_tests`).
     changed_tests_note: String,
+    /// In an encrypted eidra directory, where saved output and the shell's files are, which goes
+    /// with the toolbox. Last, so that the shell goes before it.
+    _scratch: Option<Scratch>,
+}
+
+/// A directory in memory for what the tools write in plain text and the model reads back, saved
+/// output and the shell's files, so that none of it reaches the disk unencrypted
+/// (docs/DESIGN.md §18). Removed when the session's toolbox goes.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    /// `$XDG_RUNTIME_DIR` or `/dev/shm`, both kept in memory, else the temporary directory.
+    fn new(session: &str) -> std::io::Result<Self> {
+        let memory = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir())
+            .or_else(|| Some(PathBuf::from("/dev/shm")).filter(|dir| dir.is_dir()));
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let user = unsafe { libc::getuid() };
+        let dir = memory.unwrap_or_else(std::env::temp_dir).join(format!("eidra-{user}"));
+        let dir = dir.join(session);
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+        Ok(Scratch(dir))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 enum Reply {
@@ -90,18 +123,29 @@ pub fn definitions(profile: &Profile, headless: bool, subagent: bool) -> Result<
 }
 
 impl Toolbox {
-    /// Tools for `definitions`; `session_dir` holds saved output and the shell's state.
+    /// Tools for `definitions`; `session_dir` holds saved output and the shell's state. With a
+    /// vault, those are in memory, and the shell's state is kept in `session_dir` encrypted.
     pub fn new(
         profile: &Profile,
         workspace: &Path,
         session_dir: &Path,
         definitions: Vec<Tool>,
+        vault: Option<Arc<Vault>>,
     ) -> Result<Self> {
+        let scratch = match vault {
+            Some(_) => {
+                let session = session_dir.file_name().unwrap_or_default().to_string_lossy();
+                Some(Scratch::new(&session)?)
+            }
+            None => None,
+        };
+        let live = scratch.as_ref().map_or(session_dir, |scratch| &scratch.0);
+        let sealed_state = vault.map(|vault| (session_dir.join("shell.sealed"), vault));
         Ok(Toolbox {
             workspace: workspace.to_path_buf(),
             definitions,
             output_limit: profile.tools.output_limit,
-            outputs: session_dir.join("outputs"),
+            outputs: live.join("outputs"),
             saved: 0,
             files: files::Files::new(workspace),
             diagnostics: diagnostics::Diagnostics::new(workspace, profile.diagnostics.clone()),
@@ -109,9 +153,11 @@ impl Toolbox {
             changed_tests_note: profile.prompts.changed_tests.clone(),
             shell: bash::Shell::new(
                 workspace,
-                &session_dir.join("shell"),
+                &live.join("shell"),
                 profile.api_key_env.as_deref(),
+                sealed_state,
             )?,
+            _scratch: scratch,
         })
     }
 

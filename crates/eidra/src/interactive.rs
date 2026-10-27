@@ -11,6 +11,8 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         bail!("an interactive session needs a terminal; `eidra exec` runs a task unattended");
     }
     let workspace = args.workspace()?;
+    // Encrypted, eidra's directory asks for its password; not yet, it becomes so (§18).
+    let vault = crate::vault::open(&eidra_core::eidra_home(&workspace), true)?;
     eidra_tui::run(eidra_tui::Options {
         profile: args.profile()?,
         session_root: args.session_root(&workspace),
@@ -18,6 +20,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         checkpoints: Some(eidra_core::eidra_home(&workspace).join("checkpoints")),
         workspace,
         confirm: args.confirm.clone(),
+        vault,
     })
     .await
 }

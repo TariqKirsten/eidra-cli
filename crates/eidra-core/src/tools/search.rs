@@ -143,8 +143,9 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tree() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("eidra-search-{}", std::process::id()));
+    /// A small project of the test's own: the tests run side by side.
+    fn tree(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("eidra-search-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         for (path, text) in [
             ("src/a.py", "def alpha():\n    return 1\n"),
@@ -162,7 +163,7 @@ mod tests {
 
     #[test]
     fn globs_by_name_or_path_and_skips_ignored_files() {
-        let dir = tree();
+        let dir = tree("glob");
         assert_eq!(glob(&dir, "*.py", None).unwrap(), "src/a.py\nsrc/pkg/b.py");
         assert_eq!(glob(&dir, "src/*.py", None).unwrap(), "src/a.py");
         assert_eq!(glob(&dir, "src/**/*.py", None).unwrap(), "src/a.py\nsrc/pkg/b.py");
@@ -172,7 +173,7 @@ mod tests {
 
     #[test]
     fn greps_lines_with_numbers() {
-        let dir = tree();
+        let dir = tree("grep");
         assert_eq!(
             grep(&dir, r"alpha", None, None).unwrap(),
             "README.md:1:alpha and beta\nsrc/a.py:1:def alpha():\nsrc/pkg/b.py:2:    return alpha()"

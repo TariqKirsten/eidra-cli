@@ -28,6 +28,7 @@ use crate::profile::Profile;
 use crate::session::{Header, Session};
 use crate::text::{fnv1a, utc_datetime};
 use crate::tools::{self, ToolOutput, Toolbox};
+use crate::vault::Vault;
 
 pub struct AgentOptions {
     /// The directory the agent works in.
@@ -41,6 +42,9 @@ pub struct AgentOptions {
     pub confirm: Vec<String>,
     /// A Unix socket that reaches the model server, for an agent with no network of its own.
     pub model_socket: Option<PathBuf>,
+    /// eidra's directory is encrypted, and this is its key (docs/DESIGN.md §18): the session
+    /// log, the user's AGENTS.md and what the tools keep are encrypted with it.
+    pub vault: Option<Arc<Vault>>,
 }
 
 /// How a run ended.
@@ -85,6 +89,7 @@ pub struct Agent {
     session_root: PathBuf,
     extra_confirm: Vec<String>,
     model_socket: Option<PathBuf>,
+    vault: Option<Arc<Vault>>,
     date: String,
     interrupt: Arc<watch::Sender<bool>>,
     /// A run was stopped before the model replied. The next message says so: otherwise the
@@ -189,8 +194,9 @@ impl Agent {
             parent,
             task,
         };
-        let mut session = Session::create(&options.session_root, header)?;
-        let tools = Toolbox::new(&profile, &workspace, session.dir(), definitions)?;
+        let mut session = Session::create(&options.session_root, header, options.vault.clone())?;
+        let tools =
+            Toolbox::new(&profile, &workspace, session.dir(), definitions, options.vault.clone())?;
 
         let mode = if subagent {
             &profile.prompts.subagent
@@ -206,7 +212,7 @@ impl Agent {
             ("workspace", &workspace.display().to_string()),
             ("date", &date),
             ("mode", &format!("{mode}{network}")),
-            ("agents", &agents_md(&workspace)),
+            ("agents", &agents_md(&workspace, options.vault.as_deref())),
         ]);
         session.push(Message::system(system), None)?;
 
@@ -224,6 +230,7 @@ impl Agent {
             session_root: options.session_root,
             extra_confirm: options.confirm,
             model_socket: options.model_socket,
+            vault: options.vault,
             date,
             interrupt: Arc::new(watch::channel(false).0),
             unanswered: false,
@@ -240,7 +247,7 @@ impl Agent {
     /// calls its last reply left without results get results that say so, and the next message
     /// says the turn was cut short, if it was.
     pub fn resume(profile: Profile, options: AgentOptions, log: &Path) -> Result<Self> {
-        let (mut session, read) = Session::open(log)?;
+        let (mut session, read) = Session::open(log, options.vault.clone())?;
         let header = session.header().clone();
         if header.parent.is_some() {
             bail!("{} is a subagent's session, which only its parent goes on with", header.id);
@@ -263,7 +270,13 @@ impl Agent {
             .and_then(|name| std::env::var(name).ok())
             .filter(|key| !key.is_empty());
         let client = Client::new(&profile.base_url, api_key, options.model_socket.as_deref())?;
-        let tools = Toolbox::new(&profile, &workspace, session.dir(), header.tools.clone())?;
+        let tools = Toolbox::new(
+            &profile,
+            &workspace,
+            session.dir(),
+            header.tools.clone(),
+            options.vault.clone(),
+        )?;
 
         // The last reply, and whether the turn it belongs to ended: with a reply that calls
         // nothing, or with finish.
@@ -314,6 +327,7 @@ impl Agent {
             session_root: options.session_root,
             extra_confirm: options.confirm,
             model_socket: options.model_socket,
+            vault: options.vault,
             interrupt: Arc::new(watch::channel(false).0),
             unanswered,
             background: Arc::new(AtomicUsize::new(0)),
@@ -381,6 +395,7 @@ impl Agent {
             headless: true,
             confirm: self.extra_confirm.clone(),
             model_socket: self.model_socket.clone(),
+            vault: self.vault.clone(),
         };
         let role = Role::Subagent {
             parent: self.session.header().id.clone(),
@@ -1036,11 +1051,18 @@ fn tool_message(id: &str, text: String, images: Vec<(media::Image, String)>) -> 
 /// What heads an AGENTS.md in the system prompt, before its path.
 const INSTRUCTIONS_FROM: &str = "# Instructions from ";
 
-/// AGENTS.md from eidra's own directory and from the workspace, for the system prompt.
-fn agents_md(workspace: &Path) -> String {
+/// AGENTS.md from eidra's own directory and from the workspace, for the system prompt. In an
+/// encrypted eidra directory the user's own is read from the vault, under the same name.
+fn agents_md(workspace: &Path, vault: Option<&Vault>) -> String {
+    let home = eidra_home(workspace);
+    let own = match vault {
+        Some(vault) => vault.instructions(&home).ok().flatten(),
+        None => fs::read_to_string(home.join("AGENTS.md")).ok(),
+    };
+    let project = fs::read_to_string(workspace.join("AGENTS.md")).ok();
     let mut out = String::new();
-    for path in [eidra_home(workspace).join("AGENTS.md"), workspace.join("AGENTS.md")] {
-        let Ok(text) = fs::read_to_string(&path) else {
+    for (path, text) in [(home.join("AGENTS.md"), own), (workspace.join("AGENTS.md"), project)] {
+        let Some(text) = text else {
             continue;
         };
         let text = text.trim();
