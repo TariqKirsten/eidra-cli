@@ -104,29 +104,53 @@ impl Tty {
         writeln!(self.0, "{text}").context("writing to the terminal")
     }
 
-    /// A line typed after `prompt`, not shown as it is typed.
+    /// A line typed after `prompt`, not shown as it is typed. eidra reads the keys itself, with
+    /// the terminal's signals off, so that Ctrl+C ends the prompt with the terminal as it was
+    /// rather than ending eidra with echo off.
     fn ask(&mut self, prompt: &str) -> Result<Zeroizing<String>> {
         write!(self.0, "{prompt}").context("writing to the terminal")?;
         self.0.flush()?;
-        let line = {
+        let mut bytes = Zeroizing::new(Vec::new());
+        {
             let _quiet = Quiet::new(&self.0)?;
-            let mut bytes = Zeroizing::new(Vec::new());
             let mut byte = [0u8; 1];
             loop {
-                match self.0.read(&mut byte).context("reading the terminal")? {
-                    0 => bail!("the terminal closed before a password was typed"),
-                    _ if byte[0] == b'\n' || byte[0] == b'\r' => break,
-                    _ => bytes.push(byte[0]),
+                if self.0.read(&mut byte).context("reading the terminal")? == 0 {
+                    bail!("the terminal closed before a password was typed");
+                }
+                match byte[0] {
+                    b'\r' | b'\n' => break,
+                    // Ctrl+C, or Ctrl+D with nothing typed: no password.
+                    3 => {
+                        writeln!(self.0)?;
+                        bail!("no password given");
+                    }
+                    4 if bytes.is_empty() => {
+                        writeln!(self.0)?;
+                        bail!("no password given");
+                    }
+                    // Ctrl+D after something typed, as a terminal's line editing treats it.
+                    4 => {}
+                    // Backspace: the last character, all its bytes.
+                    8 | 127 => {
+                        while let Some(b) = bytes.pop() {
+                            if b & 0xc0 != 0x80 {
+                                break;
+                            }
+                        }
+                    }
+                    // Ctrl+U: all of it.
+                    21 => bytes.clear(),
+                    b => bytes.push(b),
                 }
             }
-            Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned())
-        };
+        }
         writeln!(self.0).context("writing to the terminal")?;
-        Ok(line)
+        Ok(Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned()))
     }
 }
 
-/// Echo off on the terminal until dropped.
+/// The terminal without echo, line editing or signals until dropped: keys come one at a time.
 struct Quiet {
     fd: i32,
     before: libc::termios,
@@ -141,11 +165,12 @@ impl Quiet {
             bail!("reading the terminal's settings: {}", std::io::Error::last_os_error());
         }
         let mut quiet = before;
-        quiet.c_lflag &= !(libc::ECHO | libc::ECHONL);
-        quiet.c_lflag |= libc::ICANON;
+        quiet.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG);
+        quiet.c_cc[libc::VMIN] = 1;
+        quiet.c_cc[libc::VTIME] = 0;
         // SAFETY: `quiet` came from tcgetattr on the same descriptor.
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
-            bail!("turning the terminal's echo off: {}", std::io::Error::last_os_error());
+            bail!("setting the terminal up for a password: {}", std::io::Error::last_os_error());
         }
         Ok(Quiet { fd, before })
     }

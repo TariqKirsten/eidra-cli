@@ -55,10 +55,14 @@ __pycache__/
 .tox/
 /target/
 ";
-/// Every file goes through eidra's filter, and is compared through it; the repository's own
-/// attributes come before the project's, so no filter or diff driver of the project's applies.
-/// With no filter set up, in an eidra directory that is not encrypted, these do nothing.
-const ATTRIBUTES: &str = "* filter=eidra diff=eidra\n";
+/// Every file goes through eidra's filter, and is compared through it, and is kept as its exact
+/// bytes: the repository's own attributes come before the project's, so none of the project's
+/// filters, diff drivers, line-ending or encoding conversions apply. Git would make those to the
+/// sealed bytes, which would then no longer open, and /undo would lose the file. With no filter
+/// set up, in an eidra directory that is not encrypted, only the exact bytes remain.
+const ATTRIBUTES: &str = "* filter=eidra diff=eidra -text -ident -working-tree-encoding\n";
+/// Left in a repository whose pruning an erase put off, while an open session used it.
+const PRUNE_PENDING: &str = "eidra-prune-pending";
 /// What a sealed label starts with in a snapshot's message.
 const LABEL: &str = "label ";
 const IDENTITY: [(&str, &str); 4] = [
@@ -358,10 +362,16 @@ impl Checkpoints {
             return Ok(None);
         };
         let now = self.tree().await?;
-        // Sealed snapshots are compared through eidra's filter, which opens them; nothing else's.
-        let textconv = if self.sealed.is_some() { "--textconv" } else { "--no-textconv" };
-        let args = ["diff", "--no-color", "--no-ext-diff", textconv, "--stat=100"];
-        let diff = self.git(&[&args[..], &["--patch", &before, &now]].concat()).await?;
+        let diff = if self.sealed.is_some() {
+            // Compared through eidra's filter, which opens them. git's own summary would count
+            // the sealed bytes, as a binary file's: this one counts the opened patch's lines.
+            let args = ["diff", "--no-color", "--no-ext-diff", "--textconv", "--patch"];
+            let patch = self.git(&[&args[..], &[&before, &now]].concat()).await?;
+            format!("{}{patch}", summary(&patch))
+        } else {
+            let args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--stat=100"];
+            self.git(&[&args[..], &["--patch", &before, &now]].concat()).await?
+        };
         Ok(Some((number, diff)))
     }
 
@@ -607,45 +617,118 @@ pub fn repository_name(workspace: &Path) -> String {
     format!("{}-{hash:08x}", name.unwrap_or_default())
 }
 
+/// What `forget_sessions` did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Forgotten {
+    /// Sessions whose snapshots went.
+    pub sessions: usize,
+    /// Repositories whose pruning waits, since an open session uses them.
+    pub pending: usize,
+}
+
 /// Lets go of the snapshots of the sessions `ids` in every repository under `root`, and has git
-/// remove what only they held: at once, rather than after git's two weeks, except in the
-/// repositories named in `busy`, where an open session may be adding a snapshot as it goes.
-/// Returns how many sessions' snapshots went.
+/// remove at once, rather than after its two weeks, every object nothing refers to any more:
+/// theirs, and what snapshots that expired before left behind (§14). A repository named in
+/// `busy` is used by an open session, which may be adding a snapshot as it goes: its refs go,
+/// and it is marked to be pruned by a later erase.
 pub async fn forget_sessions(
     root: &Path,
     ids: &HashSet<String>,
     busy: &HashSet<String>,
-) -> Result<usize, String> {
+) -> Result<Forgotten, String> {
     let Ok(entries) = fs::read_dir(root) else {
-        return Ok(0);
+        return Ok(Forgotten::default());
     };
-    let mut forgotten = 0;
+    let mut forgotten = Forgotten::default();
     for entry in entries.flatten() {
         let git_dir = entry.path();
         if !git_dir.join("HEAD").exists() {
             continue;
-        }
-        for id in ids {
-            let index = git_dir.join(format!("eidra-index-{id}"));
-            let _ = fs::remove_file(index.with_extension("lock"));
-            let _ = fs::remove_file(index);
         }
         let refs = repository_git(&git_dir, &["for-each-ref", "--format=%(refname)"], None).await?;
         let gone: Vec<&str> = refs
             .lines()
             .filter(|r| r.strip_prefix("refs/eidra/").is_some_and(|id| ids.contains(id)))
             .collect();
-        if gone.is_empty() {
+        if !gone.is_empty() {
+            let input: String = gone.iter().map(|r| format!("delete {r}\n")).collect();
+            repository_git(&git_dir, &["update-ref", "--stdin"], Some(input.as_bytes())).await?;
+            forgotten.sessions += gone.len();
+        }
+        if busy.contains(&entry.file_name().to_string_lossy().into_owned()) {
+            if !gone.is_empty() {
+                fs::write(git_dir.join(PRUNE_PENDING), "").map_err(|e| e.to_string())?;
+            }
+            forgotten.pending += usize::from(git_dir.join(PRUNE_PENDING).exists());
             continue;
         }
-        let input: String = gone.iter().map(|r| format!("delete {r}\n")).collect();
-        repository_git(&git_dir, &["update-ref", "--stdin"], Some(input.as_bytes())).await?;
-        forgotten += gone.len();
-        if !busy.contains(&entry.file_name().to_string_lossy().into_owned()) {
-            repository_git(&git_dir, &["gc", "--prune=now", "--quiet"], None).await?;
+        // No session is open on it, so no index is in use. An object only an index holds would
+        // go with the prune and leave the index naming what is gone: the indexes go first, and
+        // each session makes its own again, the same, at its next snapshot.
+        for entry in fs::read_dir(&git_dir).map_err(|e| e.to_string())?.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("eidra-index-") {
+                let _ = fs::remove_file(entry.path());
+            }
         }
+        repository_git(&git_dir, &["gc", "--prune=now", "--quiet"], None).await?;
+        let _ = fs::remove_file(git_dir.join(PRUNE_PENDING));
     }
     Ok(forgotten)
+}
+
+/// Repositories under `root` whose pruning an erase put off.
+pub fn prune_pending(root: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    entries.flatten().filter(|entry| entry.path().join(PRUNE_PENDING).exists()).count()
+}
+
+/// git's `--stat` summary of a patch, counted from its lines.
+fn summary(patch: &str) -> String {
+    let mut files: Vec<(String, usize, usize)> = Vec::new();
+    let mut in_hunk = false;
+    for line in patch.lines() {
+        if let Some(paths) = line.strip_prefix("diff --git ") {
+            let path = paths.rsplit_once(" b/").map_or(paths, |(_, b)| b);
+            files.push((path.to_owned(), 0, 0));
+            in_hunk = false;
+        } else if line.starts_with("@@") {
+            in_hunk = true;
+        } else if let Some(file) = files.last_mut().filter(|_| in_hunk) {
+            // Lines in a hunk only: a removed line starting "-- " reads like the "--- " header.
+            match line.as_bytes().first() {
+                Some(b'+') => file.1 += 1,
+                Some(b'-') => file.2 += 1,
+                _ => {}
+            }
+        }
+    }
+    if files.is_empty() {
+        return String::new();
+    }
+    let width = files.iter().map(|(path, ..)| path.chars().count()).max().unwrap_or(0);
+    let most = files.iter().map(|(_, added, removed)| added + removed).max().unwrap_or(0);
+    let digits = most.to_string().len();
+    // The bars fit in 40 columns, as git's do in a narrow terminal.
+    let scale = |n: usize| if most > 40 { (n * 40).div_ceil(most) } else { n };
+    let mut out = String::new();
+    let (mut added, mut removed) = (0, 0);
+    for (path, plus, minus) in &files {
+        let bar = format!("{}{}", "+".repeat(scale(*plus)), "-".repeat(scale(*minus)));
+        out.push_str(&format!(" {path:<width$} | {:>digits$} {bar}\n", plus + minus));
+        added += plus;
+        removed += minus;
+    }
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    out.push_str(&format!(
+        " {} changed, {}, {}\n\n",
+        plural(files.len(), "file", "files"),
+        plural(added, "insertion(+)", "insertions(+)"),
+        plural(removed, "deletion(-)", "deletions(-)")
+    ));
+    out
 }
 
 /// git on a snapshot repository alone, with no work tree.
@@ -963,6 +1046,19 @@ mod tests {
         new.end().await.unwrap();
         let refs = new.git(&["for-each-ref", "--format=%(refname)", "refs/eidra/"]).await.unwrap();
         assert_eq!(refs, "refs/eidra/new\n");
+    }
+
+    #[test]
+    fn the_summary_of_a_patch_counts_its_hunks_lines() {
+        let patch = "diff --git a/q.sql b/q.sql\nindex 1..2 100644\n--- a/q.sql\n+++ b/q.sql\n\
+                     @@ -1,2 +1,2 @@\n--- a comment\n+select 2;\n keep\n\
+                     diff --git a/new.py b/new.py\n--- /dev/null\n+++ b/new.py\n@@ -0,0 +1 @@\n\
+                     +print()\n";
+        assert_eq!(
+            summary(patch),
+            " q.sql  | 2 +-\n new.py | 1 +\n 2 files changed, 2 insertions(+), 1 deletion(-)\n\n"
+        );
+        assert_eq!(summary(""), "");
     }
 
     #[test]

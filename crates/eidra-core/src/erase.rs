@@ -1,8 +1,9 @@
 //! `/erase-unsecure` (docs/DESIGN.md §18). Once eidra's directory is encrypted, the sessions from
 //! before are the only unencrypted ones left in it: this finds them and erases them, with their
 //! saved files, their subagents' logs and their snapshots. A session open in another eidra is
-//! left alone. Erased files are gone from the filesystem, but on an SSD or a copy-on-write
-//! filesystem their blocks may stay on the disk until written over.
+//! left alone, and so is the pruning of a snapshot repository one uses, till a later erase.
+//! Erased files are gone from the filesystem, but on an SSD or a copy-on-write filesystem their
+//! blocks may stay on the disk until written over.
 
 use std::collections::HashSet;
 use std::fs;
@@ -20,6 +21,8 @@ pub struct Unencrypted {
     pub open: usize,
     /// What they take on the disk, their directories included.
     pub bytes: u64,
+    /// Snapshot repositories an earlier erase could not prune yet.
+    pub pending: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -37,11 +40,15 @@ pub struct Erased {
     pub sessions: usize,
     /// Sessions whose snapshots went.
     pub snapshots: usize,
+    /// Snapshot repositories whose pruning waits for an erase while no open session uses them.
+    pub pending: usize,
 }
 
-/// The unencrypted sessions in `root`, other than `current`.
-pub fn find(root: &Path, current: &str) -> Unencrypted {
-    let mut found = Unencrypted::default();
+/// The unencrypted sessions in `root`, other than `current`, and the snapshot repositories under
+/// `checkpoints` still to prune.
+pub fn find(root: &Path, checkpoints: &Path, current: &str) -> Unencrypted {
+    let mut found =
+        Unencrypted { pending: checkpoint::prune_pending(checkpoints), ..Default::default() };
     for summary in session::all(root, None) {
         if summary.sealed || summary.header.id == current {
             continue;
@@ -63,15 +70,22 @@ pub fn find(root: &Path, current: &str) -> Unencrypted {
 }
 
 /// Erases what `find` found, which must have been found in `root`, and their snapshots in the
-/// repositories under `checkpoints`.
+/// repositories under `checkpoints`. The snapshots go first: if git fails, the logs are still
+/// there, and the next erase tries again.
 pub async fn erase(found: &Unencrypted, root: &Path, checkpoints: &Path) -> Result<Erased, String> {
-    let mut erased = Erased::default();
-    let mut ids = HashSet::new();
-    for session in &found.sessions {
-        // Opened since it was found: left alone.
-        if in_use(&session.path) {
-            continue;
-        }
+    // Opened since it was found: left alone.
+    let sessions: Vec<&Found> = found.sessions.iter().filter(|s| !in_use(&s.path)).collect();
+    let ids: HashSet<String> = sessions.iter().map(|s| s.id.clone()).collect();
+    // A repository an open session works in may be taking a snapshot: git prunes it later.
+    let busy: HashSet<String> = session::all(root, None)
+        .iter()
+        .filter(|summary| in_use(&summary.path))
+        .map(|summary| checkpoint::repository_name(Path::new(&summary.header.workspace)))
+        .collect();
+    let forgotten = checkpoint::forget_sessions(checkpoints, &ids, &busy).await?;
+    let mut erased =
+        Erased { snapshots: forgotten.sessions, pending: forgotten.pending, ..Erased::default() };
+    for session in sessions {
         fs::remove_file(&session.path)
             .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
             .map_err(|e| format!("removing {}: {e}", session.path.display()))?;
@@ -79,16 +93,8 @@ pub async fn erase(found: &Unencrypted, root: &Path, checkpoints: &Path) -> Resu
         if dir.is_dir() {
             fs::remove_dir_all(&dir).map_err(|e| format!("removing {}: {e}", dir.display()))?;
         }
-        ids.insert(session.id.clone());
         erased.sessions += 1;
     }
-    // A repository an open session works in may be taking a snapshot: git prunes it later.
-    let busy: HashSet<String> = session::all(root, None)
-        .iter()
-        .filter(|summary| in_use(&summary.path))
-        .map(|summary| checkpoint::repository_name(Path::new(&summary.header.workspace)))
-        .collect();
-    erased.snapshots = checkpoint::forget_sessions(checkpoints, &ids, &busy).await?;
     Ok(erased)
 }
 
@@ -155,7 +161,7 @@ mod tests {
         let sealed_path = sealed.path().to_path_buf();
         drop(sealed);
 
-        let found = find(&sessions, &current.header().id);
+        let found = find(&sessions, &root.join("checkpoints"), &current.header().id);
         let ids: Vec<&str> = found.sessions.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(found.sessions.len(), 2, "{ids:?}");
         assert!(found.sessions.iter().any(|s| s.subagent));
@@ -163,7 +169,7 @@ mod tests {
         assert!(found.bytes > 0);
 
         let erased = erase(&found, &sessions, &root.join("checkpoints")).await.unwrap();
-        assert_eq!(erased, Erased { sessions: 2, snapshots: 0 });
+        assert_eq!(erased, Erased { sessions: 2, snapshots: 0, pending: 0 });
         assert!(!old_path.exists() && !old_path.with_extension("").exists());
         assert!(!sub_path.exists());
         assert!(open.path().exists() && current.path().exists() && sealed_path.exists());

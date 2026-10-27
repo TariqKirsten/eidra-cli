@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+use crate::text::fnv1a;
 use crate::vault::SnapshotCipher;
 
 /// The environment variable the key comes in, as hex.
@@ -79,11 +80,17 @@ pub fn serve(cipher: &SnapshotCipher, input: impl Read, output: impl Write) -> i
     Ok(())
 }
 
-/// A snapshotted file git wrote out at `path`, opened, to `output`: what `/diff` compares.
+/// A snapshotted file git wrote out at `path`, opened, to `output`: what `/diff` compares. A
+/// binary one is its size and a fingerprint, as git would show it changed rather than its bytes.
 pub fn textconv(cipher: &SnapshotCipher, path: &Path, mut output: impl Write) -> io::Result<()> {
     let data = fs::read(path)?;
     let plain = cipher.open(&data).map_err(|e| io::Error::other(e.to_string()))?;
-    output.write_all(&plain)?;
+    // git's own test for a binary file: a NUL in its first 8000 bytes.
+    if plain.iter().take(8000).any(|&b| b == 0) {
+        writeln!(output, "(binary, {} bytes, {:016x})", plain.len(), fnv1a(&plain))?;
+    } else {
+        output.write_all(&plain)?;
+    }
     output.flush()
 }
 
@@ -196,6 +203,24 @@ mod tests {
         assert!(list(&mut reply).is_empty());
         assert_eq!(list(&mut reply), ["status=error"]);
         assert!(reply.is_empty());
+    }
+
+    #[test]
+    fn textconv_opens_text_and_stands_in_for_binary() {
+        let cipher = SnapshotCipher::new(&[7u8; 32]);
+        let dir = std::env::temp_dir().join(format!("eidra-textconv-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let read = |plain: &[u8]| {
+            fs::write(dir.join("blob"), cipher.seal(plain)).unwrap();
+            let mut out = Vec::new();
+            textconv(&cipher, &dir.join("blob"), &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(read(b"x = 1\n"), "x = 1\n");
+        let binary = read(b"\x89PNG\0\0\x01");
+        assert!(binary.starts_with("(binary, 7 bytes, "), "{binary}");
+        assert_ne!(binary, read(b"\x89PNG\0\0\x02"), "a change shows");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

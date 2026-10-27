@@ -910,7 +910,7 @@ program reading it gives nothing away. Disk encryption still matters: it covers 
   (HKDF-SHA256), and everything is sealed with XChaCha20-Poly1305. A forgotten password loses
   everything it sealed.
 - **When it is asked for:** the TUI asks for the password before it starts, three tries, on the
-  terminal without echo. In a directory that is not encrypted yet it asks the user to choose one,
+  terminal without echo; eidra reads the keys itself, so Ctrl+C leaves the terminal as it was. In a directory that is not encrypted yet it asks the user to choose one,
   twice, at least 8 characters; `EIDRA_VAULT=off` opts out, and the TUI scripts use it.
   `eidra exec` never encrypts a directory, so evals and scripts run as before, but it asks for the
   password of one that is, and so do `eidra sessions`, `eidra replay` and `eidra instructions`.
@@ -918,9 +918,12 @@ program reading it gives nothing away. Disk encryption still matters: it covers 
   it began, its workspace, whether it ran unattended, and its parent. Every record after it, the
   header first, is one line of base64: the record sealed, bound to the session and to its place
   in the log, so lines cannot be moved or swapped unnoticed. The log stays append-only, and a line
-  cut short by a crash is dropped as before. Subagents' logs are sealed the same way. A plain log
-  can be read in an encrypted directory, but does not go on there: what was added would be plain.
-  A session open in an eidra is locked (`flock`), so another cannot go on with it or erase it.
+  cut short by a crash is dropped as before; a last line without its newline counts as cut short
+  however whole it looks, since going on cuts it off the file and numbers the next line in its
+  place. Subagents' logs are sealed the same way. A plain log can be read in an encrypted
+  directory, but does not go on there: what was added would be plain. A session open in an eidra
+  is locked (`flock`), before its log is read, so another cannot add to it, go on with it or erase
+  it meanwhile. `eidra replay` does not save an encrypted session's replies.
 - **The user's AGENTS.md** is `AGENTS.md.enc`. A plain `AGENTS.md` left in the directory is
   sealed in its place at the next unlock and removed, which is how it is set or changed;
   `eidra instructions` prints it. The header's `instructions:` line still names it.
@@ -936,19 +939,40 @@ program reading it gives nothing away. Disk encryption still matters: it covers 
   which files are equal, nothing more. The filter gets the snapshot key alone, in the environment
   of the git command. Each turn's label is sealed into the commit's body. The names of the files
   stay readable: hiding them would mean a snapshot store of eidra's own instead of git.
+  - The attributes also turn off line-ending, `ident` and encoding conversion
+    (`-text -ident -working-tree-encoding`): git makes those to what the filter hands it, the
+    sealed bytes, which then no longer opened, and `/undo` lost the file (a review found it with a
+    project's `*.bat text eol=crlf`). Snapshots keep each file's exact bytes, sealed or not.
+  - `/diff`'s summary is counted from the opened patch: git's would count the sealed bytes, as a
+    binary file's. A binary file shows as its size and a fingerprint, rather than its bytes.
 - **`/erase-unsecure`** lists the unencrypted sessions left (by workspace, with their size), and
   `/erase-unsecure yes` erases them: their logs, their directories, their subagents' logs, and their
-  snapshots, which git then prunes at once, except in a repository a session open in an eidra is
-  using, where git's usual two weeks apply. Sessions open in another eidra are left alone. On an
-  SSD or a copy-on-write filesystem the disk may keep erased blocks until it writes over them.
+  snapshots. Sessions open in another eidra are left alone.
+  - Their refs go, and git prunes at once every repository no open session uses: what they held,
+    and what snapshots that expired before left behind (§14 lets go of refs after 30 days, and
+    `gc --auto` rarely prunes). The repository's session indexes go first: an object only an
+    index holds would go with the prune, and the index would then name what is gone; each
+    session makes its own again, the same, at its next snapshot.
+  - A repository an open session uses is not pruned while it may be taking a snapshot: it is
+    marked, and a later `/erase-unsecure` prunes it.
+  - The logs go last, so that if git fails they are there for the next try.
+  - On an SSD or a copy-on-write filesystem the disk may keep erased blocks until it writes over
+    them.
 - **Not covered:** the project itself; an open session, which is decrypted in memory and on the
   screen; the session list's metadata; and what was written before the directory was encrypted,
   until `/erase-unsecure`. There is no `/secure` for one session: every session in an encrypted
   directory is encrypted from its first line.
 
-Checks: unit tests for the vault, the sealed log (a crash, resuming, the lock, listing), the
-filter protocol and the erase; `crates/eidra/tests/vault.rs` runs real git with this binary as the
-filter and finds no contents or labels among the repository's objects, while `/diff`, a resumed
-session and `/undo` get them back whole; and `scripts/tui/offline.py` makes a vault at the first
+Checks: unit tests for the vault, the sealed log (a crash, a whole line without its newline,
+resuming, the lock, listing), the filter protocol, textconv and the erase.
+`crates/eidra/tests/vault.rs` runs real git with this binary as the filter:
+- it finds no contents or labels among the repository's objects, while `/diff`, a resumed session
+  and `/undo` get them back whole;
+- a project's line-ending and `ident` rules leave `/undo` byte for byte;
+- an erase prunes a plain session's snapshot, and an encrypted session whose index held an object
+  that went still diffs and undoes.
+
+Each of the last two failed before its fix. `scripts/tui/offline.py` makes a vault at the first
 start, resumes with a wrong password then the right one, finds nothing readable in the log, and
-erases an unencrypted session.
+erases an unencrypted session. A review of the first version (2026-10-27) found the defects these
+cover.

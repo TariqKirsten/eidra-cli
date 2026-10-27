@@ -122,6 +122,13 @@ impl Log {
     pub fn read(path: &Path, vault: Option<&Vault>) -> Result<Log> {
         let text =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Log::parse(&text, path, vault)
+    }
+
+    /// A log's text read back; `path` names it in errors. A last line without its newline was cut
+    /// short by a crash, however whole it looks, and is left out: a session that goes on cuts it
+    /// off the file, and numbers the lines it seals after those before it.
+    fn parse(text: &str, path: &Path, vault: Option<&Vault>) -> Result<Log> {
         let mut header = None;
         let mut messages = Vec::new();
         let mut starts = vec![0];
@@ -133,32 +140,23 @@ impl Log {
         };
         let mut sealed_lines = 0;
         for (n, &(i, line)) in lines.iter().enumerate() {
-            // A line cut short by a crash, at the very end, is left out.
-            let cut_short = n + 1 == lines.len() && !text.ends_with('\n');
+            if n + 1 == lines.len() && !text.ends_with('\n') {
+                break;
+            }
             let json = match &sealed_as {
                 Some(_) if n == 0 => continue,
                 Some(id) => {
                     let Some(vault) = vault else {
                         bail!("session {id} is encrypted, and ~/.eidra is not unlocked");
                     };
-                    match open_line(vault, id, n as u64 - 1, line) {
-                        Ok(json) => Cow::Owned(json),
-                        Err(_) if cut_short => break,
-                        Err(e) => {
-                            return Err(e)
-                                .with_context(|| format!("{} line {}", path.display(), i + 1));
-                        }
-                    }
+                    let json = open_line(vault, id, n as u64 - 1, line)
+                        .with_context(|| format!("{} line {}", path.display(), i + 1))?;
+                    Cow::Owned(json)
                 }
                 None => Cow::Borrowed(line),
             };
-            let record = match serde_json::from_str(&json) {
-                Ok(record) => record,
-                Err(_) if cut_short => break,
-                Err(e) => {
-                    return Err(e).with_context(|| format!("{} line {}", path.display(), i + 1));
-                }
-            };
+            let record = serde_json::from_str(&json)
+                .with_context(|| format!("{} line {}", path.display(), i + 1))?;
             if sealed_as.is_some() {
                 sealed_lines += 1;
             }
@@ -240,7 +238,19 @@ impl Session {
     /// what follows is appended. The log as read comes back too. With a vault, only an encrypted
     /// log goes on: what is added to a plain one would not be encrypted either.
     pub fn open(path: &Path, vault: Option<Arc<Vault>>) -> Result<(Self, Log)> {
-        let log = Log::read(path, vault.as_deref())?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // Locked before it is read, so that no other eidra adds to it in between.
+        let id = path.file_stem().unwrap_or_default().to_string_lossy();
+        lock(&file, &id)?;
+        let mut text = Vec::new();
+        file.read_to_end(&mut text).with_context(|| format!("reading {}", path.display()))?;
+        let text = String::from_utf8(text)
+            .with_context(|| format!("reading {}: it is not UTF-8", path.display()))?;
+        let log = Log::parse(&text, path, vault.as_deref())?;
         if vault.is_some() && !log.sealed {
             bail!(
                 "session {} is not encrypted, so it does not go on in an encrypted ~/.eidra: \
@@ -248,18 +258,10 @@ impl Session {
                 log.header.id
             );
         }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        lock(&file, &log.header.id)?;
         // A line cut short by a crash goes, so that what follows starts on a line of its own and
         // the log reads back whole.
-        let mut text = Vec::new();
-        file.read_to_end(&mut text)?;
-        if !text.is_empty() && !text.ends_with(b"\n") {
-            let end = text.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        if !text.is_empty() && !text.ends_with('\n') {
+            let end = text.rfind('\n').map_or(0, |i| i + 1);
             file.set_len(end as u64)?;
             file.seek(SeekFrom::End(0))?;
         }
@@ -637,6 +639,19 @@ mod tests {
         drop(session);
         let log = Log::read(&path, Some(&vault)).unwrap();
         assert_eq!(log.messages.last().unwrap().0, Message::user("again"));
+
+        // A last line written whole but for its newline is cut short too: it goes, and the line
+        // sealed after it takes its place, so the log still reads back.
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, text.strip_suffix('\n').unwrap()).unwrap();
+        assert_eq!(Log::read(&path, Some(&vault)).unwrap().messages.len(), 2);
+        let (mut session, log) = Session::open(&path, Some(vault.clone())).unwrap();
+        assert_eq!(log.messages.len(), 2);
+        session.push(Message::user("once more"), None).unwrap();
+        drop(session);
+        let log = Log::read(&path, Some(&vault)).unwrap();
+        assert_eq!(log.messages.last().unwrap().0, Message::user("once more"));
+        assert_eq!(log.messages.len(), 3);
 
         // Listed without the key: where and when, but not what was said.
         let listed = &list(&root, None)[0];

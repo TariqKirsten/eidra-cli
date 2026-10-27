@@ -1157,9 +1157,10 @@ impl<W: Write> App<W> {
             return;
         }
         let root = self.options.session_root.clone();
+        let checkpoints = self.options.checkpoints.clone().unwrap_or_default();
         let current = self.agent.as_ref().map_or(String::new(), |a| a.session_id().to_owned());
-        let found = erase::find(&root, &current);
-        if found.sessions.is_empty() {
+        let found = erase::find(&root, &checkpoints, &current);
+        if found.sessions.is_empty() && found.pending == 0 {
             let open = match found.open {
                 0 => String::new(),
                 n => format!(" but {n} open in another eidra, left alone"),
@@ -1170,7 +1171,6 @@ impl<W: Write> App<W> {
             let lines = erase_lines(&found);
             return self.commit(Block::Info, lines);
         }
-        let checkpoints = self.options.checkpoints.clone().unwrap_or_default();
         self.job =
             Some(Box::pin(
                 async move { Done::Erase(erase::erase(&found, &root, &checkpoints).await) },
@@ -1274,6 +1274,16 @@ impl<W: Write> App<W> {
                     plural(erased.sessions),
                     erased.snapshots
                 ));
+                if erased.pending > 0 {
+                    let (n, which) = match erased.pending {
+                        1 => (1, "repository is"),
+                        n => (n, "repositories are"),
+                    };
+                    self.notice(&format!(
+                        "{n} snapshot {which} in use by an open session, and still hold some of \
+                         it: /erase-unsecure yes again once that session ends"
+                    ));
+                }
             }
             Done::Erase(Err(why)) => self.error(&format!("/erase-unsecure: {why}")),
             Done::Command { command, output, status } => {
@@ -1642,26 +1652,40 @@ fn diff_lines(diff: &str, most: usize) -> Vec<Line> {
 
 /// What `/erase-unsecure` would erase, by workspace, before the user says yes.
 fn erase_lines(found: &Unencrypted) -> Vec<Line> {
-    let mut by_workspace: Vec<(String, usize)> = Vec::new();
-    for session in found.sessions.iter().filter(|s| !s.subagent) {
-        match by_workspace.iter_mut().find(|(w, _)| *w == session.workspace) {
-            Some((_, n)) => *n += 1,
-            None => by_workspace.push((session.workspace.clone(), 1)),
-        }
-    }
+    let mut lines = Vec::new();
     let subagents = found.sessions.iter().filter(|s| s.subagent).count();
     let sessions = found.sessions.len() - subagents;
-    let plural = if sessions == 1 { "" } else { "s" };
-    let size = compact(found.bytes as f64);
-    let mut head = format!("{sessions} unencrypted session{plural} ({size}B");
-    if subagents > 0 {
-        head.push_str(&format!(", and {subagents} of their subagents"));
+    if !found.sessions.is_empty() {
+        let plural = if sessions == 1 { "" } else { "s" };
+        let size = compact(found.bytes as f64);
+        let mut head = format!("{sessions} unencrypted session{plural} ({size}B");
+        if subagents > 0 {
+            head.push_str(&format!(", and {subagents} of their subagents"));
+        }
+        head.push_str("), with their saved files and /undo snapshots:");
+        lines.push(Line::styled(head, theme::BOLD));
+        let mut by_workspace: Vec<(String, usize)> = Vec::new();
+        for session in found.sessions.iter().filter(|s| !s.subagent) {
+            match by_workspace.iter_mut().find(|(w, _)| *w == session.workspace) {
+                Some((_, n)) => *n += 1,
+                None => by_workspace.push((session.workspace.clone(), 1)),
+            }
+        }
+        for (workspace, n) in by_workspace {
+            let workspace = home_relative(Path::new(&workspace));
+            lines.push(Line::styled(format!("  {workspace}: {n}"), theme::DIM));
+        }
     }
-    head.push_str("), with their saved files and /undo snapshots:");
-    let mut lines = vec![Line::styled(head, theme::BOLD)];
-    for (workspace, n) in by_workspace {
-        let workspace = home_relative(Path::new(&workspace));
-        lines.push(Line::styled(format!("  {workspace}: {n}"), theme::DIM));
+    if found.pending > 0 {
+        let which = if found.pending == 1 { "repository" } else { "repositories" };
+        lines.push(Line::styled(
+            format!(
+                "what an earlier erase left in {} snapshot {which}, which an open session was \
+                 using then",
+                found.pending
+            ),
+            theme::BOLD,
+        ));
     }
     if found.open > 0 {
         lines.push(Line::styled(
