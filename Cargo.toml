@@ -13,14 +13,22 @@ eidra-core = { path = "crates/eidra-core" }
 eidra-llm = { path = "crates/eidra-llm" }
 eidra-tui = { path = "crates/eidra-tui" }
 anyhow = "1.0.104"
+# Encryption at rest of eidra's own directory (docs/DESIGN.md §18): a key from the password,
+# authenticated encryption, and keys for each use derived from one.
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
+base64 = "0.23.1"
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 # The TUI draws with crossterm alone: ratatui's inline viewport cannot change height (DESIGN.md §12).
 crossterm = { version = "0.29", default-features = false, features = ["bracketed-paste", "event-stream"] }
 # join_all, for subagents running side by side; reqwest already builds it.
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+getrandom = "0.4.3"
 globset = "0.4.20"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
+hkdf = "0.13.0"
+hmac = "0.13.0"
 # Images for the model: their size, and a smaller copy of one too large (DESIGN.md §10).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 ignore = "0.4.33"
@@ -31,6 +39,7 @@ pulldown-cmark = { version = "0.13.5", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 thiserror = "2.0"
 tokio = { version = "1.54", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 toml = "0.9.8"
@@ -38,6 +47,7 @@ tree-sitter = "0.27.1"
 tree-sitter-bash = "0.25.1"
 tree-sitter-python = "0.25"
 unicode-width = "0.2.2"
+zeroize = "1.9.1"
 
 [profile.release]
 lto = "thin"

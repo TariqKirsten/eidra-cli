@@ -16,6 +16,7 @@ fn options(dir: &std::path::Path, headless: bool) -> AgentOptions {
         headless,
         confirm: vec![],
         model_socket: None,
+        vault: None,
     }
 }
 
@@ -77,7 +78,7 @@ async fn a_session_goes_on_where_it_stopped() {
     assert!(next.starts_with("[The user interrupted you") && next.ends_with("are you there?"));
 
     // The same log goes on, with a mark where it was taken up again and a seed not used before.
-    let read = Log::read(&log).unwrap();
+    let read = Log::read(&log, None).unwrap();
     let seeds: Vec<u64> = read.messages.iter().filter_map(|(_, s)| s.as_ref()?.seed).collect();
     assert_eq!(seeds.len(), 3);
     assert!(seeds[2] != seeds[0] && seeds[2] != seeds[1]);

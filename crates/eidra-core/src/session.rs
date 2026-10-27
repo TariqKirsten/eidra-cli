@@ -1,17 +1,26 @@
 //! The session log: an append-only JSONL file from which every request is built
 //! (docs/DESIGN.md §4.2). Nothing in it is ever rewritten, so the prompt only grows.
+//!
+//! In an encrypted eidra directory (§18) the log starts with what is needed to find and list it
+//! without the key, and every record after that, the header first, is one line of base64: the
+//! record sealed with the vault's log key, bound to the session and to its place in the log.
 
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, Read as _, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use eidra_llm::{Content, Message, Part, Tool};
 use serde::{Deserialize, Serialize};
 
 use crate::event::RequestStats;
 use crate::text::utc_datetime;
+use crate::vault::{Purpose, Vault};
 
 /// What a session started with: the log's first line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +46,16 @@ pub struct Header {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Record<'a> {
+    /// What an encrypted log shows without the key; the header follows, sealed.
+    Sealed {
+        version: u32,
+        id: &'a str,
+        created: &'a str,
+        workspace: &'a str,
+        headless: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<&'a str>,
+    },
     Session(&'a Header),
     Message {
         message: &'a Message,
@@ -66,6 +85,14 @@ enum Record<'a> {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Read {
+    Sealed {
+        id: String,
+        created: String,
+        workspace: String,
+        headless: bool,
+        #[serde(default)]
+        parent: Option<String>,
+    },
     Session(Header),
     Message {
         message: Message,
@@ -84,41 +111,66 @@ pub struct Log {
     pub messages: Vec<(Message, Option<RequestStats>)>,
     /// Where each conversation begins in `messages`: 0, and after each compaction.
     pub starts: Vec<usize>,
+    /// The log is encrypted.
+    pub sealed: bool,
+    /// Sealed lines read whole, which the next one written follows.
+    sealed_lines: u64,
 }
 
 impl Log {
-    pub fn read(path: &Path) -> Result<Log> {
+    /// Reads a log; an encrypted one needs the vault it was written with.
+    pub fn read(path: &Path, vault: Option<&Vault>) -> Result<Log> {
         let text =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Log::parse(&text, path)
+        Log::parse(&text, path, vault)
     }
 
     /// A log's text read back; `path` names it in errors. A last line without its newline was cut
     /// short by a crash, however whole it looks, and is left out: a session that goes on cuts it
-    /// off the file.
-    fn parse(text: &str, path: &Path) -> Result<Log> {
+    /// off the file, and numbers the lines it seals after those before it.
+    fn parse(text: &str, path: &Path, vault: Option<&Vault>) -> Result<Log> {
         let mut header = None;
         let mut messages = Vec::new();
         let mut starts = vec![0];
         let lines: Vec<(usize, &str)> =
             text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()).collect();
+        let sealed_as = match lines.first().map(|(_, line)| serde_json::from_str(line)) {
+            Some(Ok(Read::Sealed { id, .. })) => Some(id),
+            _ => None,
+        };
+        let mut sealed_lines = 0;
         for (n, &(i, line)) in lines.iter().enumerate() {
             if n + 1 == lines.len() && !text.ends_with('\n') {
                 break;
             }
-            let record = serde_json::from_str(line)
+            let json = match &sealed_as {
+                Some(_) if n == 0 => continue,
+                Some(id) => {
+                    let Some(vault) = vault else {
+                        bail!("session {id} is encrypted, and ~/.eidra is not unlocked");
+                    };
+                    let json = open_line(vault, id, n as u64 - 1, line)
+                        .with_context(|| format!("{} line {}", path.display(), i + 1))?;
+                    Cow::Owned(json)
+                }
+                None => Cow::Borrowed(line),
+            };
+            let record = serde_json::from_str(&json)
                 .with_context(|| format!("{} line {}", path.display(), i + 1))?;
+            if sealed_as.is_some() {
+                sealed_lines += 1;
+            }
             match record {
                 Read::Session(h) => header = Some(h),
                 Read::Message { message, stats } => messages.push((message, stats)),
-                Read::End {} | Read::Resumed {} => {}
+                Read::Sealed { .. } | Read::End {} | Read::Resumed {} => {}
                 Read::Compaction {} => starts.push(messages.len()),
             }
         }
         let Some(header) = header else {
             bail!("{} has no session header", path.display());
         };
-        Ok(Log { header, messages, starts })
+        Ok(Log { header, messages, starts, sealed: sealed_as.is_some(), sealed_lines })
     }
 
     /// Where the conversation that holds message `index` begins.
@@ -131,15 +183,23 @@ pub struct Session {
     header: Header,
     path: PathBuf,
     dir: PathBuf,
-    /// Locked while the session is open, so that no other eidra goes on with it.
+    /// Locked while the session is open, so that no other eidra goes on with it or erases it.
     file: File,
     messages: Vec<Message>,
+    sealing: Option<Sealing>,
+}
+
+/// How an encrypted log's next line is sealed.
+struct Sealing {
+    vault: Arc<Vault>,
+    /// The line's place among the sealed ones, which it is bound to.
+    next: u64,
 }
 
 impl Session {
-    /// Starts a log in `root`, as `<id>.jsonl` beside a directory `<id>/` for saved output.
-    /// `header.id` and `header.created` are filled in here.
-    pub fn create(root: &Path, mut header: Header) -> Result<Self> {
+    /// Starts a log in `root`, as `<id>.jsonl` beside a directory `<id>/` for saved output; an
+    /// encrypted one with a vault. `header.id` and `header.created` are filled in here.
+    pub fn create(root: &Path, mut header: Header, vault: Option<Arc<Vault>>) -> Result<Self> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         let (y, mo, d, h, mi, s) = utc_datetime(now.as_secs());
         let salt = (now.subsec_nanos() ^ std::process::id().rotate_left(16)) & 0xffff;
@@ -149,20 +209,35 @@ impl Session {
         let dir = root.join(&header.id);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = root.join(format!("{}.jsonl", header.id));
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create_new(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("creating {}", path.display()))?;
         lock(&file, &header.id)?;
-        let mut session = Session { header, path, dir, file, messages: Vec::new() };
+        if vault.is_some() {
+            let envelope = Record::Sealed {
+                version: 1,
+                id: &header.id,
+                created: &header.created,
+                workspace: &header.workspace,
+                headless: header.headless,
+                parent: header.parent.as_deref(),
+            };
+            let mut line = serde_json::to_vec(&envelope)?;
+            line.push(b'\n');
+            file.write_all(&line).with_context(|| format!("writing {}", path.display()))?;
+        }
+        let sealing = vault.map(|vault| Sealing { vault, next: 0 });
+        let mut session = Session { header, path, dir, file, messages: Vec::new(), sealing };
         session.write(&Record::Session(&session.header.clone()))?;
         Ok(session)
     }
 
     /// Opens a log to go on with it: the session's messages are its last conversation's, and
-    /// what follows is appended. The log as read comes back too.
-    pub fn open(path: &Path) -> Result<(Self, Log)> {
+    /// what follows is appended. The log as read comes back too. With a vault, only an encrypted
+    /// log goes on: what is added to a plain one would not be encrypted either.
+    pub fn open(path: &Path, vault: Option<Arc<Vault>>) -> Result<(Self, Log)> {
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -175,7 +250,14 @@ impl Session {
         file.read_to_end(&mut text).with_context(|| format!("reading {}", path.display()))?;
         let text = String::from_utf8(text)
             .with_context(|| format!("reading {}: it is not UTF-8", path.display()))?;
-        let log = Log::parse(&text, path)?;
+        let log = Log::parse(&text, path, vault.as_deref())?;
+        if vault.is_some() && !log.sealed {
+            bail!(
+                "session {} is not encrypted, so it does not go on in an encrypted ~/.eidra: \
+                 /erase-unsecure erases it, or EIDRA_VAULT=off goes on with it unencrypted",
+                log.header.id
+            );
+        }
         // A line cut short by a crash goes, so that what follows starts on a line of its own and
         // the log reads back whole.
         if !text.is_empty() && !text.ends_with('\n') {
@@ -187,8 +269,9 @@ impl Session {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let start = log.starts.last().copied().unwrap_or(0);
         let messages = log.messages[start..].iter().map(|(m, _)| m.clone()).collect();
-        let session =
-            Session { header: log.header.clone(), path: path.to_path_buf(), dir, file, messages };
+        let sealing = vault.map(|vault| Sealing { vault, next: log.sealed_lines });
+        let header = log.header.clone();
+        let session = Session { header, path: path.to_path_buf(), dir, file, messages, sealing };
         Ok((session, log))
     }
 
@@ -246,6 +329,12 @@ impl Session {
 
     fn write(&mut self, record: &Record) -> Result<()> {
         let mut line = serde_json::to_vec(record)?;
+        if let Some(sealing) = &mut self.sealing {
+            let aad = line_aad(&self.header.id, sealing.next);
+            let sealed = sealing.vault.seal(Purpose::Log, aad.as_bytes(), &line);
+            sealing.next += 1;
+            line = STANDARD.encode(sealed).into_bytes();
+        }
         line.push(b'\n');
         self.file.write_all(&line).with_context(|| format!("writing {}", self.path.display()))
     }
@@ -269,48 +358,105 @@ fn lock(file: &File, id: &str) -> Result<()> {
     }
 }
 
+/// Whether another eidra has the session logged at `path` open.
+pub fn in_use(path: &Path) -> bool {
+    File::open(path).is_ok_and(|file| matches!(file.try_lock(), Err(TryLockError::WouldBlock)))
+}
+
+/// What a sealed line is bound to: its session and its place.
+fn line_aad(id: &str, n: u64) -> String {
+    format!("{id}:{n}")
+}
+
+/// A sealed line's record, as JSON.
+fn open_line(vault: &Vault, id: &str, n: u64, line: &str) -> Result<String> {
+    let sealed = STANDARD.decode(line.trim()).context("an encrypted line that is not base64")?;
+    let json = vault.open(Purpose::Log, line_aad(id, n).as_bytes(), &sealed)?;
+    String::from_utf8(json).context("an encrypted line that is not UTF-8")
+}
+
 /// A session as `eidra sessions` lists it, from the start of its log.
 #[derive(Debug, Clone)]
 pub struct Summary {
     pub path: PathBuf,
+    /// Without the key, an encrypted log's header has only its id, time, workspace, whether it
+    /// ran unattended, and its parent.
     pub header: Header,
     /// When the log was last written to.
     pub modified: SystemTime,
-    /// The first thing the user said.
+    /// The first thing the user said, if it could be read.
     pub first: Option<String>,
+    /// The log is encrypted.
+    pub sealed: bool,
 }
 
 /// The sessions in `root`, but not subagents', the most recently active first. Only the start of
-/// each log is read.
-pub fn list(root: &Path) -> Vec<Summary> {
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut sessions: Vec<Summary> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
-        .filter_map(|path| summary(&path))
-        .filter(|summary| summary.header.parent.is_none())
-        .collect();
+/// each log is read; an encrypted one's first message only with the vault.
+pub fn list(root: &Path, vault: Option<&Vault>) -> Vec<Summary> {
+    let mut sessions: Vec<Summary> =
+        all(root, vault).into_iter().filter(|summary| summary.header.parent.is_none()).collect();
     sessions.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
     sessions
 }
 
-fn summary(path: &Path) -> Option<Summary> {
+/// Every log in `root`, subagents' too, in no order.
+pub fn all(root: &Path, vault: Option<&Vault>) -> Vec<Summary> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
+        .filter_map(|path| summary(&path, vault))
+        .collect()
+}
+
+fn summary(path: &Path, vault: Option<&Vault>) -> Option<Summary> {
     let modified = fs::metadata(path).and_then(|m| m.modified()).ok()?;
     let mut lines = BufReader::new(File::open(path).ok()?).lines();
-    let Ok(Read::Session(header)) = serde_json::from_str(&lines.next()?.ok()?) else {
-        return None;
-    };
-    // The system prompt comes first, then the user; a few lines are enough.
-    let first = lines.take(4).map_while(Result::ok).find_map(|line| {
-        match serde_json::from_str(&line).ok()? {
-            Read::Message { message: Message::User { content }, .. } => Some(text_of(&content)),
-            _ => None,
-        }
+    let (header, sealed_as, mut lines): (Header, Option<String>, Vec<String>) =
+        match serde_json::from_str(&lines.next()?.ok()?).ok()? {
+            Read::Session(header) => (header, None, lines.take(4).map_while(Result::ok).collect()),
+            Read::Sealed { id, created, workspace, headless, parent } => {
+                // The system prompt comes first, then the user; a few lines are enough.
+                let rest: Vec<String> = lines.take(5).map_while(Result::ok).collect();
+                let opened: Vec<String> = match vault {
+                    Some(vault) => rest
+                        .iter()
+                        .enumerate()
+                        .map_while(|(n, line)| open_line(vault, &id, n as u64, line).ok())
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let full = opened.first().and_then(|json| match serde_json::from_str(json) {
+                    Ok(Read::Session(header)) => Some(header),
+                    _ => None,
+                });
+                let header = full.unwrap_or_else(|| Header {
+                    version: 1,
+                    id: id.clone(),
+                    created,
+                    workspace,
+                    headless,
+                    profile: String::new(),
+                    profile_hash: String::new(),
+                    base_url: String::new(),
+                    model: String::new(),
+                    reasoning_effort: String::new(),
+                    tools: Vec::new(),
+                    parent,
+                    task: None,
+                });
+                (header, Some(id), opened.into_iter().skip(1).collect())
+            }
+            _ => return None,
+        };
+    let first = lines.drain(..).find_map(|line| match serde_json::from_str(&line).ok()? {
+        Read::Message { message: Message::User { content }, .. } => Some(text_of(&content)),
+        _ => None,
     });
-    Some(Summary { path: path.to_path_buf(), header, modified, first })
+    Some(Summary { path: path.to_path_buf(), header, modified, first, sealed: sealed_as.is_some() })
 }
 
 /// The text of a message's content, without its images.
@@ -351,14 +497,14 @@ mod tests {
             parent: None,
             task: None,
         };
-        let mut session = Session::create(&root, header).unwrap();
+        let mut session = Session::create(&root, header, None).unwrap();
         session.push(Message::user("hi"), None).unwrap();
         session.end("finished", "done").unwrap();
 
         let text = fs::read_to_string(session.path()).unwrap();
         let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines.len(), 3);
-        let log = Log::read(session.path()).unwrap();
+        let log = Log::read(session.path(), None).unwrap();
         assert_eq!(log.header.id, session.header().id);
         assert_eq!(log.messages, vec![(Message::user("hi"), None)]);
         assert_eq!(lines[0]["type"], "session");
@@ -387,13 +533,13 @@ mod tests {
             parent: None,
             task: None,
         };
-        let mut session = Session::create(&root, header).unwrap();
+        let mut session = Session::create(&root, header, None).unwrap();
         session.push(Message::system("s"), None).unwrap();
         session.push(Message::user("long task"), None).unwrap();
         let fresh = vec![Message::system("s"), Message::user("summary")];
         session.compact(200_000, "summary", None, fresh.clone()).unwrap();
         assert_eq!(session.messages(), fresh.as_slice());
-        let log = Log::read(session.path()).unwrap();
+        let log = Log::read(session.path(), None).unwrap();
         assert_eq!(log.messages.len(), 4);
         assert_eq!(log.starts, [0, 2]);
         assert_eq!((log.start_of(1), log.start_of(3)), (0, 2));
@@ -418,7 +564,7 @@ mod tests {
             parent: None,
             task: None,
         };
-        let mut session = Session::create(&root, header).unwrap();
+        let mut session = Session::create(&root, header, None).unwrap();
         session.push(Message::system("s"), None).unwrap();
         session.push(Message::user("first"), None).unwrap();
         let path = session.path().to_path_buf();
@@ -427,12 +573,12 @@ mod tests {
         file.write_all(br#"{"type":"message","message":{"role":"assis"#).unwrap();
         drop(file);
 
-        assert_eq!(Log::read(&path).unwrap().messages.len(), 2);
-        let (mut session, _) = Session::open(&path).unwrap();
+        assert_eq!(Log::read(&path, None).unwrap().messages.len(), 2);
+        let (mut session, _) = Session::open(&path, None).unwrap();
         assert_eq!(session.messages().len(), 2);
         session.resumed("h").unwrap();
         session.push(Message::user("again"), None).unwrap();
-        let log = Log::read(&path).unwrap();
+        let log = Log::read(&path, None).unwrap();
         assert_eq!(log.messages.len(), 3);
         assert!(!fs::read_to_string(&path).unwrap().contains("assis"));
         drop(session);
@@ -441,11 +587,11 @@ mod tests {
         // looks: it goes, and the line written after it takes its place.
         let text = fs::read_to_string(&path).unwrap();
         fs::write(&path, text.strip_suffix('\n').unwrap()).unwrap();
-        assert_eq!(Log::read(&path).unwrap().messages.len(), 2);
-        let (mut session, log) = Session::open(&path).unwrap();
+        assert_eq!(Log::read(&path, None).unwrap().messages.len(), 2);
+        let (mut session, log) = Session::open(&path, None).unwrap();
         assert_eq!((log.messages.len(), session.messages().len()), (2, 2));
         session.push(Message::user("once more"), None).unwrap();
-        let log = Log::read(&path).unwrap();
+        let log = Log::read(&path, None).unwrap();
         assert_eq!(log.messages.len(), 3);
         assert_eq!(log.messages[2].0, Message::user("once more"));
         fs::remove_dir_all(root).unwrap();
@@ -472,17 +618,94 @@ mod tests {
     #[test]
     fn a_session_is_open_in_one_eidra_at_a_time() {
         let root = std::env::temp_dir().join(format!("eidra-lock-test-{}", std::process::id()));
-        let mut session = Session::create(&root, header("/work", false)).unwrap();
+        let mut session = Session::create(&root, header("/work", false), None).unwrap();
         session.push(Message::user("hi"), None).unwrap();
         let path = session.path().to_path_buf();
-        let busy = Session::open(&path).err().unwrap();
+        let busy = Session::open(&path, None).err().unwrap();
         assert!(busy.to_string().contains("open in another eidra"), "{busy}");
         drop(session);
         // Once it is left, another goes on with it, and has it to itself in turn.
-        let (again, _) = Session::open(&path).unwrap();
-        assert!(Session::open(&path).is_err());
+        let (again, _) = Session::open(&path, None).unwrap();
+        assert!(Session::open(&path, None).is_err());
         drop(again);
-        assert!(Session::open(&path).is_ok());
+        assert!(Session::open(&path, None).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_encrypted_log_reads_back_only_with_its_vault_and_goes_on_from_a_crash() {
+        let root = std::env::temp_dir().join(format!("eidra-sealed-test-{}", std::process::id()));
+        let vault = Arc::new(Vault::with_key([3; 32]));
+        let mut session =
+            Session::create(&root, header("/secret/work", false), Some(vault.clone())).unwrap();
+        session.push(Message::system("the system prompt"), None).unwrap();
+        session.push(Message::user("the password is swordfish"), None).unwrap();
+        let path = session.path().to_path_buf();
+        // Another eidra cannot go on with it while it is open.
+        assert!(in_use(&path));
+        let busy = Session::open(&path, Some(vault.clone())).err().unwrap();
+        assert!(busy.to_string().contains("open in another eidra"), "{busy}");
+        drop(session);
+        assert!(!in_use(&path));
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("swordfish") && !text.contains("system prompt"), "{text}");
+        assert!(text.lines().next().unwrap().contains("/secret/work"), "the envelope says where");
+        let locked = Log::read(&path, None).err().unwrap();
+        assert!(locked.to_string().contains("is encrypted"), "{locked}");
+        let other = Vault::with_key([4; 32]);
+        assert!(Log::read(&path, Some(&other)).is_err());
+        let log = Log::read(&path, Some(&vault)).unwrap();
+        assert!(log.sealed && log.header.workspace == "/secret/work");
+        assert_eq!(log.messages.len(), 2);
+
+        // A crash cut the last line short: it goes, and the session goes on after it.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"c2VhbGVkIGJ1dCBjdXQ").unwrap();
+        drop(file);
+        assert_eq!(Log::read(&path, Some(&vault)).unwrap().messages.len(), 2);
+        let (mut session, _) = Session::open(&path, Some(vault.clone())).unwrap();
+        session.push(Message::user("again"), None).unwrap();
+        drop(session);
+        let log = Log::read(&path, Some(&vault)).unwrap();
+        assert_eq!(log.messages.last().unwrap().0, Message::user("again"));
+
+        // A last line written whole but for its newline is cut short too: it goes, and the line
+        // sealed after it takes its place, so the log still reads back.
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, text.strip_suffix('\n').unwrap()).unwrap();
+        assert_eq!(Log::read(&path, Some(&vault)).unwrap().messages.len(), 2);
+        let (mut session, log) = Session::open(&path, Some(vault.clone())).unwrap();
+        assert_eq!(log.messages.len(), 2);
+        session.push(Message::user("once more"), None).unwrap();
+        drop(session);
+        let log = Log::read(&path, Some(&vault)).unwrap();
+        assert_eq!(log.messages.last().unwrap().0, Message::user("once more"));
+        assert_eq!(log.messages.len(), 3);
+
+        // Listed without the key: where and when, but not what was said.
+        let listed = &list(&root, None)[0];
+        assert!(listed.sealed && listed.first.is_none());
+        assert_eq!(listed.header.workspace, "/secret/work");
+        let listed = &list(&root, Some(&vault))[0];
+        assert_eq!(listed.first.as_deref(), Some("the password is swordfish"));
+        assert_eq!(listed.header.model, "m");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_plain_log_does_not_go_on_in_an_encrypted_directory() {
+        let root = std::env::temp_dir().join(format!("eidra-plain-test-{}", std::process::id()));
+        let mut session = Session::create(&root, header("/work", false), None).unwrap();
+        session.push(Message::user("hi"), None).unwrap();
+        let path = session.path().to_path_buf();
+        drop(session);
+        let vault = Arc::new(Vault::with_key([3; 32]));
+        // It can be read, but nothing more is written to it.
+        assert!(Log::read(&path, Some(&vault)).is_ok());
+        let refused = Session::open(&path, Some(vault)).err().unwrap();
+        assert!(refused.to_string().contains("is not encrypted"), "{refused}");
+        assert!(!list(&root, None)[0].sealed);
         fs::remove_dir_all(root).unwrap();
     }
 }

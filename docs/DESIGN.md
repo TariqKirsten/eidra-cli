@@ -561,7 +561,8 @@ Reference: codex-rs `tui`.
 - **eidra's own directory** (2026-10-27) is `~/.eidra`, or `$EIDRA_HOME`, and `.eidra` in the
   workspace for a user without a home. It holds the user's `AGENTS.md` (§11), `sessions/` and
   `checkpoints/`: one directory rather than the XDG split of `~/.config` and `~/.local/share`, so
-  that a container keeps all of it with one mount or one volume (the user's choice).
+  that a container keeps all of it with one mount or one volume (the user's choice). It is
+  encrypted by default (§18).
 - **Sessions** (M8, 2026-10-27): `eidra --continue` (`-c`) goes on with this directory's latest
   interactive session, `eidra --resume ID` (`-r`) with any session by its id or the start of it,
   and `eidra exec` takes both for unattended sessions; `eidra sessions` lists this directory's
@@ -600,9 +601,10 @@ Reference: codex-rs `tui`.
     commit, not its files.
   - **Exact bytes:** the repository's own attributes, which come before the project's, turn off
     the project's filters and its line-ending, `ident` and encoding conversions
-    (`* !filter -text -ident -working-tree-encoding`), so `/undo` puts each file back byte for
-    byte. Without them a project's `*.bat text eol=crlf` put a file written with LF back with
-    CRLF, `text=auto` lost a file's CRLFs, and a filter of the user's (a global one that strips
+    (`-text -ident -working-tree-encoding`, and `filter=eidra`: eidra's own in an encrypted
+    directory, §18, and no filter otherwise), so `/undo` puts each file back byte for byte.
+    Without them a project's `*.bat text eol=crlf` put a file written with LF back with CRLF,
+    `text=auto` lost a file's CRLFs, and a filter of the user's (a global one that strips
     notebooks' outputs, say) put a notebook back without them.
   - **`/undo`** puts back what the latest turn that changed files changed: files it modified or
     deleted come back as they were before it, and files it made are removed, with any directories
@@ -904,3 +906,83 @@ is compared with the same harness.
 - **Settings to tune with evals:** the compaction threshold, the thinking policy per kind of step,
   and tool-schema variants.
 - **ty:** is it good enough on real projects?
+
+## 18. Encryption at rest (2026-10-27)
+
+eidra's own directory, `~/.eidra`, holds what a session said and did, and the user's own
+AGENTS.md. At the user's request it is encrypted by default, with one password asked for each
+time eidra starts, so that a copy of the directory (a backup, the Docker volume) or another
+program reading it gives nothing away. Disk encryption still matters: it covers what this does not
+(the project, the swap, blocks an erase leaves).
+
+- **The key:** `vault.json` holds a random 32-byte key, sealed with one made from the password by
+  Argon2id (64 MiB, 3 passes, about half a second), so a password could change without encrypting
+  everything again (there is no command for that yet). Each use has a key of its own from it
+  (HKDF-SHA256), and everything is sealed with XChaCha20-Poly1305. A forgotten password loses
+  everything it sealed.
+- **When it is asked for:** the TUI asks for the password before it starts, three tries, on the
+  terminal without echo; eidra reads the keys itself, so Ctrl+C leaves the terminal as it was.
+  In a directory that is not encrypted yet it asks the user to choose one, twice, at least 8
+  characters; `EIDRA_VAULT=off` opts out, and the TUI scripts use it.
+  `eidra exec` never encrypts a directory, so evals and scripts run as before, but it asks for the
+  password of one that is, and so do `eidra sessions`, `eidra replay` and `eidra instructions`.
+- **Session logs:** the first line says only what finding and listing a log needs: its id, when
+  it began, its workspace, whether it ran unattended, and its parent. Every record after it, the
+  header first, is one line of base64: the record sealed, bound to the session and to its place
+  in the log, so lines cannot be moved or swapped unnoticed. The log stays append-only, and a last
+  line cut short by a crash, or without its newline, is dropped as in a plain log (§14): going on
+  cuts it off the file, and the next line sealed is numbered in its place. Subagents' logs are
+  sealed the same way. A plain log can be read in an encrypted directory, but does not go on
+  there: what was added would be plain. The lock on an open session (§14) also keeps
+  `/erase-unsecure` from erasing it. `eidra replay` does not save an encrypted session's replies.
+- **The user's AGENTS.md** is `AGENTS.md.enc`. A plain `AGENTS.md` left in the directory is
+  sealed in its place at the next unlock and removed, which is how it is set or changed;
+  `eidra instructions` prints it. The header's `instructions:` line still names it.
+- **What the tools write in plain text,** saved output and the shell's files, which bash writes and
+  the model reads back, is in memory instead (`$XDG_RUNTIME_DIR`, else `/dev/shm`), and goes with
+  the session. The shell's directory and environment are also kept sealed, so a resumed session's
+  shell starts where it was.
+- **Snapshots** (§14) stay, sealed: the repository's own attributes send every file through a
+  filter named `eidra`, and git runs this binary as its long-running filter process (`eidra
+  snapshot-filter`), which seals what goes in and opens what `/undo` puts back; `/diff` reads them
+  through it as a textconv. The nonce comes from a MAC of the contents, so a file seals the same
+  way each time and git still stores an unchanged file once and sees it unchanged; that shows
+  which files are equal, nothing more. The filter gets the snapshot key alone, in the environment
+  of the git command. Each turn's label is sealed into the commit's body. The names of the files
+  stay readable: hiding them would mean a snapshot store of eidra's own instead of git.
+  - The attributes' `-text -ident -working-tree-encoding` (§14) matter more here: git makes
+    those conversions to what the filter hands it, the sealed bytes, which then no longer opened,
+    and `/undo` lost the file (a review found it with a project's `*.bat text eol=crlf`).
+  - `/diff`'s summary is counted from the opened patch: git's would count the sealed bytes, as a
+    binary file's. A binary file shows as its size and a fingerprint, rather than its bytes.
+- **`/erase-unsecure`** lists the unencrypted sessions left (by workspace, with their size), and
+  `/erase-unsecure yes` erases them: their logs, their directories, their subagents' logs, and their
+  snapshots. Sessions open in another eidra are left alone.
+  - Their refs go, and git prunes at once every repository no open session uses: what they held,
+    and what snapshots that expired before left behind (§14 lets go of refs after 30 days, and
+    `gc --auto` rarely prunes). The repository's session indexes go first: an object only an
+    index holds would go with the prune, and the index would then name what is gone; each
+    session makes its own again, the same, at its next snapshot.
+  - A repository an open session uses is not pruned while it may be taking a snapshot: it is
+    marked, and a later `/erase-unsecure` prunes it.
+  - The logs go last, so that if git fails they are there for the next try.
+  - On an SSD or a copy-on-write filesystem the disk may keep erased blocks until it writes over
+    them.
+- **Not covered:** the project itself; an open session, which is decrypted in memory and on the
+  screen; the session list's metadata; and what was written before the directory was encrypted,
+  until `/erase-unsecure`. There is no `/secure` for one session: every session in an encrypted
+  directory is encrypted from its first line.
+
+Checks: unit tests for the vault, the sealed log (a crash, a whole line without its newline,
+resuming, the lock, listing), the filter protocol, textconv and the erase.
+`crates/eidra/tests/vault.rs` runs real git with this binary as the filter:
+- it finds no contents or labels among the repository's objects, while `/diff`, a resumed session
+  and `/undo` get them back whole;
+- a project's line-ending and `ident` rules leave `/undo` byte for byte;
+- an erase prunes a plain session's snapshot, and an encrypted session whose index held an object
+  that went still diffs and undoes.
+
+Each of the last two failed before its fix. `scripts/tui/offline.py` makes a vault at the first
+start, resumes with a wrong password then the right one, finds nothing readable in the log, and
+erases an unencrypted session. A review of the first version (2026-10-27) found the defects these
+cover.

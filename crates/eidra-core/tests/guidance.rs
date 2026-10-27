@@ -79,6 +79,7 @@ async fn an_unattended_run_hears_when_its_budget_is_nearly_spent() {
         headless: true,
         confirm: vec![],
         model_socket: None,
+        vault: None,
     };
     let mut agent = Agent::start(profile, options).unwrap();
     agent.push_user("go").unwrap();
@@ -100,6 +101,7 @@ async fn an_unattended_run_hears_when_its_budget_is_nearly_spent() {
         headless: true,
         confirm: vec![],
         model_socket: None,
+        vault: None,
     };
     let mut agent = Agent::start(profile, options).unwrap();
     agent.set_time_limit(Duration::from_millis(1));
@@ -136,6 +138,7 @@ async fn an_agent_behind_a_model_socket_is_told_there_is_no_network() {
         headless: true,
         confirm: vec![],
         model_socket: socket.map(Into::into),
+        vault: None,
     };
     let system = |agent: &Agent| log_messages(agent)[0]["content"].as_str().unwrap().to_owned();
     let vacuum = Agent::start(Profile::builtin().unwrap(), options(Some("/nonexistent.sock")));
