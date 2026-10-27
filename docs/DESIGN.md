@@ -187,7 +187,7 @@ Initial set (M1):
 |---|---|---|
 | `bash` | `command`, `timeout_s?`, `background?` | §6 |
 | `bash_output`, `bash_kill` | `id`, `wait_s?` | background jobs; `wait_s` waits for new output or the end |
-| `read` | `path`, `offset?`, `limit?` | text with line numbers; images as image parts; PDFs page by page, each as its text layer and its image (§10); `.ipynb` as cells |
+| `read` | `path`, `offset?`, `limit?` | text with line numbers; images as image parts; PDFs page by page, each as its text layer and its image (§10); `.ipynb` as cells; a path that does not exist names files of its name elsewhere in the workspace, as `edit` does |
 | `edit` | `path`, `old`, `new`, `replace_all?` | exact match, which must be unique unless `replace_all`; tolerates a differing leading or trailing newline and CRLF endings; needs no read first; a miss shows where `old` stopped matching, and the file's lines there |
 | `write` | `path`, `content` | an existing file not read this session, or changed since, is shown instead of replaced, and the same call then goes through |
 | `glob` | `pattern`, `path?` | gitignore-aware, in-process (`ignore`) |
