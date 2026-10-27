@@ -118,7 +118,7 @@ profile (`notepad $PROFILE`):
     function eidra {
       $name = Split-Path -Leaf $PWD
       docker run --rm -it `
-        -v "${PWD}:/work/${name}:ro" -w "/work/${name}" `
+        -v "${PWD}:/workspace/${name}:ro" -w "/workspace/${name}" `
         -v eidra-data:/home/eidra/.eidra `
         -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e COLORTERM=truecolor -e TZ=Africa/Johannesburg `
         --detach-keys "ctrl-^,ctrl-q" `
@@ -129,8 +129,9 @@ Then, in a project's folder, `eidra` starts a session, `eidra --continue` goes o
 and `eidra sessions` lists them; any other arguments go to eidra as they are.
 
 Where it differs from the Linux wrapper:
-- The project is mounted read-only (`:ro`) at `/work/<folder>`, so the agent reads and explains the
-  code but cannot change it. Leave out `:ro` to let it edit.
+- The project is mounted read-only (`:ro`) at `/workspace/<folder>`, so the agent reads and
+  explains the code but cannot change it. Leave out `:ro` to let it edit. The folder's name keeps
+  each project's sessions apart.
 - eidra's directory is a Docker volume, `eidra-data`, so sessions and checkpoints outlive the
   container; `docker volume rm eidra-data` deletes them.
 - There is no `--network host`: the container reaches the model server at `EIDRA_BASE_URL`, on your

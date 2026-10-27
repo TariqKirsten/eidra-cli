@@ -30,5 +30,5 @@ RUN pip install --no-cache-dir "uv==$UV_VERSION" "ruff==$RUFF_VERSION" "ty==$TY_
 COPY --from=build /usr/local/bin/eidra /usr/local/bin/eidra
 RUN mkdir -m 1777 /home/eidra
 ENV HOME=/home/eidra
-WORKDIR /work
+WORKDIR /workspace
 ENTRYPOINT ["tini", "--", "eidra"]
