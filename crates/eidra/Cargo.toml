@@ -17,4 +17,3 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
-zeroize.workspace = true

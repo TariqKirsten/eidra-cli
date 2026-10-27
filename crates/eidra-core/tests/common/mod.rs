@@ -168,7 +168,6 @@ pub fn agent_with(base_url: String, dir: &Path, change: impl FnOnce(&mut Profile
         headless: false,
         confirm: vec![],
         model_socket: None,
-        vault: None,
     };
     Agent::start(profile, options).unwrap()
 }

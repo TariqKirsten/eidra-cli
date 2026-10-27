@@ -73,7 +73,6 @@ What it mounts and passes in:
 | `EIDRA_BASE_URL`, `EIDRA_MODEL` | another server or model than the profile's |
 | `EIDRA_PROFILE` | a profile directory instead of the built-in one |
 | `EIDRA_HOME` | eidra's own directory instead of `~/.eidra` |
-| `EIDRA_VAULT` | `off` leaves eidra's directory unencrypted, with no password |
 | `EIDRA_IMAGE` | the image `scripts/eidra-docker` runs (default `eidra`) |
 | `TERM`, `COLORTERM` | your terminal's, for colours and keys |
 
@@ -127,8 +126,7 @@ profile (`notepad $PROFILE`):
     }
 
 Then, in a project's folder, `eidra` starts a session, `eidra --continue` goes on with the last one
-and `eidra sessions` lists them; any other arguments go to eidra as they are. The first start asks
-you to choose the password that encrypts what the volume keeps (Encryption, below).
+and `eidra sessions` lists them; any other arguments go to eidra as they are.
 
 Where it differs from the Linux wrapper:
 - The project is mounted read-only (`:ro`) at `/workspace/<folder>`, so the agent reads and
@@ -159,7 +157,7 @@ terminal's own scrollback; at the bottom are the reply streaming in, the input b
 - A command on the confirm list asks first: y runs it once, a for the rest of the session, n not.
 - `/help`, `/new` (a new session), `/compact` (go on from a summary of the conversation; words
   after it say what to keep), `/tasks` and `/stop` (subagents in the background), `/undo` and
-  `/diff` (below), `/erase-unsecure` (below), `/reasoning`, `/quit`.
+  `/diff` (below), `/reasoning`, `/quit`.
 
 Ask the agent to do something in the background, such as "start a subagent to build a calculator
 while we chat", and a subagent works on it while you go on talking; its report comes back to the
@@ -182,24 +180,6 @@ yours, whose instructions go into every session, the session logs and the checkp
 header names the `AGENTS.md` files it read: yours and the project's, or none. Each
 session is logged as JSON lines under `~/.eidra/sessions`, or wherever `--session-dir` says, and
 the path is printed when you quit.
-
-### Encryption
-
-`~/.eidra` is encrypted. The first time `eidra` starts, it asks you to choose a password, and
-after that it asks for it each time it starts: it encrypts your sessions, your `AGENTS.md` and the
-snapshots `/undo` uses, and without it none of them can be read again. What the agent saves while
-it works, and the shell's files, stay in memory. A session's header says `encrypted`.
-
-- To set or change your `AGENTS.md`, put a plain one in `~/.eidra`: the next start encrypts it and
-  removes the plain one. `eidra instructions` prints it.
-- Sessions from before the encryption stay unencrypted, and do not go on in it: `/erase-unsecure`
-  lists them, and `/erase-unsecure yes` erases them, with their snapshots.
-- `eidra exec` never encrypts `~/.eidra`, so scripts and evals run as before, but asks for the
-  password once it is.
-- `EIDRA_VAULT=off` leaves it unencrypted. The names of the files in `/undo` snapshots stay
-  readable, and so do each session's id, time and directory.
-
-docs/DESIGN.md §18 has the details.
 
 ## Unattended runs
 

@@ -28,8 +28,6 @@ use crossterm::execute;
 use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
 use eidra_core::checkpoint::{Checkpoints, Undone};
 use eidra_core::display::{clip, compact, describe_call, duration, summarise, thousands};
-use eidra_core::erase::{self, Erased, Unencrypted};
-use eidra_core::vault::Vault;
 use eidra_core::{
     Agent, AgentOptions, Approval, Background, Decision, Event, Frontend, Interrupter, Log,
     Outcome, Profile, Report, RequestStats, text_of,
@@ -59,8 +57,6 @@ pub struct Options {
     pub checkpoints: Option<PathBuf>,
     /// The log of a session to go on with, instead of starting one.
     pub resume: Option<PathBuf>,
-    /// eidra's directory is encrypted, with this key (docs/DESIGN.md §18).
-    pub vault: Option<Arc<Vault>>,
 }
 
 /// Requests one turn may make before the turn goes back to the user.
@@ -97,7 +93,6 @@ const HELP: &[(&str, &str)] = &[
     ("!command", "run a command in the workspace; the agent sees it with your next message"),
     ("@path, tab", "attach a file to the message; tab completes the path"),
     ("/compact [what]", "go on from a summary of the conversation, keeping what you name"),
-    ("/erase-unsecure", "list the unencrypted sessions left in ~/.eidra; with yes, erase them"),
     ("/undo", "put back the files the last turn changed; again for the turn before"),
     ("/diff [all]", "what changed since the last turn began, or since the session's first"),
     ("/new", "start a new session"),
@@ -137,7 +132,6 @@ fn start(options: &Options) -> Result<Agent> {
 
 fn agent_options(options: &Options) -> AgentOptions {
     AgentOptions {
-        vault: options.vault.clone(),
         workspace: options.workspace.clone(),
         session_root: options.session_root.clone(),
         headless: false,
@@ -190,8 +184,6 @@ enum Done {
         diff: Result<Option<(usize, String)>, String>,
     },
     Undo(Result<Option<Undone>, String>),
-    /// What `/erase-unsecure yes` erased.
-    Erase(Result<Erased, String>),
     /// A command typed after `!`: its output, and how it ended unless with 0.
     Command {
         command: String,
@@ -436,8 +428,7 @@ impl<W: Write> App<W> {
             home_relative(workspace)
         );
         let session = self.agent.as_ref().map_or("", Agent::session_id);
-        let encrypted = if self.options.vault.is_some() { " · encrypted" } else { "" };
-        let second = format!("session {session}{encrypted} · /help for keys and commands");
+        let second = format!("session {session} · /help for keys and commands");
         let third = self.instructions_line();
         let lines = vec![
             Line::styled(first, theme::BOLD),
@@ -484,18 +475,15 @@ impl<W: Write> App<W> {
                  tools, and the rest of the profile is the new one",
             );
         }
-        if self.options.checkpoints.is_some() {
-            let found = match new_checkpoints(&self.options, &workspace, &session) {
-                Ok(checkpoints) => checkpoints.resumed().await,
-                Err(why) => Err(why),
-            };
+        if let Some(root) = &self.options.checkpoints {
+            let found = Checkpoints::resume(root, &workspace, &session).await;
             self.checkpoints = found.map(|checkpoints| Arc::new(Mutex::new(checkpoints)));
         }
     }
 
     /// The last conversation of the session's log, as it was shown while it happened.
     fn history(&mut self) {
-        let log = match Log::read(&self.log, self.options.vault.as_deref()) {
+        let log = match Log::read(&self.log) {
             Ok(log) => log,
             Err(e) => return self.error(&format!("reading the session's log: {}", causes(&e))),
         };
@@ -1045,7 +1033,6 @@ impl<W: Write> App<W> {
             "/tasks" => self.list_tasks(),
             "/stop" => self.stop_tasks(rest),
             "/compact" => self.compact_conversation(rest),
-            "/erase-unsecure" => self.erase_unsecure(rest),
             "/undo" => self.undo(),
             "/diff" => self.diff(rest),
             "/reasoning" => self.toggle_reasoning(),
@@ -1142,41 +1129,6 @@ impl<W: Write> App<W> {
         self.turn = Some(turn);
     }
 
-    /// Lists the unencrypted sessions left in an encrypted eidra directory, and with `yes`
-    /// erases them, with their saved files and snapshots (docs/DESIGN.md §18).
-    fn erase_unsecure(&mut self, rest: &str) {
-        if self.options.vault.is_none() {
-            self.notice(
-                "~/.eidra is not encrypted, so every session in it is unencrypted: \
-                 /erase-unsecure erases nothing then",
-            );
-            return;
-        }
-        if self.job.is_some() {
-            self.notice("the last /diff, /undo or command has not finished yet");
-            return;
-        }
-        let root = self.options.session_root.clone();
-        let checkpoints = self.options.checkpoints.clone().unwrap_or_default();
-        let current = self.agent.as_ref().map_or(String::new(), |a| a.session_id().to_owned());
-        let found = erase::find(&root, &checkpoints, &current);
-        if found.sessions.is_empty() && found.pending == 0 {
-            let open = match found.open {
-                0 => String::new(),
-                n => format!(" but {n} open in another eidra, left alone"),
-            };
-            return self.info(&format!("there are no unencrypted sessions{open}"));
-        }
-        if rest != "yes" {
-            let lines = erase_lines(&found);
-            return self.commit(Block::Info, lines);
-        }
-        self.job =
-            Some(Box::pin(
-                async move { Done::Erase(erase::erase(&found, &root, &checkpoints).await) },
-            ));
-    }
-
     /// Puts back the files the last turn that changed any changed, through the checkpoints.
     fn undo(&mut self) {
         if self.turn.is_some() {
@@ -1265,27 +1217,6 @@ impl<W: Write> App<W> {
             Done::Undo(Ok(Some(undone))) => self.undone(undone),
             Done::Diff { diff: Err(why), .. } => self.error(&format!("/diff: {why}")),
             Done::Undo(Err(why)) => self.error(&format!("/undo: {why}")),
-            Done::Erase(Ok(erased)) => {
-                let plural = |n: usize| if n == 1 { "" } else { "s" };
-                self.info(&format!(
-                    "erased {} unencrypted session{} and the snapshots of {}; the disk may keep \
-                     their blocks until it writes over them",
-                    erased.sessions,
-                    plural(erased.sessions),
-                    erased.snapshots
-                ));
-                if erased.pending > 0 {
-                    let (n, which) = match erased.pending {
-                        1 => (1, "repository is"),
-                        n => (n, "repositories are"),
-                    };
-                    self.notice(&format!(
-                        "{n} snapshot {which} in use by an open session, and still hold some of \
-                         it: /erase-unsecure yes again once that session ends"
-                    ));
-                }
-            }
-            Done::Erase(Err(why)) => self.error(&format!("/erase-unsecure: {why}")),
             Done::Command { command, output, status } => {
                 self.command_ended(command, output, status)
             }
@@ -1597,27 +1528,9 @@ async fn job_done(job: &mut Option<Job>) -> Done {
 
 /// The session's checkpoints, if the options have a place for them and the workspace allows them.
 fn checkpoints(options: &Options, agent: &Agent) -> Result<Arc<Mutex<Checkpoints>>, String> {
-    let checkpoints = new_checkpoints(options, agent.workspace(), agent.session_id())?;
-    Ok(Arc::new(Mutex::new(checkpoints)))
-}
-
-/// A session's checkpoints, sealed in an encrypted eidra directory: git then runs this very
-/// binary as its filter.
-fn new_checkpoints(
-    options: &Options,
-    workspace: &Path,
-    session: &str,
-) -> Result<Checkpoints, String> {
     let root = options.checkpoints.as_ref().ok_or("this session has none")?;
-    let checkpoints = Checkpoints::new(root, workspace, session)?;
-    Ok(match &options.vault {
-        Some(vault) => {
-            let program = std::env::current_exe()
-                .map_err(|e| format!("eidra cannot find its own binary, git's filter: {e}"))?;
-            checkpoints.sealed(&program, Arc::clone(vault))
-        }
-        None => checkpoints,
-    })
+    let checkpoints = Checkpoints::new(root, agent.workspace(), agent.session_id())?;
+    Ok(Arc::new(Mutex::new(checkpoints)))
 }
 
 /// A diff's lines, coloured as git colours them, the first `most` of them.
@@ -1647,53 +1560,6 @@ fn diff_lines(diff: &str, most: usize) -> Vec<Line> {
     if rest > 0 {
         lines.push(Line::styled(format!("… {} more lines", thousands(rest as u64)), theme::DIM));
     }
-    lines
-}
-
-/// What `/erase-unsecure` would erase, by workspace, before the user says yes.
-fn erase_lines(found: &Unencrypted) -> Vec<Line> {
-    let mut lines = Vec::new();
-    let subagents = found.sessions.iter().filter(|s| s.subagent).count();
-    let sessions = found.sessions.len() - subagents;
-    if !found.sessions.is_empty() {
-        let plural = if sessions == 1 { "" } else { "s" };
-        let size = compact(found.bytes as f64);
-        let mut head = format!("{sessions} unencrypted session{plural} ({size}B");
-        if subagents > 0 {
-            head.push_str(&format!(", and {subagents} of their subagents"));
-        }
-        head.push_str("), with their saved files and /undo snapshots:");
-        lines.push(Line::styled(head, theme::BOLD));
-        let mut by_workspace: Vec<(String, usize)> = Vec::new();
-        for session in found.sessions.iter().filter(|s| !s.subagent) {
-            match by_workspace.iter_mut().find(|(w, _)| *w == session.workspace) {
-                Some((_, n)) => *n += 1,
-                None => by_workspace.push((session.workspace.clone(), 1)),
-            }
-        }
-        for (workspace, n) in by_workspace {
-            let workspace = home_relative(Path::new(&workspace));
-            lines.push(Line::styled(format!("  {workspace}: {n}"), theme::DIM));
-        }
-    }
-    if found.pending > 0 {
-        let which = if found.pending == 1 { "repository" } else { "repositories" };
-        lines.push(Line::styled(
-            format!(
-                "what an earlier erase left in {} snapshot {which}, which an open session was \
-                 using then",
-                found.pending
-            ),
-            theme::BOLD,
-        ));
-    }
-    if found.open > 0 {
-        lines.push(Line::styled(
-            format!("  and {} open in another eidra, which are left alone", found.open),
-            theme::DIM,
-        ));
-    }
-    lines.push(Line::plain("/erase-unsecure yes erases them; it cannot be undone"));
     lines
 }
 
@@ -1894,7 +1760,6 @@ mod tests {
                 confirm: Vec::new(),
                 checkpoints: Some(dir.join("checkpoints")),
                 resume: None,
-                vault: None,
             };
             std::fs::create_dir_all(&options.workspace).unwrap();
             let agent = start(&options).unwrap();

@@ -7,10 +7,6 @@
 //! commit on a ref of the session's own, `refs/eidra/<session>`, whose subjects say which turn it
 //! belongs to, so a resumed session finds its turns again. The project's ignore files apply, and
 //! a few defaults for caches and environments; a new file over 8 MiB is left out for good.
-//!
-//! In an encrypted eidra directory (§18) git sends every file through eidra's filter, which
-//! seals what goes into a snapshot and opens what comes out, and each turn's label goes into the
-//! commit's message sealed. The names of the files stay readable.
 
 use std::collections::HashSet;
 use std::fs;
@@ -18,18 +14,12 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use zeroize::Zeroizing;
 
-use crate::snapshot_filter::{KEY_ENV, key_hex};
 use crate::text::fnv1a;
-use crate::vault::{Purpose, Vault};
 
 /// The longest one git command may take. Past it, checkpoints are off for the session.
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -55,16 +45,10 @@ __pycache__/
 .tox/
 /target/
 ";
-/// Every file goes through eidra's filter, and is compared through it, and is kept as its exact
-/// bytes: the repository's own attributes come before the project's, so none of the project's
-/// filters, diff drivers, line-ending or encoding conversions apply. Git would make those to the
-/// sealed bytes, which would then no longer open, and /undo would lose the file. With no filter
-/// set up, in an eidra directory that is not encrypted, only the exact bytes remain.
-const ATTRIBUTES: &str = "* filter=eidra diff=eidra -text -ident -working-tree-encoding\n";
-/// Left in a repository whose pruning an erase put off, while an open session used it.
-const PRUNE_PENDING: &str = "eidra-prune-pending";
-/// What a sealed label starts with in a snapshot's message.
-const LABEL: &str = "label ";
+/// Every file is kept as its exact bytes, so that /undo puts back what was there: the
+/// repository's own attributes come before the project's, and turn off its filters and its
+/// line-ending, `ident` and encoding conversions.
+const ATTRIBUTES: &str = "* !filter -text -ident -working-tree-encoding\n";
 const IDENTITY: [(&str, &str); 4] = [
     ("GIT_AUTHOR_NAME", "eidra"),
     ("GIT_AUTHOR_EMAIL", "eidra@localhost"),
@@ -114,17 +98,6 @@ pub struct Checkpoints {
     next: usize,
     /// The repository has been made, if it had to be.
     ready: bool,
-    sealed: Option<Sealed>,
-}
-
-/// What the snapshots of an encrypted eidra directory need.
-struct Sealed {
-    /// The eidra binary, which git runs as the filter.
-    program: PathBuf,
-    /// The snapshot key, as the filter gets it.
-    key: Zeroizing<String>,
-    /// For the turns' labels.
-    vault: Arc<Vault>,
 }
 
 impl Checkpoints {
@@ -136,7 +109,9 @@ impl Checkpoints {
         if workspace == Path::new("/") || home.is_some_and(|home| home == workspace) {
             return Err("they are off in the home and root directories, too big to snapshot".into());
         }
-        let git_dir = root.join(repository_name(&workspace));
+        let name = workspace.file_name().map(|n| n.to_string_lossy().into_owned());
+        let hash = fnv1a(workspace.as_os_str().as_bytes()) as u32;
+        let git_dir = root.join(format!("{}-{hash:08x}", name.unwrap_or_default()));
         Ok(Checkpoints {
             root: root.to_path_buf(),
             index: git_dir.join(format!("eidra-index-{session}")),
@@ -148,29 +123,16 @@ impl Checkpoints {
             off: None,
             next: 1,
             ready: false,
-            sealed: None,
         })
-    }
-
-    /// Seals the snapshots with `vault`'s key, through `program`, the eidra binary, which git
-    /// runs as its filter (`eidra snapshot-filter`).
-    pub fn sealed(mut self, program: &Path, vault: Arc<Vault>) -> Self {
-        let key = key_hex(&vault.snapshot_key());
-        self.sealed = Some(Sealed { program: program.to_path_buf(), key, vault });
-        self
     }
 
     /// The checkpoints of a session that may have turns already, read from its ref.
     pub async fn resume(root: &Path, workspace: &Path, session: &str) -> Result<Self, String> {
-        Self::new(root, workspace, session)?.resumed().await
-    }
-
-    /// These checkpoints, with the turns a session that goes on already had.
-    pub async fn resumed(mut self) -> Result<Self, String> {
-        if self.git_dir.join("HEAD").exists() {
-            self.load().await?;
+        let mut checkpoints = Self::new(root, workspace, session)?;
+        if checkpoints.git_dir.join("HEAD").exists() {
+            checkpoints.load().await?;
         }
-        Ok(self)
+        Ok(checkpoints)
     }
 
     /// Makes the repository if there is none yet.
@@ -257,19 +219,13 @@ impl Checkpoints {
             return Ok(());
         }
         self.last = Some(String::from_utf8_lossy(&found.stdout).trim().to_owned());
-        let format = "--format=%H%x00%s%x00%b%x1e";
-        let log = self.git(&["log", "--reverse", format, &self.reference]).await?;
-        for record in log.split('\x1e') {
-            let mut fields = record.trim_start_matches('\n').splitn(3, '\0');
-            let (Some(commit), Some(subject)) = (fields.next(), fields.next()) else {
+        let log = self.git(&["log", "--reverse", "--format=%H %s", &self.reference]).await?;
+        for line in log.lines() {
+            let Some((commit, subject)) = line.split_once(' ') else {
                 continue;
             };
-            let body = fields.next().unwrap_or_default();
             if let Some((number, label)) = subject.strip_prefix("before ").and_then(turn_number) {
-                let label = match self.open_label(body) {
-                    Some(label) => label,
-                    None => label.strip_prefix(": ").unwrap_or(label).to_owned(),
-                };
+                let label = label.strip_prefix(": ").unwrap_or(label).to_owned();
                 let before = commit.to_owned();
                 self.next = self.next.max(number + 1);
                 self.turns.push(Turn { number, label, before, after: None });
@@ -305,15 +261,7 @@ impl Checkpoints {
         let number = self.next;
         let label = label.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
         let label = crate::display::clip(label, 60);
-        // Sealed, the label goes into the message's body, and the subject names the turn alone.
-        let message = match &self.sealed {
-            Some(sealed) => {
-                let label = sealed.vault.seal(Purpose::File, LABEL.as_bytes(), label.as_bytes());
-                format!("before {number}\n\n{LABEL}{}", STANDARD.encode(label))
-            }
-            None => format!("before {number}: {label}"),
-        };
-        match self.snapshot(&message).await {
+        match self.snapshot(&format!("before {number}: {label}")).await {
             Ok(before) => {
                 self.next = number + 1;
                 self.turns.push(Turn { number, label, before, after: None });
@@ -362,25 +310,9 @@ impl Checkpoints {
             return Ok(None);
         };
         let now = self.tree().await?;
-        let diff = if self.sealed.is_some() {
-            // Compared through eidra's filter, which opens them. git's own summary would count
-            // the sealed bytes, as a binary file's: this one counts the opened patch's lines.
-            let args = ["diff", "--no-color", "--no-ext-diff", "--textconv", "--patch"];
-            let patch = self.git(&[&args[..], &[&before, &now]].concat()).await?;
-            format!("{}{patch}", summary(&patch))
-        } else {
-            let args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--stat=100"];
-            self.git(&[&args[..], &["--patch", &before, &now]].concat()).await?
-        };
+        let args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--stat=100"];
+        let diff = self.git(&[&args[..], &["--patch", &before, &now]].concat()).await?;
         Ok(Some((number, diff)))
-    }
-
-    /// A turn's label, sealed in its message's body, if it was and it opens.
-    fn open_label(&self, body: &str) -> Option<String> {
-        let sealed = &self.sealed.as_ref()?.vault;
-        let line = body.lines().find_map(|line| line.strip_prefix(LABEL))?;
-        let label = sealed.open(Purpose::File, LABEL.as_bytes(), &STANDARD.decode(line).ok()?);
-        String::from_utf8(label.ok()?).ok()
     }
 
     /// Puts back the files the latest turn changed, the turns that changed nothing aside. A file
@@ -498,9 +430,9 @@ impl Checkpoints {
     }
 
     /// Records the workspace as a commit after the last one, on the session's ref.
-    async fn snapshot(&mut self, message: &str) -> Result<String, String> {
+    async fn snapshot(&mut self, subject: &str) -> Result<String, String> {
         let tree = self.tree().await?;
-        let mut args = vec!["commit-tree", &tree, "-m", message];
+        let mut args = vec!["commit-tree", &tree, "-m", subject];
         let last = self.last.clone();
         if let Some(parent) = &last {
             args.extend(["-p", parent]);
@@ -584,18 +516,6 @@ impl Checkpoints {
         ] {
             command.args(["-c", setting]);
         }
-        if let Some(sealed) = &self.sealed {
-            // git runs these through the shell.
-            let program = shell_quote(&sealed.program.to_string_lossy());
-            command
-                .arg("-c")
-                .arg(format!("filter.eidra.process={program} snapshot-filter process"));
-            command.args(["-c", "filter.eidra.required=true"]);
-            command
-                .arg("-c")
-                .arg(format!("diff.eidra.textconv={program} snapshot-filter textconv"));
-            command.env(KEY_ENV, sealed.key.as_str());
-        }
         command
             .args(args)
             .current_dir(&self.workspace)
@@ -607,141 +527,6 @@ impl Checkpoints {
             .env_remove("GIT_NAMESPACE");
         command
     }
-}
-
-/// The name of the repository, under the checkpoints' root, that keeps the snapshots of
-/// `workspace`, a canonical path.
-pub fn repository_name(workspace: &Path) -> String {
-    let name = workspace.file_name().map(|n| n.to_string_lossy().into_owned());
-    let hash = fnv1a(workspace.as_os_str().as_bytes()) as u32;
-    format!("{}-{hash:08x}", name.unwrap_or_default())
-}
-
-/// What `forget_sessions` did.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Forgotten {
-    /// Sessions whose snapshots went.
-    pub sessions: usize,
-    /// Repositories whose pruning waits, since an open session uses them.
-    pub pending: usize,
-}
-
-/// Lets go of the snapshots of the sessions `ids` in every repository under `root`, and has git
-/// remove at once, rather than after its two weeks, every object nothing refers to any more:
-/// theirs, and what snapshots that expired before left behind (§14). A repository named in
-/// `busy` is used by an open session, which may be adding a snapshot as it goes: its refs go,
-/// and it is marked to be pruned by a later erase.
-pub async fn forget_sessions(
-    root: &Path,
-    ids: &HashSet<String>,
-    busy: &HashSet<String>,
-) -> Result<Forgotten, String> {
-    let Ok(entries) = fs::read_dir(root) else {
-        return Ok(Forgotten::default());
-    };
-    let mut forgotten = Forgotten::default();
-    for entry in entries.flatten() {
-        let git_dir = entry.path();
-        if !git_dir.join("HEAD").exists() {
-            continue;
-        }
-        let refs = repository_git(&git_dir, &["for-each-ref", "--format=%(refname)"], None).await?;
-        let gone: Vec<&str> = refs
-            .lines()
-            .filter(|r| r.strip_prefix("refs/eidra/").is_some_and(|id| ids.contains(id)))
-            .collect();
-        if !gone.is_empty() {
-            let input: String = gone.iter().map(|r| format!("delete {r}\n")).collect();
-            repository_git(&git_dir, &["update-ref", "--stdin"], Some(input.as_bytes())).await?;
-            forgotten.sessions += gone.len();
-        }
-        if busy.contains(&entry.file_name().to_string_lossy().into_owned()) {
-            if !gone.is_empty() {
-                fs::write(git_dir.join(PRUNE_PENDING), "").map_err(|e| e.to_string())?;
-            }
-            forgotten.pending += usize::from(git_dir.join(PRUNE_PENDING).exists());
-            continue;
-        }
-        // No session is open on it, so no index is in use. An object only an index holds would
-        // go with the prune and leave the index naming what is gone: the indexes go first, and
-        // each session makes its own again, the same, at its next snapshot.
-        for entry in fs::read_dir(&git_dir).map_err(|e| e.to_string())?.flatten() {
-            if entry.file_name().to_string_lossy().starts_with("eidra-index-") {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-        repository_git(&git_dir, &["gc", "--prune=now", "--quiet"], None).await?;
-        let _ = fs::remove_file(git_dir.join(PRUNE_PENDING));
-    }
-    Ok(forgotten)
-}
-
-/// Repositories under `root` whose pruning an erase put off.
-pub fn prune_pending(root: &Path) -> usize {
-    let Ok(entries) = fs::read_dir(root) else {
-        return 0;
-    };
-    entries.flatten().filter(|entry| entry.path().join(PRUNE_PENDING).exists()).count()
-}
-
-/// git's `--stat` summary of a patch, counted from its lines.
-fn summary(patch: &str) -> String {
-    let mut files: Vec<(String, usize, usize)> = Vec::new();
-    let mut in_hunk = false;
-    for line in patch.lines() {
-        if let Some(paths) = line.strip_prefix("diff --git ") {
-            let path = paths.rsplit_once(" b/").map_or(paths, |(_, b)| b);
-            files.push((path.to_owned(), 0, 0));
-            in_hunk = false;
-        } else if line.starts_with("@@") {
-            in_hunk = true;
-        } else if let Some(file) = files.last_mut().filter(|_| in_hunk) {
-            // Lines in a hunk only: a removed line starting "-- " reads like the "--- " header.
-            match line.as_bytes().first() {
-                Some(b'+') => file.1 += 1,
-                Some(b'-') => file.2 += 1,
-                _ => {}
-            }
-        }
-    }
-    if files.is_empty() {
-        return String::new();
-    }
-    let width = files.iter().map(|(path, ..)| path.chars().count()).max().unwrap_or(0);
-    let most = files.iter().map(|(_, added, removed)| added + removed).max().unwrap_or(0);
-    let digits = most.to_string().len();
-    // The bars fit in 40 columns, as git's do in a narrow terminal.
-    let scale = |n: usize| if most > 40 { (n * 40).div_ceil(most) } else { n };
-    let mut out = String::new();
-    let (mut added, mut removed) = (0, 0);
-    for (path, plus, minus) in &files {
-        let bar = format!("{}{}", "+".repeat(scale(*plus)), "-".repeat(scale(*minus)));
-        out.push_str(&format!(" {path:<width$} | {:>digits$} {bar}\n", plus + minus));
-        added += plus;
-        removed += minus;
-    }
-    let plural =
-        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    out.push_str(&format!(
-        " {} changed, {}, {}\n\n",
-        plural(files.len(), "file", "files"),
-        plural(added, "insertion(+)", "insertions(+)"),
-        plural(removed, "deletion(-)", "deletions(-)")
-    ));
-    out
-}
-
-/// git on a snapshot repository alone, with no work tree.
-async fn repository_git(
-    git_dir: &Path,
-    args: &[&str],
-    input: Option<&[u8]>,
-) -> Result<String, String> {
-    let mut command = Command::new("git");
-    command.arg("--git-dir").arg(git_dir).args(["-c", "core.hooksPath=/dev/null"]).args(args);
-    command.env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE").env_remove("GIT_NAMESPACE");
-    let output = succeeded(output(&mut command, args[0], input).await?, args[0])?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Runs git, with `input` on its stdin, and returns what it wrote.
@@ -770,11 +555,6 @@ fn failure(what: &str, output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let why = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("it failed");
     format!("git {what}: {}", why.trim())
-}
-
-/// `text` quoted for the shell.
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Whether `inner` is below the directory `outer`.
@@ -1046,19 +826,6 @@ mod tests {
         new.end().await.unwrap();
         let refs = new.git(&["for-each-ref", "--format=%(refname)", "refs/eidra/"]).await.unwrap();
         assert_eq!(refs, "refs/eidra/new\n");
-    }
-
-    #[test]
-    fn the_summary_of_a_patch_counts_its_hunks_lines() {
-        let patch = "diff --git a/q.sql b/q.sql\nindex 1..2 100644\n--- a/q.sql\n+++ b/q.sql\n\
-                     @@ -1,2 +1,2 @@\n--- a comment\n+select 2;\n keep\n\
-                     diff --git a/new.py b/new.py\n--- /dev/null\n+++ b/new.py\n@@ -0,0 +1 @@\n\
-                     +print()\n";
-        assert_eq!(
-            summary(patch),
-            " q.sql  | 2 +-\n new.py | 1 +\n 2 files changed, 2 insertions(+), 1 deletion(-)\n\n"
-        );
-        assert_eq!(summary(""), "");
     }
 
     #[test]

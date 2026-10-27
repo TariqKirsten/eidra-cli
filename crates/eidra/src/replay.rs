@@ -48,9 +48,7 @@ pub struct ReplayArgs {
 }
 
 pub async fn run(args: ReplayArgs) -> Result<()> {
-    let here = std::env::current_dir().context("the current directory")?;
-    let vault = crate::vault::open(&eidra_core::eidra_home(&here), false)?;
-    let log = Log::read(&args.session, vault.as_deref())?;
+    let log = Log::read(&args.session)?;
     let header = &log.header;
     let profile = match &args.profile {
         Some(dir) => Profile::load(dir)?,
@@ -107,11 +105,8 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
     let api_key = profile.api_key_env.as_deref().and_then(|name| std::env::var(name).ok());
     let api_key = api_key.filter(|key| !key.is_empty());
     let client = Client::new(&header.base_url, api_key, args.model_socket.as_deref())?;
-    // An encrypted session's replies are not written out: they would be its words in plain text.
-    let out = (!log.sealed).then(|| args.session.with_extension("").join("replays"));
-    if let Some(out) = &out {
-        fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
-    }
+    let out = args.session.with_extension("").join("replays");
+    fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
 
     println!(
         "session {} reply {} of {replies}, after {} messages",
@@ -152,15 +147,10 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
             "finish_reason": turn.finish_reason,
             "stats": stats,
         });
-        if let Some(out) = &out {
-            let path = out.join(format!("reply{}-seed{seed}.json", args.reply));
-            fs::write(&path, serde_json::to_string_pretty(&sample)? + "\n")?;
-        }
+        let path = out.join(format!("reply{}-seed{seed}.json", args.reply));
+        fs::write(&path, serde_json::to_string_pretty(&sample)? + "\n")?;
     }
-    match &out {
-        Some(out) => println!("  samples saved in {}", out.display()),
-        None => println!("  samples not saved: the session is encrypted"),
-    }
+    println!("  samples saved in {}", out.display());
     Ok(())
 }
 

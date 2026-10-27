@@ -74,7 +74,7 @@ async fn a_long_conversation_goes_on_from_a_summary() {
     let first = next[1]["content"].as_str().unwrap();
     assert!(first.contains("5,010 tokens") && first.contains("SUMMARY: ran true"), "{first}");
     // The log keeps both, and says where the second begins.
-    let log = Log::read(agent.session_log(), None).unwrap();
+    let log = Log::read(agent.session_log()).unwrap();
     assert_eq!(log.starts, [0, 4]);
     let _ = std::fs::remove_dir_all(&dir);
 }

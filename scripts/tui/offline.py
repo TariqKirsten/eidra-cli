@@ -55,16 +55,11 @@ class Case:
         self.workspace.mkdir()
         self.sessions = []
 
-    def start(self, *args, server=None, cols=90, rows=24, vault=False, wait=True):
-        """eidra in the scenario's world, unencrypted unless `vault`; ready for keys unless not
-        to `wait`, as for a password."""
+    def start(self, *args, server=None, cols=90, rows=24):
         url = server.url if server else f"http://127.0.0.1:{free_port()}/v1"
         # Sessions and checkpoints go to an eidra directory of the scenario's own, not the user's.
         env = dict(os.environ, TERM="xterm-256color", EIDRA_HOME=str(self.dir / "eidra"))
         env.pop("RADIANCE_API_KEY", None)
-        env.pop("EIDRA_VAULT", None)
-        if not vault:
-            env["EIDRA_VAULT"] = "off"
         if self.image:
             # The wrapper works in the current directory and keeps sessions in EIDRA_HOME.
             argv = [str(ROOT / "scripts/eidra-docker"), "--base-url", url, *args]
@@ -74,14 +69,8 @@ class Case:
             argv += ["--session-dir", str(self.dir / "sessions"), *args]
         s = Session(argv, cols=cols, rows=rows, env=env, cwd=self.workspace)
         self.sessions.append(s)
-        if wait:
-            s.wait_for(idle, 10, "eidra to start")
+        s.wait_for(idle, 10, "eidra to start")
         return s
-
-    def logs(self):
-        """The session logs, wherever this run of eidra keeps them."""
-        return sorted([*(self.dir / "sessions").glob("*.jsonl"),
-                       *(self.dir / "eidra" / "sessions").glob("*.jsonl")])
 
     def show(self, s, what):
         if self.verbose:
@@ -111,21 +100,6 @@ def quit_cleanly(s):
     for mode in ["<1u", "?2004l", "?25h"]:
         assert mode in s.term.modes, f"{mode} was not restored: {s.term.modes}"
     assert not s.term.wraps, f"the terminal wrapped rows itself: {s.term.wraps}"
-
-
-def choose_password(s, password):
-    """Encrypts eidra's directory at its first start: a password too short, then one typed
-    twice; then the TUI starts."""
-    s.wait_for(lambda s: s.on_screen("new password:"), 10, "the question")
-    s.type("short\r")
-    s.wait_for(lambda s: s.on_screen("at least 8 characters"), 5, "too short")
-    s.type(f"{password}\r")
-    s.wait_for(lambda s: s.on_screen("the same again:"), 5, "once more")
-    s.type(f"{password}\r")
-    # The key is made from the password slowly on purpose, slower still in a debug build.
-    s.wait_for(idle, 20, "eidra to start")
-    assert s.contains("· encrypted ·"), s.dump()
-    assert not s.contains(password), f"the password was shown\n{s.dump()}"
 
 
 def interrupted_note():
@@ -304,55 +278,6 @@ def compact(case):
         assert [m["role"] for m in messages] == ["system", "user", "user"], messages
         assert "SUMMARY: one answer so far." in messages[1]["content"], messages[1]
         quit_cleanly(s)
-
-
-@scenario
-def vault(case):
-    """The first start encrypts eidra's directory with a password chosen twice; the log holds
-    nothing readable, and the next start asks for the password, again after a wrong one."""
-    replies = [reply(text="Hello back."), reply(text="Hello again.")]
-    with Server(replies) as server:
-        s = case.start(server=server, vault=True, wait=False)
-        choose_password(s, "correct horse")
-        s.type("hello there\r")
-        s.wait_for(lambda s: s.contains("Hello back.") and idle(s), 10, "the reply")
-        quit_cleanly(s)
-        [log] = case.logs()
-        text = log.read_text()
-        assert "hello there" not in text and "Hello back" not in text, text[:400]
-
-        s = case.start("--continue", server=server, vault=True, wait=False)
-        s.wait_for(lambda s: s.on_screen("password for"), 10, "the question")
-        s.type("wrong horse\r")
-        s.wait_for(lambda s: s.on_screen("that is not its password"), 20, "the wrong one")
-        s.type("correct horse\r")
-        s.wait_for(idle, 20, "eidra to start")
-        case.show(s, "resumed, encrypted")
-        assert s.contains("› hello there") and s.contains("Hello back."), s.dump()
-        quit_cleanly(s)
-
-
-@scenario
-def erase_unsecure(case):
-    """In an encrypted directory, /erase-unsecure lists the sessions from before, and erases
-    them when told yes."""
-    with Server([reply(text="A plain answer.")]) as server:
-        s = case.start(server=server)
-        s.type("an old question\r")
-        s.wait_for(lambda s: s.contains("A plain answer.") and idle(s), 10, "the reply")
-        quit_cleanly(s)
-    [old] = case.logs()
-    s = case.start(vault=True, wait=False)
-    choose_password(s, "correct horse")
-    s.type("/erase-unsecure\r")
-    s.wait_for(lambda s: s.contains("/erase-unsecure yes erases them"), 10, "the list")
-    case.show(s, "the list")
-    assert s.contains("1 unencrypted session ("), s.dump()
-    assert old.exists()
-    s.type("/erase-unsecure yes\r")
-    s.wait_for(lambda s: s.contains("erased 1 unencrypted session"), 10, "the erase")
-    assert not old.exists() and not old.with_suffix("").exists()
-    quit_cleanly(s)
 
 
 @scenario

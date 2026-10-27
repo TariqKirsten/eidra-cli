@@ -20,7 +20,6 @@ use tokio::time::Instant;
 use crate::confirm::{ConfirmPolicy, Verdict};
 use crate::event::{Approval, Decision, Frontend};
 use crate::text::clean_terminal_output;
-use crate::vault::{Purpose, Vault};
 
 const DEFAULT_TIMEOUT_S: u64 = 120;
 const MAX_TIMEOUT_S: u64 = 600;
@@ -64,18 +63,8 @@ pub struct Shell {
     env: BTreeMap<String, String>,
     workspace: PathBuf,
     state: PathBuf,
-    /// In an encrypted eidra directory, where the directory and environment are kept, sealed,
-    /// for a session that goes on later: `state` is then in memory.
-    sealed: Option<(PathBuf, Arc<Vault>)>,
     jobs: BTreeMap<u64, Job>,
     next_job: u64,
-}
-
-/// The shell's state as it is kept sealed.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SealedState {
-    cwd: PathBuf,
-    env: BTreeMap<String, String>,
 }
 
 struct Job {
@@ -97,13 +86,8 @@ struct JobLog {
 
 impl Shell {
     /// `state` is a directory for the shell's saved state. `secret_env` names a variable commands
-    /// must not see: the API key. `sealed` keeps the state encrypted, too, at a path of its own.
-    pub fn new(
-        workspace: &Path,
-        state: &Path,
-        secret_env: Option<&str>,
-        sealed: Option<(PathBuf, Arc<Vault>)>,
-    ) -> std::io::Result<Self> {
+    /// must not see: the API key.
+    pub fn new(workspace: &Path, state: &Path, secret_env: Option<&str>) -> std::io::Result<Self> {
         fs::create_dir_all(state)?;
         let mut env: BTreeMap<String, String> = std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
@@ -119,40 +103,12 @@ impl Shell {
             env,
             workspace: workspace.to_path_buf(),
             state: state.to_path_buf(),
-            sealed,
             jobs: BTreeMap::new(),
             next_job: 1,
         };
         // A resumed session's shell is where its last command left it.
         shell.load_state();
-        shell.load_sealed();
         Ok(shell)
-    }
-
-    /// The directory and environment a resumed encrypted session's last command left.
-    fn load_sealed(&mut self) {
-        let Some((path, vault)) = &self.sealed else {
-            return;
-        };
-        let Ok(sealed) = fs::read(path) else {
-            return;
-        };
-        let state = vault.open(Purpose::File, b"shell state", &sealed).ok();
-        if let Some(state) = state.and_then(|s| serde_json::from_slice::<SealedState>(&s).ok()) {
-            self.cwd = state.cwd;
-            self.env = state.env;
-        }
-    }
-
-    /// Keeps the directory and environment sealed, for a session that goes on later.
-    fn save_sealed(&self) {
-        let Some((path, vault)) = &self.sealed else {
-            return;
-        };
-        let state = SealedState { cwd: self.cwd.clone(), env: self.env.clone() };
-        if let Ok(json) = serde_json::to_vec(&state) {
-            let _ = fs::write(path, vault.seal(Purpose::File, b"shell state", &json));
-        }
     }
 
     /// The directory the next command starts in.
@@ -246,7 +202,6 @@ impl Shell {
             {
                 Ok(Ok(status)) => {
                     self.load_state();
-                    self.save_sealed();
                     describe_exit(status)
                 }
                 Ok(Err(e)) => return Err(format!("reading the command's output failed: {e}")),
@@ -596,7 +551,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("eidra-bash-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("sub")).unwrap();
-        (Shell::new(&dir, &dir.join(".state"), Some("HOME"), None).unwrap(), dir)
+        (Shell::new(&dir, &dir.join(".state"), Some("HOME")).unwrap(), dir)
     }
 
     async fn run(shell: &mut Shell, command: &str) -> String {
@@ -613,7 +568,7 @@ mod tests {
         assert_eq!(run(&mut shell, "exit 3").await, "[exit code 3]");
         assert_eq!(run(&mut shell, "echo $PAGER $TERM").await, "cat dumb");
         // A resumed session's shell starts where the last command left it.
-        let mut again = Shell::new(&_dir, &_dir.join(".state"), Some("HOME"), None).unwrap();
+        let mut again = Shell::new(&_dir, &_dir.join(".state"), Some("HOME")).unwrap();
         assert!(run(&mut again, "pwd").await.ends_with("/sub"));
         assert_eq!(run(&mut again, "echo $GREETING").await, "hi");
     }

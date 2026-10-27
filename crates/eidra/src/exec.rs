@@ -117,7 +117,7 @@ impl AgentArgs {
             if exact.is_file() {
                 return Ok(Some(exact));
             }
-            let sessions = list_sessions(&root, None);
+            let sessions = list_sessions(&root);
             let matching: Vec<_> =
                 sessions.iter().filter(|s| s.header.id.starts_with(id)).collect();
             return match matching.as_slice() {
@@ -130,7 +130,7 @@ impl AgentArgs {
             return Ok(None);
         }
         let here = workspace.canonicalize().context("the current directory")?;
-        let latest = list_sessions(&root, None)
+        let latest = list_sessions(&root)
             .into_iter()
             .find(|s| s.header.headless == headless && Path::new(&s.header.workspace) == here);
         match latest {
@@ -154,15 +154,12 @@ pub async fn run(args: ExecArgs) -> Result<i32> {
     let task = read_task(&args)?;
     let profile = args.agent.profile()?;
     let workspace = args.agent.workspace()?;
-    // An encrypted eidra directory is used, not made: evals and scripts run as they did.
-    let vault = crate::vault::open(&eidra_home(&workspace), false)?;
     let options = AgentOptions {
         session_root: args.agent.session_root(&workspace),
         workspace,
         headless: true,
         confirm: args.agent.confirm.clone(),
         model_socket: args.model_socket.clone(),
-        vault,
     };
     let mut agent = match args.agent.session_to_resume(&options.workspace, true)? {
         Some(log) => Agent::resume(profile, options, &log)?,
