@@ -19,6 +19,25 @@ fn options(dir: &std::path::Path, headless: bool) -> AgentOptions {
     }
 }
 
+#[test]
+fn a_session_knows_the_agents_md_files_it_began_with_and_keeps_them() {
+    let dir = scratch("instructions");
+    std::fs::write(dir.join("work/AGENTS.md"), "Use tabs.\n").unwrap();
+    let mut first = agent("http://127.0.0.1:9/v1".into(), &dir);
+    let read = first.instructions();
+    // The user's own, in ~/.eidra, may come first.
+    let ours = dir.join("work").canonicalize().unwrap().join("AGENTS.md");
+    assert_eq!(read.last(), Some(&ours));
+    first.push_user("hi").unwrap();
+    let log = first.session_log().to_path_buf();
+    drop(first);
+
+    // Removed since: the session goes on with what it read when it began.
+    std::fs::remove_file(dir.join("work/AGENTS.md")).unwrap();
+    let resumed = Agent::resume(Profile::builtin().unwrap(), options(&dir, false), &log).unwrap();
+    assert_eq!(resumed.instructions(), read);
+}
+
 #[tokio::test]
 async fn a_session_goes_on_where_it_stopped() {
     let dir = scratch("resume");

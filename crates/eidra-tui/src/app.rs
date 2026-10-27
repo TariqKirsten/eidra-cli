@@ -80,6 +80,7 @@ const COMMAND_TAIL: usize = 30;
 
 const HELP: &[(&str, &str)] = &[
     ("enter", "send; while the agent works, queue it for when the turn ends"),
+    ("ctrl+enter", "interrupt the agent and send at once, with anything queued"),
     ("shift+enter", "new line (also alt+enter and ctrl+j)"),
     ("esc", "interrupt the agent"),
     ("ctrl+c", "interrupt; or clear the input; or quit when it is empty"),
@@ -280,6 +281,9 @@ struct App<W: Write> {
     inbox: mpsc::UnboundedReceiver<Message>,
     /// Messages sent during the agent's turn, for when it ends.
     queued: Vec<String>,
+    /// Ctrl+Enter stopped the turn: what is queued goes as soon as it has stopped, rather than
+    /// back to the input box.
+    send_now: bool,
     /// Subagents working in the background.
     tasks: Vec<Task>,
     /// Reports of background subagents that have ended, for the agent's next message.
@@ -326,6 +330,7 @@ impl<W: Write> App<W> {
             sender,
             inbox,
             queued: Vec::new(),
+            send_now: false,
             tasks: Vec::new(),
             reports: Vec::new(),
             notes: Vec::new(),
@@ -420,8 +425,35 @@ impl<W: Write> App<W> {
         );
         let session = self.agent.as_ref().map_or("", Agent::session_id);
         let second = format!("session {session} · /help for keys and commands");
-        let lines = vec![Line::styled(first, theme::BOLD), Line::styled(second, theme::DIM)];
+        let third = self.instructions_line();
+        let lines = vec![
+            Line::styled(first, theme::BOLD),
+            Line::styled(second, theme::DIM),
+            Line::styled(third, theme::DIM),
+        ];
         self.commit(Block::Info, lines);
+    }
+
+    /// Which AGENTS.md files the session's system prompt holds, so that the user can see theirs
+    /// were read: the workspace's by its name, the user's own by its path.
+    fn instructions_line(&self) -> String {
+        let Some(agent) = &self.agent else {
+            return String::new();
+        };
+        let workspace = agent.workspace();
+        let files = agent.instructions();
+        if files.is_empty() {
+            let own = home_relative(&eidra_core::eidra_home(workspace).join("AGENTS.md"));
+            return format!("instructions: none (no {own}, no AGENTS.md here)");
+        }
+        let shown: Vec<String> = files
+            .iter()
+            .map(|path| match path.strip_prefix(workspace) {
+                Ok(inside) => inside.display().to_string(),
+                Err(_) => home_relative(path),
+            })
+            .collect();
+        format!("instructions: {}", shown.join(", "))
     }
 
     /// Shows the conversation a resumed session goes on from, and finds the checkpoints of its
@@ -710,6 +742,7 @@ impl<W: Write> App<W> {
         let Some(turn) = self.turn.take() else {
             return;
         };
+        let send_now = mem::take(&mut self.send_now);
         // The busy line goes, even when nothing else changes: the snapshot after a turn can end
         // it a while after its last event was drawn.
         self.dirty = true;
@@ -720,6 +753,7 @@ impl<W: Write> App<W> {
             self.commit_reply(&turn.reasoning, &turn.reply, None);
         }
         let limit = self.options.profile.context.limit;
+        let interrupted = matches!(outcome, Ok(Outcome::Interrupted));
         let normal = match outcome {
             Ok(Outcome::Replied) => true,
             Ok(Outcome::Finished(summary)) => {
@@ -764,11 +798,13 @@ impl<W: Write> App<W> {
         if self.quitting {
             return;
         }
-        if normal && self.job.is_none() {
+        // Stopped by Ctrl+Enter, the turn hands over to what was queued, as a reply would.
+        let go_on = normal || (send_now && interrupted);
+        if go_on && self.job.is_none() {
             // What was queued, after the reports that came in meanwhile.
             let queued = mem::take(&mut self.queued).join("\n\n");
             self.send(queued);
-        } else if !normal {
+        } else if !go_on {
             self.return_queued();
         }
         // With a /diff, /undo or ! command still running, what was queued waits for it.
@@ -849,7 +885,8 @@ impl<W: Write> App<W> {
             }
             KeyCode::Char('j') if ctrl => self.editor.insert("\n"),
             KeyCode::Tab if !ctrl && !alt && self.complete() => {}
-            KeyCode::Enter if shift || alt || ctrl => self.editor.insert("\n"),
+            KeyCode::Enter if ctrl => self.submit_now(),
+            KeyCode::Enter if shift || alt => self.editor.insert("\n"),
             KeyCode::Enter => self.submit(),
             _ => {
                 self.editor.key(key);
@@ -955,6 +992,18 @@ impl<W: Write> App<W> {
         }
     }
 
+    /// Ctrl+Enter: during the agent's turn, stops it, and sends the message after any queued
+    /// before it as soon as the turn has stopped. Otherwise, and for commands, the same as Enter.
+    fn submit_now(&mut self) {
+        let typed = self.editor.text().trim();
+        let commanded = command(typed).is_some() || typed.starts_with('!');
+        self.submit();
+        if self.turn.is_some() && !commanded && !self.queued.is_empty() {
+            self.send_now = true;
+            self.interrupt();
+        }
+    }
+
     fn command(&mut self, command: &str, rest: &str) {
         match command {
             "/help" => {
@@ -998,6 +1047,9 @@ impl<W: Write> App<W> {
                 self.agent = Some(agent);
                 self.stats = None;
                 self.info(&format!("new session · log {}", home_relative(&self.log)));
+                // AGENTS.md is read again for it, and may have changed.
+                let instructions = self.instructions_line();
+                self.info(&instructions);
             }
             Err(e) => self.error(&format!("no new session: {}", causes(&e))),
         }
@@ -1337,7 +1389,7 @@ impl<W: Write> App<W> {
         }
         bottom.push(Line::styled("─".repeat(width), theme::DIM));
         let placeholder = if self.turn.is_some() {
-            "Write the next message; it is sent when this turn ends"
+            "Queue message"
         } else {
             "Message eidra · /help for keys and commands"
         };
@@ -1817,6 +1869,7 @@ mod tests {
         assert_eq!(live[..2], ["First thought.", "Second thought."]);
         assert!(live[3].contains("thinking · 0 s · esc to interrupt"), "{live:?}");
         assert!(live[4].starts_with("────"), "{live:?}");
+        assert_eq!(live[5], "› Queue message");
         assert_eq!(live.last().unwrap(), "qwen3.8-flash-next · xhigh · 0/256K");
 
         // The reply's text replaces its reasoning in the tail.
@@ -1871,6 +1924,49 @@ mod tests {
         assert!(t.app.queued.is_empty());
         assert!(t.app.turn.is_some());
         assert_eq!(t.finished(), ["", "› next one"]);
+    }
+
+    #[test]
+    fn ctrl_enter_interrupts_and_sends_at_once_with_what_was_queued() {
+        let mut t = Test::new();
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        let agent = t.begin();
+        // With nothing typed or queued there is nothing to send, so the turn goes on.
+        t.app.key(ctrl_enter);
+        assert!(!t.app.turn.as_ref().unwrap().interrupted);
+
+        t.submit("first");
+        t.app.editor.insert("then this");
+        t.app.key(ctrl_enter);
+        assert!(t.app.turn.as_ref().unwrap().interrupted);
+        assert_eq!(t.app.queued, ["first", "then this"]);
+
+        // Once the turn has stopped, both go, rather than back to the input box.
+        t.app.turn_ended(agent, Ok(Outcome::Interrupted));
+        assert!(t.app.turn.is_some() && t.app.queued.is_empty() && t.app.editor.is_empty());
+        assert_eq!(t.last_message(), "first\n\nthen this");
+        assert!(t.finished().contains(&"! interrupted".to_owned()));
+    }
+
+    #[test]
+    fn the_header_names_the_agents_md_files_read() {
+        let mut t = Test::new();
+        std::fs::write(t.dir.join("work/AGENTS.md"), "Use tabs.\n").unwrap();
+        // A session begun now reads it. The user's own, in ~/.eidra, may come first.
+        t.app.agent = Some(start(&t.app.options).unwrap());
+        let line = t.app.instructions_line();
+        assert!(line == "instructions: AGENTS.md" || line.ends_with(", AGENTS.md"), "{line}");
+        t.app.header();
+        assert_eq!(t.finished().last(), Some(&line));
+    }
+
+    #[test]
+    fn ctrl_enter_sends_like_enter_when_the_agent_is_idle() {
+        let mut t = Test::new();
+        t.app.editor.insert("hello");
+        t.app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert!(t.app.turn.is_some());
+        assert_eq!(t.last_message(), "hello");
     }
 
     fn report(label: &str, text: &str) -> Report {

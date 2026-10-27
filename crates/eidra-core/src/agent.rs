@@ -403,6 +403,21 @@ impl Agent {
         &self.session.header().id
     }
 
+    /// The AGENTS.md files whose instructions the system prompt holds, as the session read them
+    /// when it began: the user's own in eidra's directory, then the workspace's.
+    pub fn instructions(&self) -> Vec<PathBuf> {
+        let Some(Message::System { content: Content::Text(system) }) =
+            self.session.messages().first()
+        else {
+            return Vec::new();
+        };
+        system
+            .lines()
+            .filter_map(|line| line.strip_prefix(INSTRUCTIONS_FROM))
+            .map(PathBuf::from)
+            .collect()
+    }
+
     /// The session's log file.
     pub fn session_log(&self) -> &Path {
         self.session.path()
@@ -969,6 +984,9 @@ fn tool_message(id: &str, text: String, images: Vec<(media::Image, String)>) -> 
     Message::Tool { tool_call_id: id.to_owned(), content: Content::Parts(parts) }
 }
 
+/// What heads an AGENTS.md in the system prompt, before its path.
+const INSTRUCTIONS_FROM: &str = "# Instructions from ";
+
 /// AGENTS.md from eidra's own directory and from the workspace, for the system prompt.
 fn agents_md(workspace: &Path) -> String {
     let mut out = String::new();
@@ -978,7 +996,7 @@ fn agents_md(workspace: &Path) -> String {
         };
         let text = text.trim();
         if !text.is_empty() {
-            out.push_str(&format!("\n# Instructions from {}\n{text}\n", path.display()));
+            out.push_str(&format!("\n{INSTRUCTIONS_FROM}{}\n{text}\n", path.display()));
         }
     }
     out

@@ -111,6 +111,7 @@ def interrupted_note():
 def basics(case):
     """Typing, a request that fails, commands, history, a resize, and quitting."""
     s = case.start(cols=80, rows=20)
+    assert s.contains("instructions: none (no "), s.dump()
     s.type("hello there")
     assert s.on_screen("› hello there"), s.dump()
     s.send("\x1b\r")  # alt+enter
@@ -139,10 +140,13 @@ def basics(case):
 
 @scenario
 def reply_and_status(case):
-    """A reply: its reasoning as one line, its text as markdown, and the status line's numbers."""
+    """A reply: its reasoning as one line, its text as markdown, and the status line's numbers;
+    the header names the workspace's AGENTS.md."""
+    (case.workspace / "AGENTS.md").write_text("Answer briefly.\n")
     text = "# Done\n\nSome **bold** text.\nline one\nline two"
     with Server([reply(reasoning="A short thought.", text=text, reasoning_tokens=7)]) as server:
         s = case.start(server=server, cols=100)
+        assert s.contains("instructions: AGENTS.md"), s.dump()
         s.type("hi\r")
         s.wait_for(lambda s: s.contains("line two") and idle(s), 10, "the reply")
         case.show(s, "after the reply")
@@ -225,6 +229,27 @@ def queue(case):
         case.show(s, "queued")
         s.wait_for(lambda s: s.contains("Second answer.") and idle(s), 10, "both turns")
         assert server.requests[1]["messages"][-1]["content"] == "second"
+        quit_cleanly(s)
+
+
+@scenario
+def send_now(case):
+    """Ctrl+Enter during a turn stops it and sends at once, after what was queued."""
+    replies = [reply(reasoning="Let me think about this", stall=30), reply(text="Done that.")]
+    with Server(replies) as server:
+        s = case.start(server=server)
+        s.type("a long task\r")
+        s.wait_for(lambda s: s.on_screen("thinking"), 10, "the reasoning")
+        assert s.on_screen("› Queue message"), s.dump()
+        s.type("first\r")
+        s.wait_for(lambda s: s.on_screen("queued › first"), 5, "the queued message")
+        s.type("do this instead")
+        s.send("\x1b[13;5u")  # ctrl+enter, as the kitty keyboard protocol sends it
+        s.wait_for(lambda s: s.contains("Done that.") and idle(s), 10, "the next reply")
+        case.show(s, "after ctrl+enter")
+        assert s.contains("! interrupted"), s.dump()
+        last = server.requests[1]["messages"][-1]["content"]
+        assert last == f"{interrupted_note()}\n\nfirst\n\ndo this instead", last
         quit_cleanly(s)
 
 

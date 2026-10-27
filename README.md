@@ -145,8 +145,8 @@ Where it differs from the Linux wrapper:
 terminal's own scrollback; at the bottom are the reply streaming in, the input box and a status line
 (model · effort · context used against the limit · cache reuse · prefill and decode speed).
 
-- Enter sends; a message sent while the agent works waits for its turn to end. Shift+Enter,
-  Alt+Enter or Ctrl+J add a newline.
+- Enter sends; a message sent while the agent works waits for its turn to end. Ctrl+Enter
+  interrupts the agent and sends at once. Shift+Enter, Alt+Enter or Ctrl+J add a newline.
 - Esc interrupts the agent. Ctrl+C interrupts, or clears the input, or quits; Ctrl+D quits.
 - Up and Down (or Ctrl+P and Ctrl+N) walk the history. Ctrl+T shows the model's reasoning whole
   instead of as one line.
@@ -175,7 +175,8 @@ stop at the context window. If no summary can be made, it stops at the profile's
 tokens of the server's 262,144), and `/new` starts another.
 
 eidra keeps what is its own in `~/.eidra`, or wherever `$EIDRA_HOME` says: an `AGENTS.md` of
-yours, whose instructions go into every session, the session logs and the checkpoints. Each
+yours, whose instructions go into every session, the session logs and the checkpoints. A session's
+header names the `AGENTS.md` files it read: yours and the project's, or none. Each
 session is logged as JSON lines under `~/.eidra/sessions`, or wherever `--session-dir` says, and
 the path is printed when you quit.
 

@@ -392,6 +392,10 @@ pixels.
 ## 11. AGENTS.md
 
 - The root `AGENTS.md` and `~/.eidra/AGENTS.md` go into the system prompt at session start.
+- The TUI's header names the ones the system prompt holds, so that the user can see theirs were
+  read (2026-10-27): `instructions: ~/.eidra/AGENTS.md, AGENTS.md`, or `instructions: none (no
+  ~/.eidra/AGENTS.md, no AGENTS.md here)`; `/new` says it again. The list is read back from the
+  session's system prompt, so a resumed session shows those it began with.
 - A nested `AGENTS.md` (M6, 2026-10-27) is appended to the first tool result that touches its
   directory or one below it, headed with where it came from, and never again in that session
   (R5). `read`, `edit`, `write`, `glob` and `grep` touch the directory of the path they name;
@@ -419,7 +423,8 @@ live region here grows and shrinks.
   draw takes. Live rows are wrapped one column short of the width, so the terminal never wraps
   them, and the region stays shorter than the terminal, so its top is always on screen.
 - Raw mode, bracketed paste, and the kitty keyboard protocol's unambiguous keys where the terminal
-  has them, so that Shift+Enter is not Enter. Exiting or panicking restores the terminal.
+  has them, so that Shift+Enter and Ctrl+Enter are not Enter. Exiting or panicking restores the
+  terminal.
 - Control characters in model or tool output are never written to the terminal.
 
 **The live region**, top to bottom:
@@ -441,7 +446,11 @@ live region here grows and shrinks.
 A step's reasoning, calls and results stay together; a blank line separates everything else.
 
 **Keys:**
-- Enter sends. While the agent works, the message is queued and sent when the turn ends.
+- Enter sends. While the agent works, the message is queued and sent when the turn ends; the
+  input box then reads "Queue message".
+- Ctrl+Enter (2026-10-27) interrupts the turn and sends the message as soon as it has stopped,
+  after anything queued; with no turn under way it is Enter. Only a terminal with the kitty
+  protocol tells it from Enter; elsewhere it arrives as Enter or Ctrl+J.
 - Shift+Enter, Alt+Enter or Ctrl+J add a newline.
 - Esc interrupts. Ctrl+C interrupts when the agent works, else clears the input, else quits.
   Ctrl+D quits when the input is empty.
@@ -480,13 +489,14 @@ sends events and approval requests to the UI loop through a channel. Esc stops t
   again: in the first smoke test it finished an interrupted count to 400 before the next task.
 - A tool call cut off gets an "interrupted" result, as do the calls after it, and a foreground
   command's whole process group is stopped.
-- Messages queued during the turn go back to the input box.
+- Messages queued during the turn go back to the input box, unless Ctrl+Enter stopped it: then
+  they are sent at once.
 
 **Checks.** Beyond the unit tests, two scripts drive the binary in a pseudo-terminal and read its
 screen with a small terminal emulator:
 - `scripts/tui/offline.py` runs it against a fake server that streams scripted replies: typing and
   commands, a reply with the status line's numbers, tool calls, an approval, an interrupt, a queued
-  message, a background task worked on during the chat, attachments, PDF pages, `/undo` and
+  message and one sent at once with Ctrl+Enter, a background task worked on during the chat, attachments, PDF pages, `/undo` and
   `/diff`, `--continue`, `!` commands and `@` mentions, and SIGTERM. About 25 s, no GPU; run it
   after any change to the TUI. `--docker IMAGE` runs the same in the image (§13).
 - `scripts/tui/smoke.py` does much the same against radiance, and checks that the model hears a
