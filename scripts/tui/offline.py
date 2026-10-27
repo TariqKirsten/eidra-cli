@@ -254,6 +254,33 @@ def send_now(case):
 
 
 @scenario
+def compact(case):
+    """/compact summarises the conversation when asked, keeping what the user names, and the
+    conversation goes on from the summary."""
+    replies = [
+        reply(text="First answer."),
+        reply(text="SUMMARY: one answer so far."),
+        reply(text="Second answer."),
+    ]
+    with Server(replies) as server:
+        s = case.start(server=server)
+        s.type("first\r")
+        s.wait_for(lambda s: s.contains("First answer.") and idle(s), 10, "the first reply")
+        s.type("/compact the numbers\r")
+        s.wait_for(lambda s: s.contains("! compacted: the conversation goes on") and idle(s), 10,
+                   "the summary")
+        case.show(s, "after /compact")
+        asked = server.requests[1]["messages"][-1]["content"]
+        assert asked.endswith("wants it to keep in particular: the numbers]"), asked
+        s.type("next\r")
+        s.wait_for(lambda s: s.contains("Second answer.") and idle(s), 10, "the next reply")
+        messages = server.requests[2]["messages"]
+        assert [m["role"] for m in messages] == ["system", "user", "user"], messages
+        assert "SUMMARY: one answer so far." in messages[1]["content"], messages[1]
+        quit_cleanly(s)
+
+
+@scenario
 def background(case):
     """A subagent started in the background works while the chat goes on; its report goes to the
     agent when it ends, and the agent tells the user."""

@@ -155,8 +155,9 @@ terminal's own scrollback; at the bottom are the reply streaming in, the input b
 - `!command` runs a command in the project; you see its output, and the agent gets it with your
   next message.
 - A command on the confirm list asks first: y runs it once, a for the rest of the session, n not.
-- `/help`, `/new` (a new session), `/tasks` and `/stop` (subagents in the background),
-  `/undo` and `/diff` (below), `/reasoning`, `/quit`.
+- `/help`, `/new` (a new session), `/compact` (go on from a summary of the conversation; words
+  after it say what to keep), `/tasks` and `/stop` (subagents in the background), `/undo` and
+  `/diff` (below), `/reasoning`, `/quit`.
 
 Ask the agent to do something in the background, such as "start a subagent to build a calculator
 while we chat", and a subagent works on it while you go on talking; its report comes back to the

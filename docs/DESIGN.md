@@ -325,6 +325,12 @@ The policy guards against model mistakes. It is not a security boundary.
     session there.
   - 200K is a first guess: quality and latency fall off before the window's end, so evals will
     tune it, from around 120K.
+- **`/compact [what]`** (2026-10-27) compacts on demand in the TUI, in a turn of its own that Esc
+  stops: the same request and new conversation, with `compact_focus` added to the prompt when
+  the user names what the summary should keep. Before the first reply there is nothing to
+  compact. An interrupted `/compact` does not mark the last reply as cut short, and an empty
+  summary leaves automatic compaction on. The status line's context goes to 0 until the next
+  request, since the last reply's numbers were those of the conversation that went.
 
   Tested live with `compact_at` at 14K on a task that read two source files whole and then
   answered three questions about them: the summary request found 15,168 of its 19,058 tokens in
@@ -462,9 +468,9 @@ A step's reasoning, calls and results stay together; a blank line separates ever
   else Tab is four spaces.
 - An approval takes y (once), a (this command, for the rest of the session) or n. Keys that arrive
   in the first 0.4 s are ignored, so that typing meant for the input box does not answer it.
-- Commands: `/help`, `/new`, `/tasks` and `/stop [n]` for background tasks, `/undo` and
-  `/diff [all]` (§14), `/reasoning`, `/quit` (or `/exit`). Quitting stops the turn and the
-  background tasks first, and waits for an undo under way.
+- Commands: `/help`, `/new`, `/compact [what]` (§8), `/tasks` and `/stop [n]` for background
+  tasks, `/undo` and `/diff [all]` (§14), `/reasoning`, `/quit` (or `/exit`). Quitting stops the
+  turn and the background tasks first, and waits for an undo under way.
 
 **What a message brings along** (M8, 2026-10-27):
 - **`@path` to a text file** attaches it after the message, as `read` shows it, numbered lines

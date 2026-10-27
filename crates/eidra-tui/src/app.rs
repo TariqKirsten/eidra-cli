@@ -92,6 +92,7 @@ const HELP: &[(&str, &str)] = &[
     ("ctrl+t", "show reasoning in full, or as one line"),
     ("!command", "run a command in the workspace; the agent sees it with your next message"),
     ("@path, tab", "attach a file to the message; tab completes the path"),
+    ("/compact [what]", "go on from a summary of the conversation, keeping what you name"),
     ("/undo", "put back the files the last turn changed; again for the turn before"),
     ("/diff [all]", "what changed since the last turn began, or since the session's first"),
     ("/new", "start a new session"),
@@ -196,6 +197,8 @@ struct Turn {
     run: Run,
     interrupter: Interrupter,
     interrupted: bool,
+    /// It is a `/compact`, rather than a reply to a message.
+    compacting: bool,
     started: Instant,
     phase: Phase,
     /// The reply streaming in: its reasoning and its text.
@@ -212,6 +215,7 @@ impl Turn {
             run,
             interrupter,
             interrupted: false,
+            compacting: false,
             started: Instant::now(),
             phase: Phase::Waiting,
             reasoning: String::new(),
@@ -791,6 +795,10 @@ impl<W: Write> App<W> {
                 false
             }
         };
+        // The last reply's numbers were those of the conversation a /compact replaced.
+        if turn.compacting && self.agent.as_ref().is_some_and(|agent| agent.context_used() == 0) {
+            self.stats = None;
+        }
         if mem::replace(&mut self.after, After::Nothing) == After::NewSession {
             self.new_session();
         }
@@ -1009,7 +1017,7 @@ impl<W: Write> App<W> {
             "/help" => {
                 let lines = HELP
                     .iter()
-                    .map(|(key, what)| Line::plain(format!("  {key:<14}")).with(what, theme::DIM))
+                    .map(|(key, what)| Line::plain(format!("  {key:<16}")).with(what, theme::DIM))
                     .collect();
                 self.commit(Block::Info, lines);
             }
@@ -1024,6 +1032,7 @@ impl<W: Write> App<W> {
             "/new" => self.new_session(),
             "/tasks" => self.list_tasks(),
             "/stop" => self.stop_tasks(rest),
+            "/compact" => self.compact_conversation(rest),
             "/undo" => self.undo(),
             "/diff" => self.diff(rest),
             "/reasoning" => self.toggle_reasoning(),
@@ -1092,6 +1101,32 @@ impl<W: Write> App<W> {
             let label = self.tasks[i].label.clone();
             self.info(&format!("stopping \"{label}\"; the agent gets its report"));
         }
+    }
+
+    /// Summarises the conversation and goes on from the summary, as the agent does by itself past
+    /// `[context] compact_at`, in a turn of its own that Esc stops. `focus` is what to keep.
+    fn compact_conversation(&mut self, focus: &str) {
+        if self.turn.is_some() {
+            self.notice(
+                "the agent is working: /compact once its turn ends, or press esc to stop it",
+            );
+            return;
+        }
+        let Some(mut agent) = self.agent.take() else {
+            return;
+        };
+        let interrupter = agent.interrupter();
+        let mut channel = Channel(self.sender.clone());
+        let focus = focus.to_owned();
+        let run: Run = Box::pin(async move {
+            // Compacted, or left as it was after an empty summary: either way the turn is the
+            // user's again, as after a reply.
+            let outcome = agent.compact_now(&mut channel, &focus).await;
+            (agent, outcome.map(|stopped| stopped.unwrap_or(Outcome::Replied)))
+        });
+        let mut turn = Turn::new(run, interrupter);
+        turn.compacting = true;
+        self.turn = Some(turn);
     }
 
     /// Puts back the files the last turn that changed any changed, through the checkpoints.
@@ -1555,6 +1590,7 @@ fn busy_line(turn: &Turn) -> Line {
     let frame = SPINNER[(elapsed.as_millis() / SPINNER_STEP.as_millis()) as usize % SPINNER.len()];
     let doing = match (&turn.approval, &turn.phase) {
         _ if turn.interrupted => "interrupting".to_owned(),
+        _ if turn.compacting => "compacting".to_owned(),
         (Some(_), _) => "waiting for your answer".to_owned(),
         (None, Phase::Waiting) => "waiting for the model".to_owned(),
         (None, Phase::Thinking) => "thinking".to_owned(),
@@ -1946,6 +1982,27 @@ mod tests {
         assert!(t.app.turn.is_some() && t.app.queued.is_empty() && t.app.editor.is_empty());
         assert_eq!(t.last_message(), "first\n\nthen this");
         assert!(t.finished().contains(&"! interrupted".to_owned()));
+    }
+
+    #[test]
+    fn compact_runs_as_a_turn_of_its_own() {
+        let mut t = Test::new();
+        t.submit("/compact the API notes");
+        assert!(t.app.turn.as_ref().is_some_and(|turn| turn.compacting));
+        assert!(t.live().iter().any(|row| row.contains("compacting · 0 s · esc to interrupt")));
+        t.submit("/compact");
+        let refused =
+            "! the agent is working: /compact once its turn ends, or press esc to stop it";
+        assert!(t.finished().contains(&refused.to_owned()));
+
+        // Once it has compacted, the numbers of the conversation it replaced go.
+        let mut t = Test::new();
+        let agent = t.begin();
+        t.app.turn.as_mut().unwrap().compacting = true;
+        t.app.stats = Some(RequestStats { prompt_tokens: Some(150_000), ..Default::default() });
+        t.app.turn_ended(agent, Ok(Outcome::Replied));
+        assert!(t.app.stats.is_none());
+        assert_eq!(t.app.status_line(80).text(), "qwen3.8-flash-next · xhigh · 0/256K");
     }
 
     #[test]

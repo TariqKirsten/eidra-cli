@@ -403,6 +403,12 @@ impl Agent {
         &self.session.header().id
     }
 
+    /// Tokens the conversation took at the last reply, its prompt and the reply; 0 after a
+    /// compaction, until the next reply.
+    pub fn context_used(&self) -> u64 {
+        self.used
+    }
+
     /// The AGENTS.md files whose instructions the system prompt holds, as the session read them
     /// when it began: the user's own in eidra's directory, then the workspace's.
     pub fn instructions(&self) -> Vec<PathBuf> {
@@ -467,7 +473,7 @@ impl Agent {
         for step in 0..max_requests {
             if self.profile.context.compact_at.is_some_and(|at| self.used > at)
                 && !self.uncompactable
-                && let Some(outcome) = self.compact(frontend).await?
+                && let Some(outcome) = self.compact(frontend, None).await?
             {
                 return Ok(outcome);
             }
@@ -620,21 +626,59 @@ impl Agent {
         Ok(Outcome::RequestLimit)
     }
 
+    /// Summarises the conversation now, as the user asked with `/compact`, and goes on from the
+    /// summary (docs/DESIGN.md §8). `focus`, unless empty, says what the summary should keep.
+    /// Returns an outcome only if the user stopped it, and the conversation is as it was, or the
+    /// server could not fit it.
+    pub async fn compact_now<F: Frontend>(
+        &mut self,
+        frontend: &mut F,
+        focus: &str,
+    ) -> Result<Option<Outcome>> {
+        // An interrupt from before this is not for it.
+        self.interrupt.send_replace(false);
+        if !self.session.messages().iter().any(|m| matches!(m, Message::Assistant(_))) {
+            frontend.event(Event::Notice { text: "there is nothing to compact yet".into() });
+            return Ok(None);
+        }
+        // Stopped, it leaves the conversation as it was, and the last reply was not cut short.
+        let unanswered = self.unanswered;
+        let outcome = self.compact(frontend, Some(focus)).await?;
+        if outcome == Some(Outcome::Interrupted) {
+            self.unanswered = unanswered;
+        }
+        Ok(outcome)
+    }
+
     /// Summarises the conversation and goes on in a new one that starts with the same system
-    /// prompt and the summary (docs/DESIGN.md §8). Returns an outcome only if the run ends here:
+    /// prompt and the summary (docs/DESIGN.md §8): by itself past `[context] compact_at`, or as
+    /// the user asked, with what they want kept. Returns an outcome only if the run ends here:
     /// the user stopped it, and the conversation is as it was, or the server could not fit it.
-    async fn compact<F: Frontend>(&mut self, frontend: &mut F) -> Result<Option<Outcome>> {
+    async fn compact<F: Frontend>(
+        &mut self,
+        frontend: &mut F,
+        asked: Option<&str>,
+    ) -> Result<Option<Outcome>> {
         let tokens = self.used;
-        frontend.event(Event::Notice {
-            text: format!(
+        let text = match asked {
+            None => format!(
                 "the conversation has reached {} tokens: summarising it, to go on from the summary",
                 thousands(tokens)
             ),
-        });
+            Some(_) => format!(
+                "summarising the conversation of {} tokens, to go on from the summary",
+                thousands(tokens)
+            ),
+        };
+        frontend.event(Event::Notice { text });
         self.requests += 1;
         frontend.event(Event::Request { number: self.requests });
+        let mut prompt = self.profile.prompts.compact.clone();
+        if let Some(focus) = asked.map(str::trim).filter(|focus| !focus.is_empty()) {
+            prompt.push_str(&self.profile.prompts.compact_focus.replace("{focus}", focus));
+        }
         let mut messages = self.session.messages().to_vec();
-        messages.push(Message::user(self.profile.prompts.compact.clone()));
+        messages.push(Message::user(prompt));
         let header = self.session.header();
         let mut request =
             reply_request(&self.profile, header, messages, seed(&header.id, self.requests))?;
@@ -668,7 +712,10 @@ impl Agent {
             frontend.event(Event::Notice {
                 text: "the summary came back empty, so the conversation goes on as it is".into(),
             });
-            self.uncompactable = true;
+            // Given up on for good only by itself, which would otherwise ask after every reply.
+            if asked.is_none() {
+                self.uncompactable = true;
+            }
             return Ok(None);
         }
         let system = self.session.messages().first().cloned().context("no system prompt")?;
@@ -680,6 +727,8 @@ impl Agent {
             .replace("{summary}", summary);
         self.session.compact(tokens, summary, Some(&stats), vec![system, Message::user(first)])?;
         self.used = 0;
+        // A reply cut short before is in the summary, or nowhere: the next message need not say so.
+        self.unanswered = false;
         // The results that carried nested AGENTS.md files are gone: they come again when needed.
         self.tools.forget_nested();
         frontend.event(Event::Notice {

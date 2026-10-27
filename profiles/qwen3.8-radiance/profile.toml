@@ -113,6 +113,8 @@ compact = """[This conversation is too long to go on with, so it will continue i
 Reply with the summary only.]"""
 # Starts the conversation after a compaction; {tokens} and {summary} are replaced.
 compacted = "[The conversation so far reached {tokens} tokens and was compacted. This is the summary you wrote of it:]\n\n{summary}\n\n[Go on from here.]"
+# Added to compact when the user runs /compact with words after it; {focus} is replaced.
+compact_focus = "\n\n[The user asked for this summary, and wants it to keep in particular: {focus}]"
 # Starts the user's next message after /undo put back what one of the agent's turns changed in the
 # workspace. {turn} is the start of the message that began the turn; {restored}, {removed} and
 # {kept} list files, or say none. Without it the model believes its changes are still there.

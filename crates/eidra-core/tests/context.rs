@@ -78,3 +78,36 @@ async fn a_long_conversation_goes_on_from_a_summary() {
     assert_eq!(log.starts, [0, 4]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn compact_now_summarises_when_asked_keeping_what_the_user_names() {
+    let dir = scratch("compact-now");
+    let (url, requests) = recording_server(vec![
+        Reply::Chunks(usage(text("Hello."), 1_000)),
+        Reply::Chunks(usage(text("SUMMARY: said hello."), 1_050)),
+        Reply::Chunks(usage(text("Hi again."), 300)),
+    ])
+    .await;
+    let mut agent = agent(url, &dir);
+    // Before the first reply there is nothing to summarise, and nothing is asked.
+    assert_eq!(agent.compact_now(&mut Quiet, "").await.unwrap(), None);
+    agent.push_user("hi").unwrap();
+    assert_eq!(agent.run(&mut Quiet, 5).await.unwrap(), Outcome::Replied);
+    assert_eq!(agent.compact_now(&mut Quiet, " the greeting ").await.unwrap(), None);
+    assert_eq!(agent.context_used(), 0);
+    agent.push_user("and now?").unwrap();
+    assert_eq!(agent.run(&mut Quiet, 5).await.unwrap(), Outcome::Replied);
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let asked = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"].clone();
+    let asked = asked.as_str().unwrap();
+    assert!(asked.ends_with("wants it to keep in particular: the greeting]"), "{asked}");
+    // The conversation goes on from the summary, with the user's next message after it.
+    let next = requests[2]["messages"].as_array().unwrap();
+    let roles: Vec<&str> = next.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["system", "user", "user"]);
+    assert!(next[1]["content"].as_str().unwrap().contains("SUMMARY: said hello."));
+    assert_eq!(next[2]["content"], "and now?");
+    let _ = std::fs::remove_dir_all(&dir);
+}
