@@ -3,7 +3,12 @@
 //! what the code must go on doing: in the July SWE-rebench baseline, three of six failures were
 //! the agent editing existing tests until its change passed them. Some tasks do ask for a tested
 //! behaviour to change, so the result only says so; nothing is refused.
+//!
+//! An unattended run is also checked once at `finish`, against the commit it began at, which sees
+//! tests changed any way at all: in the v2 run, the one such failure left changed them with a
+//! Python script run through bash.
 
+use std::fs;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -13,6 +18,8 @@ use tree_sitter::Node;
 
 /// How long `git show` may take.
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `git diff` may take, which looks at every file of the work tree.
+const DIFF_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Whether `path` holds Python tests, by pytest's conventions.
 pub fn is_test_file(path: &Path) -> bool {
@@ -27,10 +34,56 @@ pub fn is_test_file(path: &Path) -> bool {
 /// The file as the project's last commit has it, if it is in one.
 pub async fn at_head(path: &Path) -> Option<String> {
     let (dir, name) = (path.parent()?, path.file_name()?.to_str()?);
+    git(dir, &["show", &format!("HEAD:./{name}")], GIT_TIMEOUT).await
+}
+
+/// The commit the repository that holds `workspace` is at, if there is one: the project's tests as
+/// a run found them.
+pub fn head_commit(workspace: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (output.status.success() && !commit.is_empty()).then_some(commit)
+}
+
+/// The tests of commit `base` that the workspace no longer has as they were, however they were
+/// changed: each test file, as a path in the workspace, with its tests altered or removed.
+pub async fn changed_since(workspace: &Path, base: &str) -> Vec<(String, Vec<String>)> {
+    let args = ["diff", "--name-only", "--no-renames", "--relative", "-z", base, "--"];
+    let Some(paths) = git(workspace, &args, DIFF_TIMEOUT).await else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for path in paths.split('\0').filter(|p| !p.is_empty() && is_test_file(Path::new(p))) {
+        let Some(head) = git(workspace, &["show", &format!("{base}:./{path}")], GIT_TIMEOUT).await
+        else {
+            continue;
+        };
+        // A file removed has none of its tests.
+        let now = fs::read_to_string(workspace.join(path)).unwrap_or_default();
+        let tests = changed(&head, &head, &now);
+        if !tests.is_empty() {
+            found.push((path.to_owned(), tests));
+        }
+    }
+    found
+}
+
+/// What git printed in `dir`, if it succeeded in time.
+async fn git(dir: &Path, args: &[&str], timeout: Duration) -> Option<String> {
     let mut git = Command::new("git");
     git.arg("-C")
         .arg(dir)
-        .args(["show", &format!("HEAD:./{name}")])
+        .args(args)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -38,7 +91,7 @@ pub async fn at_head(path: &Path) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(GIT_TIMEOUT, git.output()).await.ok()?.ok()?;
+    let output = tokio::time::timeout(timeout, git.output()).await.ok()?.ok()?;
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -151,6 +204,51 @@ class TestCache:
         let added = format!("{HEAD}\ndef test_new():\n    assert True\n");
         let changed_added = added.replace("assert True", "assert False");
         assert!(changed(HEAD, &added, &changed_added).is_empty());
+    }
+
+    #[tokio::test]
+    async fn finds_committed_tests_changed_any_way_since_a_commit() {
+        let git = |dir: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir)
+                .output();
+            output.is_ok_and(|o| o.status.success())
+        };
+        let dir = std::env::temp_dir().join(format!("eidra-changed-since-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("tests")).unwrap();
+        fs::write(dir.join("tests/test_cache.py"), HEAD).unwrap();
+        fs::write(dir.join("tests/test_gone.py"), "def test_kept():\n    assert True\n").unwrap();
+        fs::write(dir.join("cache.py"), "x = 1\n").unwrap();
+        if !git(&dir, &["init", "-q"]) {
+            return eprintln!("no git: skipped");
+        }
+        assert!(git(&dir, &["add", "-A"]) && git(&dir, &["commit", "-qm", "start"]));
+        let base = head_commit(&dir).unwrap();
+        assert_eq!(base.len(), 40);
+        assert!(changed_since(&dir, &base).await.is_empty());
+
+        // As a script would: an assertion changed, a test added, a file removed, code changed. A
+        // commit since does not hide them.
+        let edited = HEAD.replace("== 3", "== 4") + "\ndef test_new():\n    assert True\n";
+        fs::write(dir.join("tests/test_cache.py"), edited).unwrap();
+        fs::remove_file(dir.join("tests/test_gone.py")).unwrap();
+        fs::write(dir.join("cache.py"), "x = 2\n").unwrap();
+        assert!(git(&dir, &["commit", "-qam", "theirs"]));
+        assert_eq!(
+            changed_since(&dir, &base).await,
+            [
+                ("tests/test_cache.py".to_owned(), vec!["test_adds".to_owned()]),
+                ("tests/test_gone.py".to_owned(), vec!["test_kept".to_owned()]),
+            ]
+        );
+        // From a directory inside the repository, paths are the workspace's.
+        let inside = changed_since(&dir.join("tests"), &base).await;
+        assert_eq!(inside[0].0, "test_cache.py");
+        assert!(head_commit(&std::env::temp_dir().join("eidra-no-such-repo")).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

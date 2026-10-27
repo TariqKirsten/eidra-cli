@@ -52,6 +52,10 @@ pub struct Toolbox {
     nested: agents::Nested,
     /// The note for a change to the project's tests (`[prompts] changed_tests`).
     changed_tests_note: String,
+    /// The commit the run began at, until its first `finish` checks the tests against it
+    /// (`[prompts] finish_changed_tests`).
+    base: Option<String>,
+    finish_note: String,
 }
 
 enum Reply {
@@ -107,6 +111,8 @@ impl Toolbox {
             diagnostics: diagnostics::Diagnostics::new(workspace, profile.diagnostics.clone()),
             nested: agents::Nested::new(workspace),
             changed_tests_note: profile.prompts.changed_tests.clone(),
+            base: None,
+            finish_note: profile.prompts.finish_changed_tests.clone(),
             shell: bash::Shell::new(
                 workspace,
                 &session_dir.join("shell"),
@@ -241,11 +247,29 @@ impl Toolbox {
                 frontend.event(Event::Todo { list: string(args, "list")?.to_owned() });
                 "The todo list is updated.".into()
             }
-            "finish" => return Ok(Reply::Finish(string(args, "summary")?.to_owned())),
+            "finish" => {
+                let summary = string(args, "summary")?.to_owned();
+                // Once: the next finish ends the run whatever the tests are.
+                if let Some(base) = self.base.take()
+                    && let Some(note) = self.tests_changed_since(&base).await
+                {
+                    return Ok(Reply::Text(note));
+                }
+                return Ok(Reply::Finish(summary));
+            }
             // The agent runs `task` itself, since it starts another agent.
             _ => return Err(format!("{name} is not implemented")),
         };
         Ok(Reply::Text(text))
+    }
+
+    /// Has the first `finish` check the project's tests against the commit the workspace is at
+    /// now. For the agent that answers for the run: a subagent shares the workspace with the agent
+    /// that started it, and would be told of that agent's changes.
+    pub fn check_tests_at_finish(&mut self) {
+        if !self.finish_note.is_empty() {
+            self.base = test_changes::head_commit(&self.workspace);
+        }
     }
 
     /// Forgets which nested AGENTS.md files were given, after a compaction dropped the results
@@ -268,6 +292,31 @@ impl Toolbox {
             names.push_str(&format!(" and {} more", changed.len() - MOST));
         }
         Some(self.changed_tests_note.replace("{tests}", &names))
+    }
+
+    /// The note for a `finish` that leaves tests of commit `base` altered or removed.
+    async fn tests_changed_since(&self, base: &str) -> Option<String> {
+        const MOST: usize = 8;
+        let changed = test_changes::changed_since(&self.workspace, base).await;
+        let total: usize = changed.iter().map(|(_, tests)| tests.len()).sum();
+        if total == 0 {
+            return None;
+        }
+        let mut left = MOST;
+        let mut parts = Vec::new();
+        for (path, tests) in &changed {
+            if left == 0 {
+                break;
+            }
+            let names: Vec<&str> = tests.iter().take(left).map(String::as_str).collect();
+            left -= names.len();
+            parts.push(format!("{} in {path}", names.join(", ")));
+        }
+        let mut tests = parts.join("; ");
+        if total > MOST {
+            tests.push_str(&format!(", and {} more", total - MOST));
+        }
+        Some(self.finish_note.replace("{tests}", &tests))
     }
 
     /// A file the user's message mentions, as `read` shows it, with any nested AGENTS.md it is

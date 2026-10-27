@@ -1,5 +1,6 @@
 //! What the harness tells the model beyond the tools' own results: an edit that changes the
-//! project's tests, a budget nearly spent, a timeout under another name, and no network.
+//! project's tests, a finish that leaves them changed, a budget nearly spent, a timeout under
+//! another name, and no network.
 
 mod common;
 
@@ -63,6 +64,69 @@ async fn changing_a_committed_test_is_pointed_out() {
         "{}",
         results[1]
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_unattended_run_that_changed_committed_tests_hears_so_at_its_first_finish() {
+    if Command::new("git").arg("--version").output().is_err() {
+        return eprintln!("no git: skipped");
+    }
+    let dir = scratch("finish-tests");
+    let work = dir.join("work");
+    fs::create_dir_all(work.join("tests")).unwrap();
+    let test = "from calc import add\n\n\ndef test_adds():\n    assert add(1, 2) == 3\n";
+    fs::write(work.join("tests/test_calc.py"), test).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-qm", "start"]);
+    let finish = || Reply::Chunks(tool_call("finish", json!({"summary": "done"})));
+    let run = |replies: Vec<Reply>| {
+        let (dir, work) = (dir.clone(), work.clone());
+        async move {
+            let mut profile = Profile::builtin().unwrap();
+            profile.base_url = fake_server(replies).await;
+            let options = AgentOptions {
+                workspace: work,
+                session_root: dir.join("sessions"),
+                headless: true,
+                confirm: vec![],
+                model_socket: None,
+            };
+            let mut agent = Agent::start(profile, options).unwrap();
+            agent.push_user("go").unwrap();
+            let outcome = agent.run(&mut Quiet, 5).await.unwrap();
+            (outcome, tool_results(&log_messages(&agent)))
+        }
+    };
+
+    // Changed through bash, which the edit's note does not see: the first finish says so, and
+    // the next ends the run.
+    let sed = json!({"command": "sed -i 's/== 3/== 4/' tests/test_calc.py"});
+    let replies = vec![Reply::Chunks(tool_call("bash", sed)), finish(), finish()];
+    let (outcome, results) = run(replies).await;
+    assert_eq!(outcome, Outcome::Finished("done".into()));
+    assert!(
+        results[1].starts_with(
+            "[Not finished yet. Your changes alter tests the project already had: test_adds in \
+             tests/test_calc.py. They say"
+        ),
+        "{}",
+        results[1]
+    );
+    assert_eq!(results[2], "Finished.");
+
+    // Put back, with a test of its own added, the run finishes at once.
+    let add = "printf '\\ndef test_more():\\n    assert True\\n' >> tests/test_calc.py";
+    let replies = vec![
+        Reply::Chunks(tool_call("bash", json!({"command": "git checkout -q tests/test_calc.py"}))),
+        Reply::Chunks(tool_call("bash", json!({"command": add}))),
+        finish(),
+    ];
+    let (outcome, results) = run(replies).await;
+    assert_eq!(outcome, Outcome::Finished("done".into()));
+    assert_eq!(results[2], "Finished.");
+    assert!(fs::read_to_string(work.join("tests/test_calc.py")).unwrap().contains("test_more"));
     let _ = fs::remove_dir_all(&dir);
 }
 

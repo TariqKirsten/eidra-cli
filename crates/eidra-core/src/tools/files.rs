@@ -6,6 +6,7 @@
 //! a read costs two steps (DESIGN.md §16.1).
 
 use std::borrow::Cow;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,8 @@ const DEFAULT_LINES: usize = 2000;
 const MAX_LINE_CHARS: usize = 2000;
 /// Lines of context shown around an edit.
 const CONTEXT: usize = 3;
+/// The most lines of the file shown when `old` is not found.
+const SHOWN_ON_MISS: usize = 40;
 
 pub struct Files {
     workspace: PathBuf,
@@ -218,30 +221,78 @@ fn find_form<'a>(text: &str, old: &'a str, new: &'a str) -> Option<(Cow<'a, str>
     None
 }
 
-/// Why `old` was not found, and where to look.
+/// Why `old` was not found, and where to look. Of the places its first line occurs, ignoring
+/// indentation, the one where most of its lines go on to match is shown: the first of its lines
+/// that differs there, and the file's lines around it, so that the next edit can be put right
+/// without reading the file again. In the v2 run most tool errors were long `old` texts whose
+/// later lines did not match, in files of thousands of lines (DESIGN.md §16.5).
 fn not_found(path: &str, text: &str, old: &str) -> String {
-    let Some(first) = old.lines().map(str::trim).find(|l| !l.is_empty()) else {
+    let wanted: Vec<&str> = old.lines().skip_while(|l| l.trim().is_empty()).collect();
+    let Some(first) = wanted.first().map(|l| l.trim()) else {
         return format!("old was not found in {path}");
     };
-    let hits: Vec<String> = text
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.trim() == first)
-        .map(|(i, _)| (i + 1).to_string())
-        .take(5)
+    let lines: Vec<&str> = text.lines().collect();
+    // Each place the first line occurs, with how many of old's lines match there as they are.
+    let places: Vec<(usize, usize)> = (0..lines.len())
+        .filter(|&at| lines[at].trim() == first)
+        .map(|at| (at, wanted.iter().zip(&lines[at..]).take_while(|(w, l)| w == l).count()))
         .collect();
-    if hits.is_empty() {
-        format!(
+    let Some(&(at, same)) = places.iter().max_by_key(|&&(at, same)| (same, Reverse(at))) else {
+        return format!(
             "old was not found in {path}, and neither was its first line; read the file again, \
              it may not be what you remember"
-        )
-    } else {
-        format!(
-            "old was not found in {path}. Its first line appears (ignoring indentation) at line {}; \
-             check the whitespace and the lines after it against the file",
-            hits.join(", ")
-        )
+        );
+    };
+    let mut out = format!("old was not found in {path}. ");
+    let line = at + 1;
+    let matched = |n: usize| match n {
+        1 => format!("Its first line matches line {line}"),
+        n => format!("Its first {n} lines match lines {line}–{}", line + n - 1),
+    };
+    match (same, lines.get(at + same)) {
+        (n, _) if n == wanted.len() => out.push_str(&format!(
+            "All its lines match lines {line}–{}, but not with the same line endings or blank \
+             lines around them.",
+            line + n - 1
+        )),
+        (n, None) => out.push_str(&format!("{}, where the file ends.", matched(n))),
+        (n, Some(theirs)) => {
+            let ours = wanted[n];
+            match n {
+                0 => out.push_str("Its first line "),
+                n => out.push_str(&format!("{}, but its line {} ", matched(n), n + 1)),
+            }
+            if ours.trim() == theirs.trim() {
+                out.push_str(&format!(
+                    "differs from line {} in whitespace only:\n  old:  {ours:?}\n  file: \
+                     {theirs:?}",
+                    line + n
+                ));
+            } else {
+                out.push_str(&format!(
+                    "differs from line {}:\n  old:  {}\n  file: {}",
+                    line + n,
+                    clip(ours),
+                    clip(theirs)
+                ));
+            }
+        }
     }
+    let others: Vec<String> =
+        places.iter().filter(|p| p.0 != at).map(|p| (p.0 + 1).to_string()).take(5).collect();
+    if !others.is_empty() {
+        out.push_str(&format!("\n(Its first line also appears at line {}.)", others.join(", ")));
+    }
+    // The lines the edit was meant for, and a few around them; around the difference if many.
+    let (mut from, mut to) = (at.saturating_sub(2), (at + wanted.len() + 2).min(lines.len()));
+    if to - from > SHOWN_ON_MISS {
+        from = (at + same).saturating_sub(5).max(from);
+        to = to.min(from + SHOWN_ON_MISS);
+    }
+    let shown: Vec<Cow<str>> = lines[from..to].iter().map(|line| clip(line)).collect();
+    out.push_str(&format!("\nLines {}–{to} of {path} read:\n", from + 1));
+    out.push_str(&numbered(shown.iter().map(|line| &**line), from + 1));
+    out
 }
 
 /// The 1-based line that byte `index` is on.
@@ -365,8 +416,52 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("w.txt")).unwrap(), "uno\r\ndos\r\n");
 
         let miss = files.edit("a.py", "  b = 3\n  c = 4", "x", false).unwrap_err();
-        assert!(miss.contains("at line 2"), "{miss}");
+        assert!(miss.contains("first line differs from line 2 in whitespace only"), "{miss}");
         let gone = files.edit("a.py", "zzz", "x", false).unwrap_err();
         assert!(gone.contains("neither was its first line"), "{gone}");
+    }
+
+    #[test]
+    fn a_missed_edit_shows_where_it_stopped_matching() {
+        let dir = workspace("missed");
+        let mut text: String = (1..=60).map(|i| format!("x{i} = {i}\n")).collect();
+        text.push_str("def f():\n\tif a:\n        return 1\n    return 2\n");
+        fs::write(dir.join("m.py"), &text).unwrap();
+        let mut files = Files::new(&dir);
+
+        // A later line that is not what the file has: the place, the two lines, and the file there.
+        let miss = files.edit("m.py", "x30 = 30\nx31 = 31\nx32 = 99\nx33 = 33", "y", false);
+        let miss = miss.unwrap_err();
+        assert!(
+            miss.starts_with(
+                "old was not found in m.py. Its first 2 lines match lines 30–31, but its line 3 \
+                 differs from line 32:\n  old:  x32 = 99\n  file: x32 = 32\nLines 28–35 of m.py \
+                 read:\n    28\tx28 = 28\n"
+            ),
+            "{miss}"
+        );
+        assert!(miss.ends_with("    35\tx35 = 35\n"), "{miss}");
+
+        // A tab where the file has spaces.
+        let miss = files.edit("m.py", "\tif a:\n\t\treturn 1", "y", false).unwrap_err();
+        assert!(
+            miss.contains(
+                "Its first line matches line 62, but its line 2 differs from line 63 \
+                 in whitespace only:\n  old:  \"\\t\\treturn 1\"\n  file: \"        return 1\""
+            ),
+            "{miss}"
+        );
+        // Past the end of the file, and a long old shown around where it stopped matching.
+        let past = files.edit("m.py", "    return 2\n    return 3", "y", false).unwrap_err();
+        assert!(past.contains("Its first line matches line 64, where the file ends."), "{past}");
+        let long: String =
+            (1..=50).map(|i| format!("x{i} = {}\n", if i == 45 { 0 } else { i })).collect();
+        let miss = files.edit("m.py", &long, "y", false).unwrap_err();
+        assert!(
+            miss.contains("first 44 lines match lines 1–44, but its line 45 differs from line 45")
+                && miss.contains("Lines 40–52 of"),
+            "{miss}"
+        );
+        assert_eq!(fs::read_to_string(dir.join("m.py")).unwrap(), text);
     }
 }

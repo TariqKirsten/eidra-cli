@@ -190,7 +190,10 @@ impl Agent {
             task,
         };
         let mut session = Session::create(&options.session_root, header)?;
-        let tools = Toolbox::new(&profile, &workspace, session.dir(), definitions)?;
+        let mut tools = Toolbox::new(&profile, &workspace, session.dir(), definitions)?;
+        if options.headless && !subagent {
+            tools.check_tests_at_finish();
+        }
 
         let mode = if subagent {
             &profile.prompts.subagent
@@ -263,7 +266,10 @@ impl Agent {
             .and_then(|name| std::env::var(name).ok())
             .filter(|key| !key.is_empty());
         let client = Client::new(&profile.base_url, api_key, options.model_socket.as_deref())?;
-        let tools = Toolbox::new(&profile, &workspace, session.dir(), header.tools.clone())?;
+        let mut tools = Toolbox::new(&profile, &workspace, session.dir(), header.tools.clone())?;
+        if header.headless {
+            tools.check_tests_at_finish();
+        }
 
         // The last reply, and whether the turn it belongs to ended: with a reply that calls
         // nothing, or with finish.
