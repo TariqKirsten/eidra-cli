@@ -103,6 +103,41 @@ the binary mounted into it, since it is static:
 
 On the host, without a container, it is just `target/release/eidra` in the project's directory.
 
+### On Windows
+
+With Docker Desktop and its WSL2 engine, the same image runs on a Windows host. Build it there from
+a clone of this repository (`docker build -t eidra .`), or copy one over:
+`docker save eidra | gzip > eidra.tar.gz` where it was built, then `docker load -i eidra.tar.gz`.
+
+`scripts/eidra-docker` is bash, so a PowerShell function takes its place. Put it in your PowerShell
+profile (`notepad $PROFILE`):
+
+    $env:RADIANCE_API_KEY = "<key>"
+    $env:EIDRA_BASE_URL   = "http://<model-server>:8000/v1"
+
+    function eidra {
+      $name = Split-Path -Leaf $PWD
+      docker run --rm -it `
+        -v "${PWD}:/work/${name}:ro" -w "/work/${name}" `
+        -v eidra-data:/home/eidra/.eidra `
+        -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e COLORTERM=truecolor -e TZ=Africa/Johannesburg `
+        --detach-keys "ctrl-^,ctrl-q" `
+        eidra @args
+    }
+
+Then, in a project's folder, `eidra` starts a session, `eidra --continue` goes on with the last one
+and `eidra sessions` lists them; any other arguments go to eidra as they are.
+
+Where it differs from the Linux wrapper:
+- The project is mounted read-only (`:ro`) at `/work/<folder>`, so the agent reads and explains the
+  code but cannot change it. Leave out `:ro` to let it edit.
+- eidra's directory is a Docker volume, `eidra-data`, so sessions and checkpoints outlive the
+  container; `docker volume rm eidra-data` deletes them.
+- There is no `--network host`: the container reaches the model server at `EIDRA_BASE_URL`, on your
+  network or over a VPN such as Tailscale.
+- It runs as the container's root user, so git accepts the repository Windows mounts into it.
+- `TZ` is your time zone, for the dates the agent reads and writes.
+
 ## The interactive session
 
 `eidra` with no command starts a session in the current directory. Finished output goes into the
