@@ -42,7 +42,13 @@ impl Files {
         if abs.is_dir() {
             return Err(format!("{path} is a directory; list it with bash (ls) or glob"));
         }
-        let bytes = fs::read(&abs).map_err(|e| self.failed(path, &abs, format!("{path}: {e}")))?;
+        let bytes = fs::read(&abs).map_err(|e| {
+            let elsewhere = match e.kind() {
+                std::io::ErrorKind::NotFound => self.elsewhere(&abs),
+                _ => String::new(),
+            };
+            self.failed(path, &abs, format!("{path}: {e}{elsewhere}"))
+        })?;
         let out = listing(path, &bytes, offset, limit)?;
         self.seen.insert(abs, fnv1a(&bytes));
         Ok(out)
@@ -78,9 +84,12 @@ impl Files {
                 path,
                 &abs,
                 match e.kind() {
-                    std::io::ErrorKind::NotFound => {
-                        format!("{path} does not exist; create it with write")
-                    }
+                    std::io::ErrorKind::NotFound => match self.elsewhere(&abs) {
+                        elsewhere if elsewhere.is_empty() => {
+                            format!("{path} does not exist; create it with write")
+                        }
+                        elsewhere => format!("{path} does not exist{elsewhere}"),
+                    },
                     _ => format!("{path}: {e}"),
                 },
             )
@@ -131,6 +140,19 @@ impl Files {
             String::new()
         };
         Ok(format!("Edited {path}{count}. Lines {from}–{to} now read:\n{snippet}"))
+    }
+
+    /// Where files with the name of `abs`, which does not exist, are in the workspace: a path with
+    /// a directory missing or doubled is a common slip, which a search would otherwise cost a step.
+    fn elsewhere(&self, abs: &Path) -> String {
+        let Some(name) = abs.file_name().and_then(|n| n.to_str()) else {
+            return String::new();
+        };
+        match super::search::named(&self.workspace, name, 5).as_slice() {
+            [] => String::new(),
+            [one] => format!(". There is a {name} at {one}"),
+            many => format!(". There are files named {name} at {}", many.join(", ")),
+        }
     }
 
     /// An I/O error on `path`. A path outside the workspace is usually a mistaken absolute path, or
@@ -419,6 +441,23 @@ mod tests {
         assert!(miss.contains("first line differs from line 2 in whitespace only"), "{miss}");
         let gone = files.edit("a.py", "zzz", "x", false).unwrap_err();
         assert!(gone.contains("neither was its first line"), "{gone}");
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_names_files_of_its_name() {
+        let dir = workspace("elsewhere");
+        fs::create_dir_all(dir.join("pkg/service")).unwrap();
+        fs::write(dir.join("pkg/service/post.py"), "x = 1\n").unwrap();
+        let mut files = Files::new(&dir);
+        let read = files.read("service/post.py", None, None).unwrap_err();
+        assert!(read.ends_with(". There is a post.py at pkg/service/post.py"), "{read}");
+        let edit = files.edit("service/post.py", "x = 1", "x = 2", false).unwrap_err();
+        assert_eq!(
+            edit,
+            "service/post.py does not exist. There is a post.py at pkg/service/post.py"
+        );
+        let new = files.edit("nowhere.py", "x = 1", "x = 2", false).unwrap_err();
+        assert_eq!(new, "nowhere.py does not exist; create it with write");
     }
 
     #[test]

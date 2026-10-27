@@ -52,6 +52,18 @@ fn files_under(root: &Path) -> impl Iterator<Item = PathBuf> {
         .map(|entry| entry.into_path())
 }
 
+/// Files in the workspace named `name`, the first `most` of them by path: what a path that does
+/// not exist was often meant to be. The walk stops after `MOST_WALKED` files.
+pub fn named(workspace: &Path, name: &str, most: usize) -> Vec<String> {
+    const MOST_WALKED: usize = 100_000;
+    files_under(workspace)
+        .take(MOST_WALKED)
+        .filter(|file| file.file_name().is_some_and(|n| n == name))
+        .take(most)
+        .map(|file| display(workspace, &file))
+        .collect()
+}
+
 /// A path as the model should see it: relative to the workspace when it is inside it.
 fn display(workspace: &Path, path: &Path) -> String {
     path.strip_prefix(workspace).unwrap_or(path).display().to_string()
