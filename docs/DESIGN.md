@@ -575,7 +575,11 @@ Reference: codex-rs `tui`.
     a kill, get results that say eidra stopped before them, and if the last turn did not end, the
     next message starts with the `interrupted` note. Request numbers, and so seeds, go on from
     where they were, and the shell starts in the directory, with the exports, its last command
-    left. A log line cut short by a crash is cut off.
+    left. A log line cut short by a crash is cut off, and so is a last line without its newline
+    however whole it looks, so that the messages read back are the ones the file keeps.
+  - A session open in an eidra is locked (`flock`), before its log is read, so that another
+    eidra neither goes on with it nor adds to it meanwhile; it says the session is open in
+    another eidra.
   - The TUI shows the conversation again, its last 80 messages, as they were shown at the time,
     and finds the session's checkpoints, so `/undo` still works.
   - A subagent's session cannot be resumed, nor an unattended one in the TUI or the other way
@@ -594,6 +598,12 @@ Reference: codex-rs `tui`.
     over 8 MiB, for good. The home and root directories get no checkpoints, and neither does a
     workspace with over 20,000 new files at once. A nested git repository is recorded as its
     commit, not its files.
+  - **Exact bytes:** the repository's own attributes, which come before the project's, turn off
+    the project's filters and its line-ending, `ident` and encoding conversions
+    (`* !filter -text -ident -working-tree-encoding`), so `/undo` puts each file back byte for
+    byte. Without them a project's `*.bat text eol=crlf` put a file written with LF back with
+    CRLF, `text=auto` lost a file's CRLFs, and a filter of the user's (a global one that strips
+    notebooks' outputs, say) put a notebook back without them.
   - **`/undo`** puts back what the latest turn that changed files changed: files it modified or
     deleted come back as they were before it, and files it made are removed, with any directories
     it made for them. A file changed again after the turn, by the user or anything else, is left

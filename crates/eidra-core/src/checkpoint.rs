@@ -682,6 +682,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn undo_puts_back_exact_bytes_whatever_the_projects_attributes() {
+        if !has_git() {
+            return eprintln!("no git: skipped");
+        }
+        let s = Scratch::new("bytes");
+        // Rules that change a file on its way into a snapshot or back out of one.
+        s.write(
+            ".gitattributes",
+            "*.bat text eol=crlf\n*.py text=auto\n*.txt ident\n*.ipynb filter=strip\n",
+        );
+        let files = [
+            ("run.bat", "@echo off\necho written with LF\n"),
+            ("src/a.py", "a = 1\r\nb = 2\r\n"),
+            ("id.txt", "$Id: as typed $\n"),
+            ("nb.ipynb", "{\"outputs\": [\"kept\"]}\n"),
+        ];
+        for (path, text) in files {
+            s.write(path, text);
+        }
+        let mut checkpoints = s.open("s1").await;
+        checkpoints.ready().await.unwrap();
+        // A filter of the user's, which leaves the outputs out.
+        checkpoints.git(&["config", "filter.strip.clean", "sed s/kept//"]).await.unwrap();
+        checkpoints.begin("change them").await.unwrap();
+        for (path, _) in files {
+            s.write(path, "changed\n");
+        }
+        checkpoints.end().await.unwrap();
+        checkpoints.undo().await.unwrap().unwrap();
+        for (path, text) in files {
+            assert_eq!(s.read(path).as_deref(), Some(text), "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_resumed_session_finds_its_turns() {
         if !has_git() {
             return eprintln!("no git: skipped");

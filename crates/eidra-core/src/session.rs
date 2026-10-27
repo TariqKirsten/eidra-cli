@@ -435,6 +435,54 @@ mod tests {
         let log = Log::read(&path).unwrap();
         assert_eq!(log.messages.len(), 3);
         assert!(!fs::read_to_string(&path).unwrap().contains("assis"));
+        drop(session);
+
+        // A last line written whole but for its newline was cut short too, however whole it
+        // looks: it goes, and the line written after it takes its place.
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, text.strip_suffix('\n').unwrap()).unwrap();
+        assert_eq!(Log::read(&path).unwrap().messages.len(), 2);
+        let (mut session, log) = Session::open(&path).unwrap();
+        assert_eq!((log.messages.len(), session.messages().len()), (2, 2));
+        session.push(Message::user("once more"), None).unwrap();
+        let log = Log::read(&path).unwrap();
+        assert_eq!(log.messages.len(), 3);
+        assert_eq!(log.messages[2].0, Message::user("once more"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn header(workspace: &str, headless: bool) -> Header {
+        Header {
+            version: 1,
+            id: String::new(),
+            created: String::new(),
+            workspace: workspace.into(),
+            headless,
+            profile: "p".into(),
+            profile_hash: "h".into(),
+            base_url: "http://x/v1".into(),
+            model: "m".into(),
+            reasoning_effort: "medium".into(),
+            tools: vec![],
+            parent: None,
+            task: None,
+        }
+    }
+
+    #[test]
+    fn a_session_is_open_in_one_eidra_at_a_time() {
+        let root = std::env::temp_dir().join(format!("eidra-lock-test-{}", std::process::id()));
+        let mut session = Session::create(&root, header("/work", false)).unwrap();
+        session.push(Message::user("hi"), None).unwrap();
+        let path = session.path().to_path_buf();
+        let busy = Session::open(&path).err().unwrap();
+        assert!(busy.to_string().contains("open in another eidra"), "{busy}");
+        drop(session);
+        // Once it is left, another goes on with it, and has it to itself in turn.
+        let (again, _) = Session::open(&path).unwrap();
+        assert!(Session::open(&path).is_err());
+        drop(again);
+        assert!(Session::open(&path).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 }
