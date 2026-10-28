@@ -648,8 +648,9 @@ pub fn agent_command(
 }
 
 /// One attempt at a Harbor task: the agent in a container of the task's image, then the verifier
-/// in the same container. A task whose environment cannot be made counts as a failed attempt, with
-/// the reason in error.log, so that one bad image does not stop a long run.
+/// in the same container. An attempt whose environment cannot be made, or whose model server stops
+/// answering, is lost, with the reason in error.log, so that one bad image or a server gone does
+/// not stop a long run or count against the agent.
 pub async fn run_attempt(
     context: &RunContext,
     task: &Task,
@@ -660,31 +661,13 @@ pub async fn run_attempt(
     let dir = context.run_dir.join(task.id()).join(repeat.to_string());
     let sessions = dir.join("sessions");
     fs::create_dir_all(&sessions)?;
-    let started = Instant::now();
-    let failed = |error: anyhow::Error| -> Result<Attempt> {
-        fs::write(dir.join("error.log"), format!("{error:#}\n"))?;
-        let setup = CheckResult {
-            name: "setup".into(),
-            passed: false,
-            timed_out: false,
-            seconds: started.elapsed().as_secs_f64(),
-            reward: None,
-        };
-        Ok(Attempt {
-            task: task.id().to_owned(),
-            split: task.spec.split,
-            repeat,
-            passed: false,
-            checks: vec![setup],
-            exit_code: None,
-            timed_out: false,
-            wall_s: 0.0,
-            metrics: metrics::read(&sessions).unwrap_or_default(),
-        })
+    let lost = |reason: String| -> Result<Attempt> {
+        fs::write(dir.join("error.log"), format!("{reason}\n"))?;
+        Ok(Attempt::lost(task, repeat, reason, metrics::read(&sessions).unwrap_or_default()))
     };
     let images = match images_for(context, task, config).await {
         Ok(images) => images,
-        Err(error) => return failed(error),
+        Err(error) => return lost(format!("setup: {error:#}")),
     };
     let setup = AgentSetup {
         route: &context.route,
@@ -696,15 +679,17 @@ pub async fn run_attempt(
     };
     let mut env = match Env::start(&images.tag, config, Some(&setup)).await {
         Ok(env) => env,
-        Err(error) => return failed(error),
+        Err(error) => return lost(format!("setup: {error:#}")),
     };
-    let outcome = agent_then_verifier(&mut env, &setup, task, config, max_requests, &dir).await;
+    let outcome =
+        agent_then_verifier(&mut env, &setup, task, config, max_requests, &dir, context).await;
     let image = env.image().to_owned();
     env.remove().await;
     give_back(&sessions, &image).await;
     let (finished, verdict) = match outcome {
-        Ok(outcome) => outcome,
-        Err(error) => return failed(error),
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return lost(super::SERVER_DOWN.into()),
+        Err(error) => return lost(format!("{error:#}")),
     };
     let check = CheckResult {
         name: "verifier".into(),
@@ -722,10 +707,13 @@ pub async fn run_attempt(
         exit_code: finished.code,
         timed_out: finished.timed_out,
         wall_s: finished.seconds,
+        lost: None,
         metrics: metrics::read(&sessions)?,
     })
 }
 
+/// The agent, then the verifier on what it left; nothing if the model server stopped answering
+/// while the agent ran.
 async fn agent_then_verifier(
     env: &mut Env,
     setup: &AgentSetup<'_>,
@@ -733,7 +721,8 @@ async fn agent_then_verifier(
     config: &Config,
     max_requests: usize,
     dir: &Path,
-) -> Result<(Finished, Verdict)> {
+    context: &RunContext,
+) -> Result<Option<(Finished, Verdict)>> {
     // Behind the relay the agent has no network but loopback.
     if matches!(setup.route, Route::Socket(_)) {
         env.set_network(false).await?;
@@ -742,23 +731,29 @@ async fn agent_then_verifier(
     let command: Vec<&str> = command.iter().map(String::as_str).collect();
     let vars: Vec<String> = setup.api_key_env.map(str::to_owned).into_iter().collect();
     let timeout = Duration::from_secs_f64(config.agent_timeout_s);
-    let finished = env
-        .exec(
-            &command,
-            config.agent_user.as_deref(),
-            &vars,
-            timeout,
-            &dir.join("events.jsonl"),
-            Some(&dir.join("agent.log")),
-        )
-        .await?;
+    let user = config.agent_user.as_deref();
+    let (events, log) = (dir.join("events.jsonl"), dir.join("agent.log"));
+    // Dropping the command stops docker exec; removing the container then stops the agent.
+    let finished = tokio::select! {
+        finished = env.exec(&command, user, &vars, timeout, &events, Some(&log)) => finished?,
+        () = context.health.down() => return Ok(None),
+    };
     env.resume().await?;
     fs::write(dir.join("agent.patch"), env.agent_patch().await?)?;
     let verdict = verify(env, &task.dir, config, &dir.join("checks")).await?;
-    Ok((finished, verdict))
+    Ok(Some((finished, verdict)))
 }
 
-/// The task's images, made once per run.
+/// Waits before fetching a task's image again after the network failed it: about 15 minutes in
+/// all, which a run waits out rather than lose every task after an outage.
+const FETCH_RETRIES: [Duration; 4] = [
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(240),
+    Duration::from_secs(480),
+];
+
+/// The task's images, made once per run. Fetching them again after the network failed it.
 async fn images_for(context: &RunContext, task: &Task, config: &Config) -> Result<Images> {
     let mut made = context.images.lock().await;
     if let Some(images) = made.get(task.id()) {
@@ -766,9 +761,48 @@ async fn images_for(context: &RunContext, task: &Task, config: &Config) -> Resul
     }
     let dir = context.run_dir.join(task.id());
     fs::create_dir_all(&dir)?;
-    let images = image(task.id(), &task.dir, config, &dir.join("image.log")).await?;
+    let log = dir.join("image.log");
+    let mut waits = FETCH_RETRIES.iter();
+    let images = loop {
+        let error = match image(task.id(), &task.dir, config, &log).await {
+            Ok(images) => break images,
+            Err(error) => error,
+        };
+        match waits.next() {
+            Some(wait) if network_failed(&fs::read_to_string(&log).unwrap_or_default()) => {
+                eprintln!(
+                    "fetching {}'s image failed on the network; trying again in {} s",
+                    task.id(),
+                    wait.as_secs()
+                );
+                tokio::time::sleep(*wait).await;
+            }
+            _ => return Err(error),
+        }
+    };
     made.insert(task.id().to_owned(), images.clone());
     Ok(images)
+}
+
+/// Whether Docker's log says a fetch failed on the network, which may come back, rather than on
+/// the image.
+fn network_failed(log: &str) -> bool {
+    const SIGNS: [&str; 13] = [
+        "i/o timeout",
+        "TLS handshake timeout",
+        "connection reset by peer",
+        "connection refused",
+        "no such host",
+        "Temporary failure in name resolution",
+        "server misbehaving",
+        "DeadlineExceeded",
+        "request canceled",
+        "unexpected EOF",
+        "toomanyrequests",
+        "502 Bad Gateway",
+        "503 Service Unavailable",
+    ];
+    SIGNS.iter().any(|sign| log.contains(sign))
 }
 
 /// Validates a Harbor task: the verifier on the untouched environment, then on one where
@@ -872,6 +906,19 @@ async fn quiet(args: &[&str]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fetch the network failed is tried again; an image that fails to build is not.
+    #[test]
+    fn a_fetch_failed_by_the_network_is_told_from_a_broken_image() {
+        // As Docker logged it on 2026-10-28, eleven times.
+        let outage = "#2 ERROR: failed to do request: Head \"https://registry-1.docker.io/v2/\
+                      swerebenchv2/livekit__agents-5944/manifests/v0.1.0\": dial tcp: lookup \
+                      registry-1.docker.io: i/o timeout";
+        assert!(network_failed(outage));
+        let broken = "ERROR: failed to solve: process \"/bin/sh -c pip install -e .\" did not \
+                      complete successfully: exit code: 1";
+        assert!(!network_failed(broken));
+    }
 
     #[test]
     fn reads_old_and_new_task_files() {

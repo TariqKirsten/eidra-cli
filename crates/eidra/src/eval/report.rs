@@ -69,11 +69,20 @@ fn share(part: f64) -> String {
 }
 
 /// The start of a hash, enough to tell runs apart; runs from before binaries were hashed have none.
-fn short(hash: &str) -> &str {
+pub(super) fn short(hash: &str) -> &str {
     if hash.is_empty() { "-" } else { &hash[..8.min(hash.len())] }
 }
 
 pub fn progress(done: usize, total: usize, attempt: &Attempt) {
+    if let Some(reason) = &attempt.lost {
+        let width = total.to_string().len();
+        let reason = reason.lines().next().unwrap_or_default();
+        eprintln!(
+            "[{done:>width$}/{total}] {:<16} #{:<2} LOST: {reason}",
+            attempt.task, attempt.repeat
+        );
+        return;
+    }
     let verdict = if attempt.passed {
         "pass".to_owned()
     } else if attempt.timed_out {
@@ -107,7 +116,16 @@ pub fn progress(done: usize, total: usize, attempt: &Attempt) {
     );
 }
 
+/// The attempts that say something about the agent, and how many were lost.
+fn counted(attempts: &[Attempt]) -> (Vec<Attempt>, usize) {
+    let (lost, counted): (Vec<&Attempt>, Vec<&Attempt>) =
+        attempts.iter().partition(|a| a.is_lost());
+    (counted.into_iter().cloned().collect(), lost.len())
+}
+
 pub fn print(manifest: &Manifest, attempts: &[Attempt]) {
+    let (attempts, lost) = counted(attempts);
+    let attempts = attempts.as_slice();
     let regraded =
         manifest.regraded.as_ref().map_or(String::new(), |when| format!(" · regraded {when}"));
     let network = match manifest.network {
@@ -163,11 +181,19 @@ pub fn print(manifest: &Manifest, attempts: &[Attempt]) {
     println!(
         "  medians per attempt; cached is the prompt share the cache supplied; errors are tool errors per attempt"
     );
+    if lost > 0 {
+        println!(
+            "  {lost} attempts lost to something outside the agent are left out; `eidra eval run \
+             --resume` runs them again"
+        );
+    }
 }
 
 pub fn compare(before: &(Manifest, Vec<Attempt>), after: &(Manifest, Vec<Attempt>)) {
     let (before_manifest, before_attempts) = before;
     let (after_manifest, after_attempts) = after;
+    let (before_attempts, after_attempts) = (counted(before_attempts).0, counted(after_attempts).0);
+    let (before_attempts, after_attempts) = (before_attempts.as_slice(), after_attempts.as_slice());
     let name = |m: &Manifest| {
         format!(
             "{} (profile {}, binary {}, {})",

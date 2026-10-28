@@ -11,6 +11,7 @@
 
 mod docker;
 mod harbor;
+mod health;
 mod metrics;
 mod report;
 mod select;
@@ -135,6 +136,22 @@ struct RunArgs {
     /// PATH is left as the image has it
     #[arg(long, value_name = "DIR")]
     tools: Option<PathBuf>,
+
+    /// The eidra binary the attempts run [default: this one], so that a frozen agent can be run
+    /// by a newer eval. It must be built for the task images: static, for Linux
+    #[arg(long, value_name = "PATH")]
+    agent: Option<PathBuf>,
+
+    /// Go on with a recorded run: run the attempts it is missing, and again those it lost to
+    /// something outside the agent (an image that could not be made, a model server that stopped
+    /// answering), with its own suite, tasks, attempts, label, network and checkers. The agent
+    /// binary and the profile must be the ones it ran
+    #[arg(
+        long,
+        value_name = "RUN_DIR",
+        conflicts_with_all = ["suite", "tasks", "split", "repeats", "parallel", "label", "network"]
+    )]
+    resume: Option<PathBuf>,
 }
 
 /// Where `--tools` is mounted in an attempt's container.
@@ -186,9 +203,15 @@ pub struct Manifest {
     /// The checkers mounted into each attempt (`--tools`), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<String>,
+    /// Requests per attempt for every task (`--max-requests`), if not each task's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<usize>,
     /// When the checks were last run again on the attempts (`eidra eval regrade`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regraded: Option<String>,
+    /// When the run was taken up again (`eidra eval run --resume`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resumed: Vec<String>,
 }
 
 /// One attempt at one task: a line of results.jsonl.
@@ -202,8 +225,36 @@ pub struct Attempt {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub wall_s: f64,
+    /// Why the attempt says nothing about the agent, if it does not: its image could not be made,
+    /// or the model server stopped answering. Reports leave it out, and `--resume` runs it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lost: Option<String>,
     #[serde(flatten)]
     pub metrics: Metrics,
+}
+
+impl Attempt {
+    /// A lost attempt, which ran nothing worth keeping.
+    fn lost(task: &Task, repeat: u32, reason: String, metrics: Metrics) -> Attempt {
+        Attempt {
+            task: task.id().to_owned(),
+            split: task.spec.split,
+            repeat,
+            passed: false,
+            checks: Vec::new(),
+            exit_code: None,
+            timed_out: false,
+            wall_s: 0.0,
+            lost: Some(reason),
+            metrics,
+        }
+    }
+
+    /// Whether it says nothing about the agent. Runs from before `lost` was recorded marked an
+    /// image that could not be made as a failed check named `setup`.
+    pub fn is_lost(&self) -> bool {
+        self.lost.is_some() || self.checks.iter().any(|c| c.name == "setup" && !c.passed)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,7 +283,62 @@ struct RunContext {
     route: harbor::Route,
     /// Harbor tasks' images, made once per run.
     images: tokio::sync::Mutex<HashMap<String, harbor::Images>>,
+    /// Whether the model server still answers.
+    health: health::Health,
 }
+
+/// What a run needs of the profile its agents use.
+#[derive(Deserialize)]
+struct RunProfile {
+    name: String,
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(skip)]
+    hash: String,
+}
+
+impl RunProfile {
+    /// The profile in `dir`, or the built-in one. An agent of another version (`--agent`) may
+    /// know fields this one does not, so its profile is read for these fields alone, and left to
+    /// the agent to check.
+    fn read(dir: Option<&Path>, other_agent: bool) -> Result<RunProfile> {
+        let (profile, hash) = match dir {
+            Some(dir) if other_agent => {
+                let read = |name: &str| {
+                    let path = dir.join(name);
+                    fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
+                };
+                let (toml_text, system) = (read("profile.toml")?, read("system.md")?);
+                let profile: RunProfile = toml::from_str(&toml_text)
+                    .with_context(|| format!("{}", dir.join("profile.toml").display()))?;
+                (profile, Profile::hash_of(&toml_text, &system))
+            }
+            _ => {
+                let p = match dir {
+                    Some(dir) => Profile::load(dir)?,
+                    None => Profile::builtin()?,
+                };
+                let profile = RunProfile {
+                    name: p.name,
+                    base_url: p.base_url,
+                    model: p.model,
+                    api_key_env: p.api_key_env,
+                    hash: String::new(),
+                };
+                (profile, p.hash)
+            }
+        };
+        Ok(RunProfile { hash, ..profile })
+    }
+}
+
+/// What an attempt is recorded as when the model server stops answering while it runs.
+const SERVER_DOWN: &str = "the model server stopped answering";
+
+/// How long a run waits for a model server that stopped answering before it stops.
+const OUTAGE_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 pub async fn run(args: EvalArgs) -> Result<i32> {
     match args.command {
@@ -276,52 +382,83 @@ fn select(selection: &Selection) -> Result<Vec<Task>> {
     Ok(tasks)
 }
 
-async fn run_suite(args: RunArgs) -> Result<i32> {
+async fn run_suite(mut args: RunArgs) -> Result<i32> {
+    // A run taken up again is run as it was recorded.
+    let resumed = args.resume.as_deref().map(load_run).transpose()?;
+    if let Some((manifest, _)) = &resumed {
+        args.selection = Selection {
+            suite: manifest.suite.clone().into(),
+            tasks: manifest.tasks.clone(),
+            split: None,
+        };
+        args.repeats = manifest.repeats;
+        args.parallel = manifest.parallel;
+        args.network = manifest.network.unwrap_or(Network::Host);
+        if args.tools.is_none() {
+            args.tools = manifest.tools.as_ref().map(PathBuf::from);
+        }
+        args.max_requests = args.max_requests.or(manifest.max_requests);
+    }
     let tasks = select(&args.selection)?;
-    let (profile, profile_dir) = match &args.profile {
-        Some(dir) => (Profile::load(dir)?, Some(fs::canonicalize(dir)?)),
-        None => (Profile::builtin()?, None),
-    };
+    let profile = RunProfile::read(args.profile.as_deref(), args.agent.is_some())?;
+    let profile_dir = args.profile.as_deref().map(fs::canonicalize).transpose()?;
+    let api_key = profile.api_key_env.as_ref().and_then(|var| std::env::var(var).ok());
     if let Some(var) = &profile.api_key_env
-        && std::env::var_os(var).is_none()
+        && api_key.is_none()
     {
         eprintln!("note: ${var} is not set, so the agent sends no API key");
     }
-    let label = args.label.clone().unwrap_or_else(|| profile.name.clone());
-    let (compact_stamp, iso_stamp) = now();
-    let run_dir = args.out.join(format!("{compact_stamp}-{}", sanitize(&label)));
-    fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
-    let run_dir = fs::canonicalize(&run_dir)?;
-
-    let binary = std::env::current_exe().context("finding the eidra binary")?;
+    let binary = match &args.agent {
+        Some(path) => {
+            fs::canonicalize(path).with_context(|| format!("--agent {}", path.display()))?
+        }
+        None => std::env::current_exe().context("finding the eidra binary")?,
+    };
     let binary_bytes =
         fs::read(&binary).with_context(|| format!("reading {}", binary.display()))?;
-    let manifest = Manifest {
-        label,
-        started: iso_stamp,
-        eidra: env!("CARGO_PKG_VERSION").into(),
-        binary_hash: format!("{:016x}", fnv1a(&binary_bytes)),
-        profile: profile.name.clone(),
-        profile_hash: profile.hash.clone(),
-        model: profile.model.clone(),
-        base_url: profile.base_url.clone(),
-        suite: args.selection.suite.display().to_string(),
-        tasks: tasks.iter().map(|t| t.id().to_owned()).collect(),
-        repeats: args.repeats,
-        parallel: args.parallel.max(1),
-        network: Some(args.network),
-        tools: args.tools.as_ref().map(|dir| dir.display().to_string()),
-        regraded: None,
-    };
+    let binary_hash = format!("{:016x}", fnv1a(&binary_bytes));
+
+    // Nothing is recorded for a server that does not answer. The watchdog asks it itself, as the
+    // agents would without the relay.
+    let client = eidra_llm::Client::new(&profile.base_url, api_key, None)?;
+    let timing = health::Timing::default();
+    if !health::probe(&client, &profile.model, timing.timeout).await {
+        bail!("the model server at {} does not answer", profile.base_url);
+    }
+    let health = health::Health::watch(client, profile.model.clone(), timing);
+
+    let (manifest, run_dir, kept) =
+        open_run(&args, resumed, &tasks, &profile, &binary, binary_hash)?;
+    // Every task once, then every task again: a run stopped early still covers the whole suite.
+    // Removing images instead runs each task's attempts together, so each image is fetched once.
+    let mut jobs: Vec<(usize, u32)> = (1..=args.repeats)
+        .flat_map(|repeat| (0..tasks.len()).map(move |task| (task, repeat)))
+        .filter(|&(task, repeat)| {
+            !kept.iter().any(|a| a.task == tasks[task].id() && a.repeat == repeat)
+        })
+        .collect();
+    if args.remove_images {
+        jobs.sort();
+    }
+    if jobs.is_empty() {
+        eprintln!("{} has every attempt it should; nothing to run", run_dir.display());
+        report::print(&manifest, &kept);
+        return Ok(0);
+    }
     fs::write(run_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest)? + "\n")?;
+    // What an attempt that never ended left behind would be read as the new one's.
+    for &(task, repeat) in &jobs {
+        set_aside(&run_dir, tasks[task].id(), repeat)?;
+    }
     eprintln!(
-        "eval run {} · {} tasks × {} attempts · profile {} ({}) · binary {}",
+        "eval run {} · {} tasks × {} attempts{} · profile {} ({}) · binary {}",
         run_dir.display(),
         tasks.len(),
         args.repeats,
+        if kept.is_empty() { String::new() } else { format!(", {} to run", jobs.len()) },
         profile.name,
-        &profile.hash[..8],
-        &manifest.binary_hash[..8]
+        report::short(&profile.hash),
+        report::short(&manifest.binary_hash)
     );
 
     // Agents in a vacuum reach the model through this relay, which runs as long as the run does.
@@ -351,24 +488,21 @@ async fn run_suite(args: RunArgs) -> Result<i32> {
         tools: args.tools.as_deref().map(fs::canonicalize).transpose().context("--tools")?,
         max_requests: args.max_requests,
         images: tokio::sync::Mutex::new(HashMap::new()),
+        health,
     });
     let tasks = Arc::new(tasks);
-    // Every task once, then every task again: a run stopped early still covers the whole suite.
-    // Removing images instead runs each task's attempts together, so each image is fetched once.
-    let mut jobs: Vec<(usize, u32)> = (1..=args.repeats)
-        .flat_map(|repeat| (0..tasks.len()).map(move |task| (task, repeat)))
-        .collect();
-    if args.remove_images {
-        jobs.sort();
+    let mut left = vec![0u32; tasks.len()];
+    for &(task, _) in &jobs {
+        left[task] += 1;
     }
-    let mut left = vec![args.repeats; tasks.len()];
     let mut results =
         OpenOptions::new().create(true).append(true).open(run_dir.join("results.jsonl"))?;
     let mut running = JoinSet::new();
-    let mut next = 0;
-    let mut attempts = Vec::new();
-    while next < jobs.len() || !running.is_empty() {
-        while next < jobs.len() && running.len() < manifest.parallel {
+    let (mut next, mut ended) = (0, 0);
+    let mut attempts = kept;
+    let mut stopped = false;
+    loop {
+        while next < jobs.len() && running.len() < manifest.parallel && context.health.is_up() {
             let (task, repeat) = jobs[next];
             next += 1;
             let (tasks, context) = (Arc::clone(&tasks), Arc::clone(&context));
@@ -377,13 +511,25 @@ async fn run_suite(args: RunArgs) -> Result<i32> {
                 (task, attempt)
             });
         }
+        if running.is_empty() {
+            if next == jobs.len() {
+                break;
+            }
+            // The server stopped answering, and the attempts it stopped have ended.
+            if !context.health.up_within(OUTAGE_LIMIT).await {
+                stopped = true;
+                break;
+            }
+            continue;
+        }
         let Some(joined) = running.join_next().await else {
             break;
         };
         let (task, attempt) = joined.context("an attempt panicked")?;
         let attempt = attempt?;
         writeln!(results, "{}", serde_json::to_string(&attempt)?)?;
-        report::progress(attempts.len() + 1, jobs.len(), &attempt);
+        ended += 1;
+        report::progress(ended, jobs.len(), &attempt);
         attempts.push(attempt);
         left[task] -= 1;
         if args.remove_images && left[task] == 0 {
@@ -398,7 +544,140 @@ async fn run_suite(args: RunArgs) -> Result<i32> {
     }
     eprintln!();
     report::print(&manifest, &attempts);
-    Ok(0)
+    if stopped {
+        eprintln!(
+            "\nThe model server has not answered for {} minutes, so the run stopped with {} \
+             attempts not run.",
+            OUTAGE_LIMIT.as_secs() / 60,
+            jobs.len() - next
+        );
+    }
+    if stopped || attempts.iter().any(Attempt::is_lost) {
+        eprintln!(
+            "To run the lost and missing attempts once all is well again:\n  {}",
+            resume_command(&args, &run_dir)
+        );
+    }
+    Ok(if stopped { 2 } else { 0 })
+}
+
+/// The run's manifest and directory, and the attempts it keeps: a new run's, or those of a recorded
+/// one taken up again, which must have run this agent binary and profile.
+fn open_run(
+    args: &RunArgs,
+    resumed: Option<(Manifest, Vec<Attempt>)>,
+    tasks: &[Task],
+    profile: &RunProfile,
+    binary: &Path,
+    binary_hash: String,
+) -> Result<(Manifest, PathBuf, Vec<Attempt>)> {
+    if let Some((mut manifest, attempts)) = resumed {
+        let run_dir = fs::canonicalize(args.resume.as_deref().unwrap_or(Path::new(".")))?;
+        if manifest.binary_hash != binary_hash {
+            bail!(
+                "the run's attempts ran an eidra binary of hash {}, and {} is {}: pass that binary \
+                 with --agent",
+                report::short(&manifest.binary_hash),
+                binary.display(),
+                report::short(&binary_hash)
+            );
+        }
+        if manifest.profile_hash != profile.hash {
+            bail!(
+                "the run used profile {} ({}), and this one is {} ({}): pass it with --profile",
+                manifest.profile,
+                report::short(&manifest.profile_hash),
+                profile.name,
+                report::short(&profile.hash)
+            );
+        }
+        manifest.resumed.push(now().1);
+        let kept = set_aside_lost(&run_dir, attempts)?;
+        return Ok((manifest, run_dir, kept));
+    }
+    let label = args.label.clone().unwrap_or_else(|| profile.name.clone());
+    let (compact_stamp, iso_stamp) = now();
+    let run_dir = args.out.join(format!("{compact_stamp}-{}", sanitize(&label)));
+    fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+    let manifest = Manifest {
+        label,
+        started: iso_stamp,
+        eidra: env!("CARGO_PKG_VERSION").into(),
+        binary_hash,
+        profile: profile.name.clone(),
+        profile_hash: profile.hash.clone(),
+        model: profile.model.clone(),
+        base_url: profile.base_url.clone(),
+        suite: args.selection.suite.display().to_string(),
+        tasks: tasks.iter().map(|t| t.id().to_owned()).collect(),
+        repeats: args.repeats,
+        parallel: args.parallel.max(1),
+        network: Some(args.network),
+        tools: args.tools.as_ref().map(|dir| dir.display().to_string()),
+        max_requests: args.max_requests,
+        regraded: None,
+        resumed: Vec::new(),
+    };
+    Ok((manifest, fs::canonicalize(&run_dir)?, Vec::new()))
+}
+
+/// The command that takes the run in `run_dir` up again, with what it cannot read from the run.
+fn resume_command(args: &RunArgs, run_dir: &Path) -> String {
+    let mut command = format!("eidra eval run --resume {}", run_dir.display());
+    if let Some(agent) = &args.agent {
+        command += &format!(" --agent {}", agent.display());
+    }
+    if let Some(profile) = &args.profile {
+        command += &format!(" --profile {}", profile.display());
+    }
+    if args.remove_images {
+        command += " --remove-images";
+    }
+    command
+}
+
+/// Before a run is taken up again: moves its lost attempts' lines to lost.jsonl and their
+/// directories under lost/, and returns the attempts it keeps. results.jsonl as it was the first
+/// time is kept in results.before-resume.jsonl.
+fn set_aside_lost(run_dir: &Path, attempts: Vec<Attempt>) -> Result<Vec<Attempt>> {
+    let (lost, kept): (Vec<Attempt>, Vec<Attempt>) =
+        attempts.into_iter().partition(Attempt::is_lost);
+    if lost.is_empty() {
+        return Ok(kept);
+    }
+    let results = run_dir.join("results.jsonl");
+    let original = run_dir.join("results.before-resume.jsonl");
+    if !original.exists() {
+        fs::copy(&results, &original)?;
+    }
+    let mut record =
+        OpenOptions::new().create(true).append(true).open(run_dir.join("lost.jsonl"))?;
+    for attempt in &lost {
+        writeln!(record, "{}", serde_json::to_string(attempt)?)?;
+        set_aside(run_dir, &attempt.task, attempt.repeat)?;
+    }
+    let mut lines = String::new();
+    for attempt in &kept {
+        lines += &(serde_json::to_string(attempt)? + "\n");
+    }
+    fs::write(&results, lines)?;
+    Ok(kept)
+}
+
+/// Moves an attempt's directory, if it has one, to lost/<task>/<repeat>-<n>.
+fn set_aside(run_dir: &Path, task: &str, repeat: u32) -> Result<()> {
+    let dir = run_dir.join(task).join(repeat.to_string());
+    if !dir.exists() {
+        return Ok(());
+    }
+    let parent = run_dir.join("lost").join(task);
+    fs::create_dir_all(&parent)?;
+    let aside = (1..)
+        .map(|n| parent.join(format!("{repeat}-{n}")))
+        .find(|path| !path.exists())
+        .unwrap_or_default();
+    fs::rename(&dir, &aside)
+        .with_context(|| format!("moving {} to {}", dir.display(), aside.display()))
 }
 
 async fn run_attempt(context: &RunContext, task: &Task, repeat: u32) -> Result<Attempt> {
@@ -442,9 +721,14 @@ async fn run_attempt(context: &RunContext, task: &Task, repeat: u32) -> Result<A
     }
     command.push(&task.spec.prompt);
     let timeout = Duration::from_secs(task.spec.timeout_s);
-    let finished = agent
-        .run(&command, timeout, &dir.join("events.jsonl"), Some(&dir.join("agent.log")))
-        .await?;
+    let (events, log) = (dir.join("events.jsonl"), dir.join("agent.log"));
+    let finished = tokio::select! {
+        finished = agent.run(&command, timeout, &events, Some(&log)) => finished?,
+        () = context.health.down() => {
+            let metrics = metrics::read(&sessions).unwrap_or_default();
+            return Ok(Attempt::lost(task, repeat, SERVER_DOWN.into(), metrics));
+        }
+    };
 
     let metrics = metrics::read(&sessions)?;
     let checks = run_checks(task, &work, &dir).await?;
@@ -457,6 +741,7 @@ async fn run_attempt(context: &RunContext, task: &Task, repeat: u32) -> Result<A
         exit_code: finished.code,
         timed_out: finished.timed_out,
         wall_s: finished.seconds,
+        lost: None,
         metrics,
     })
 }
@@ -733,6 +1018,67 @@ mod tests {
             args.windows(2).any(|pair| pair
                 == ["-e", &format!("EIDRA_MODEL_SOCKET={}", harbor::SOCKET_IN_CONTAINER)])
         );
+    }
+
+    fn attempt(task: &str, repeat: u32, lost: Option<&str>, checks: &[(&str, bool)]) -> Attempt {
+        Attempt {
+            task: task.into(),
+            split: Split::Test,
+            repeat,
+            passed: false,
+            checks: checks
+                .iter()
+                .map(|&(name, passed)| CheckResult {
+                    name: name.into(),
+                    passed,
+                    timed_out: false,
+                    seconds: 1.0,
+                    reward: None,
+                })
+                .collect(),
+            exit_code: Some(0),
+            timed_out: false,
+            wall_s: 1.0,
+            lost: lost.map(Into::into),
+            metrics: Metrics::default(),
+        }
+    }
+
+    /// Taking a run up again keeps the attempts that say something about the agent, and sets the
+    /// others aside, with their directories, so that what they left is not read as the new ones'.
+    #[test]
+    fn a_resumed_run_sets_its_lost_attempts_aside() {
+        let run = std::env::temp_dir().join(format!("eidra-resume-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&run);
+        for (task, repeat) in [("a", 1), ("b", 1), ("c", 2)] {
+            fs::create_dir_all(run.join(task).join(repeat.to_string()).join("sessions")).unwrap();
+        }
+        let attempts = vec![
+            attempt("a", 1, None, &[("verifier", false)]),
+            attempt("b", 1, Some(SERVER_DOWN), &[]),
+            // As runs from before `lost` recorded an image that could not be made.
+            attempt("c", 2, None, &[("setup", false)]),
+        ];
+        let lines: String =
+            attempts.iter().map(|a| serde_json::to_string(a).unwrap() + "\n").collect();
+        fs::write(run.join("results.jsonl"), &lines).unwrap();
+
+        let kept = set_aside_lost(&run, attempts).unwrap();
+        assert_eq!(kept.iter().map(|a| a.task.as_str()).collect::<Vec<_>>(), ["a"]);
+        let count = |name: &str| fs::read_to_string(run.join(name)).unwrap().lines().count();
+        assert_eq!(
+            (count("results.jsonl"), count("lost.jsonl"), count("results.before-resume.jsonl")),
+            (1, 2, 3)
+        );
+        assert!(run.join("a/1/sessions").is_dir());
+        assert!(!run.join("b/1").exists() && run.join("lost/b/1-1/sessions").is_dir());
+        assert!(!run.join("c/2").exists() && run.join("lost/c/2-1/sessions").is_dir());
+
+        // Set aside again, an attempt goes next to the first, which stays as it was.
+        fs::create_dir_all(run.join("b/1")).unwrap();
+        set_aside(&run, "b", 1).unwrap();
+        assert!(run.join("lost/b/1-1/sessions").is_dir() && run.join("lost/b/1-2").is_dir());
+        let _ = fs::remove_dir_all(&run);
     }
 
     /// Without a socket there is nothing to relay through, so the agent is on the host's network

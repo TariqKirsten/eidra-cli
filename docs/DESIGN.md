@@ -645,6 +645,15 @@ Reference: codex-rs `tui`.
   on a reference solution. `eidra eval regrade` runs the current checks again on what a recorded
   run's attempts left, after a check is fixed. The format and the rules for writing tasks are in
   evals/README.md.
+- **Lost attempts.** An attempt whose image could not be made, or whose model server stopped
+  answering, is recorded as lost and left out of reports. A watchdog asks the server for one
+  token every two minutes; two requests in a row unanswered for 150 s stop the attempts running,
+  none starts until the server answers, and after 30 minutes the run stops. `eidra eval run
+  --resume` then runs the lost and missing attempts, with the run's own agent binary (`--agent`,
+  so that a newer eval can run a frozen agent) and profile. Image fetches that fail on the network
+  are tried again over about 15 minutes. All of this came of the night of 2026-10-28,
+  when a card dropping off the bus left radiance taking requests it never answered, and a short
+  network outage then failed eleven image fetches in a row.
 - **`eidra replay`** sends one request of a recorded session again. Radiance is deterministic for
   a seed and a prompt, so with the recorded seed it should reproduce the reply exactly; a reply
   that differs means the server computed something else. Other seeds show what else the model

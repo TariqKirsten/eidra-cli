@@ -100,6 +100,7 @@ impl Container {
 
         let started = Instant::now();
         let mut child = cmd.spawn().context("starting docker")?;
+        let mut running = Running { name: &name, ended: false };
         let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
             Ok(status) => (status?, false),
             Err(_) => {
@@ -112,7 +113,27 @@ impl Container {
                 (child.wait().await?, true)
             }
         };
+        running.ended = true;
         Ok(Finished { code: status.code(), timed_out, seconds: started.elapsed().as_secs_f64() })
+    }
+}
+
+/// A container being run. Dropped before it ends, as when the run stops waiting on an attempt, it
+/// kills the container: killing `docker run` alone would leave it running.
+struct Running<'a> {
+    name: &'a str,
+    ended: bool,
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            let _ = std::process::Command::new("docker")
+                .args(["kill", self.name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 

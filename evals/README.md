@@ -11,6 +11,7 @@ the profile can be judged by numbers rather than by impression (docs/DESIGN.md Â
     eidra eval report evals/runs/<run>         # print a recorded run again
     eidra eval compare evals/runs/<a> evals/runs/<b>
     eidra eval regrade evals/runs/<run>        # rerun fixed checks on what the attempts left
+    eidra eval run --resume evals/runs/<run>   # run a stopped run's lost and missing attempts
     eidra eval vacuum-check                     # check the sandbox itself, not the model
 
 ## How an attempt runs
@@ -28,6 +29,29 @@ the profile can be judged by numbers rather than by impression (docs/DESIGN.md Â
 Each attempt keeps its session log (`sessions/`), its JSON events (`events.jsonl`), the
 workspace as the agent left it (`work/`) and each check's output (`checks/`). `results.jsonl`
 has one line per attempt.
+
+## When something outside the agent fails
+
+An attempt can say nothing about the agent: its image could not be made, or the model server
+stopped answering while it ran. Such an attempt is **lost**: its line in `results.jsonl` gives the
+reason under `lost`, and reports leave it out. Two things keep a long run from losing more than
+it must:
+- A fetch of a task's image that fails on the network is tried again, four times over about 15
+  minutes.
+- A watchdog asks the model server for one token every two minutes. When two requests in a row
+  go unanswered for 150 s, the attempts running are stopped and lost, and none starts until the
+  server answers again. After 30 minutes without an answer the run stops, exiting 2.
+
+`--resume` takes a recorded run up again with its own suite, tasks, attempts, label, network and
+checkers: it runs the attempts it is missing and again those it lost. Lost lines move to
+`lost.jsonl` and their directories under `lost/`, and `results.jsonl` as it was is kept in
+`results.before-resume.jsonl`. The agent binary and the profile must be the run's own. `--agent`
+runs a frozen binary from a newer eval, and `--profile` names the profile directory when the
+binary's built-in one is not the run's:
+
+    git archive <commit> profiles/qwen3.8-radiance | tar -x -C /tmp/run-profile
+    eidra eval run --resume evals/runs/<run> --agent evals/runs/bin/eidra-<commit> \
+        --profile /tmp/run-profile/profiles/qwen3.8-radiance --remove-images
 
 ## Checking the vacuum
 

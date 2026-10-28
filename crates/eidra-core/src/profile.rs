@@ -217,9 +217,14 @@ impl Profile {
     fn parse(toml_text: &str, system: &str) -> Result<Self> {
         let mut profile: Profile = toml::from_str(toml_text).context("profile.toml")?;
         profile.system_template = system.to_owned();
-        let hash = fnv1a(toml_text.as_bytes()) ^ fnv1a(system.as_bytes()).rotate_left(1);
-        profile.hash = format!("{hash:016x}");
+        profile.hash = Self::hash_of(toml_text, system);
         Ok(profile)
+    }
+
+    /// The hash of a profile with these files.
+    pub fn hash_of(toml_text: &str, system: &str) -> String {
+        let hash = fnv1a(toml_text.as_bytes()) ^ fnv1a(system.as_bytes()).rotate_left(1);
+        format!("{hash:016x}")
     }
 
     /// The request's extra fields as JSON.
