@@ -640,7 +640,8 @@ Reference: codex-rs `tui`.
   - requests, tool calls and tool errors
   - prompt, cached, computed, generated and reasoning tokens
 
-  `eidra eval compare` shows two runs side by side, task by task. `eidra eval validate` checks the
+  `eidra eval compare` shows two runs side by side, task by task, and a sign test on the tasks
+  that changed says whether the split is more than chance. `eidra eval validate` checks the
   tasks themselves, without the model: their checks must fail on the starting workspace and pass
   on a reference solution. `eidra eval regrade` runs the current checks again on what a recorded
   run's attempts left, after a check is fixed. The format and the rules for writing tasks are in

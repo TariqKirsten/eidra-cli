@@ -252,11 +252,68 @@ pub fn compare(before: &(Manifest, Vec<Attempt>), after: &(Manifest, Vec<Attempt
         compact(total(&b, |x| x.metrics.output_tokens as f64)),
         compact(total(&a, |x| x.metrics.output_tokens as f64)),
     );
+    // Task by task, by the share of attempts that passed.
+    let (mut better, mut worse) = (0, 0);
+    for (task, b) in &old {
+        if let Some(a) = new.get(task) {
+            let (b, a) = (b.passed as f64 / b.attempts as f64, a.passed as f64 / a.attempts as f64);
+            if a > b {
+                better += 1;
+            } else if a < b {
+                worse += 1;
+            }
+        }
+    }
+    let same = old.keys().filter(|task| new.contains_key(*task)).count() - better - worse;
+    println!("  tasks better {better}, worse {worse}, the same {same}: {}", verdict(better, worse));
+}
+
+/// What a sign test makes of `better` tasks against `worse`: how likely a split at least that
+/// uneven would be if the change made no difference, every task better or worse by chance alike.
+fn verdict(better: usize, worse: usize) -> String {
+    let p = sign_test(better, worse);
+    let p_text = if p < 0.001 { "p < 0.001".to_owned() } else { format!("p = {p:.2}") };
+    if p < 0.05 {
+        format!("more than chance would give ({p_text}, sign test)")
+    } else {
+        format!("no more than chance might give ({p_text}, sign test)")
+    }
+}
+
+/// The two-sided sign test's p-value for `better` successes against `worse`.
+fn sign_test(better: usize, worse: usize) -> f64 {
+    let n = better + worse;
+    if n == 0 {
+        return 1.0;
+    }
+    // P(X <= k) for X ~ Binomial(n, 1/2), with k the smaller count, twice over.
+    let k = better.min(worse);
+    let mut coefficient = 1.0_f64;
+    let mut tail = 0.0;
+    for i in 0..=k {
+        if i > 0 {
+            coefficient = coefficient * (n - i + 1) as f64 / i as f64;
+        }
+        tail += coefficient;
+    }
+    (2.0 * tail / 2f64.powi(n as i32)).min(1.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sign_test_tells_a_lopsided_split_from_chance() {
+        assert_eq!(sign_test(0, 0), 1.0);
+        assert_eq!(sign_test(3, 3), 1.0);
+        // 8 tasks better and 1 worse: 2 * 10/512.
+        assert!((sign_test(8, 1) - 0.0390625).abs() < 1e-12);
+        assert!((sign_test(1, 8) - 0.0390625).abs() < 1e-12);
+        assert!((sign_test(5, 0) - 0.0625).abs() < 1e-12);
+        assert!(verdict(8, 1).starts_with("more than chance would give (p = 0.04"));
+        assert!(verdict(3, 1).starts_with("no more than chance might give (p = 0.62"));
+    }
 
     #[test]
     fn medians_and_tallies() {
