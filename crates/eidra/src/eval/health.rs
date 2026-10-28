@@ -57,7 +57,7 @@ impl Health {
                     () = tokio::time::sleep(pause) => {}
                     () = state.closed() => return,
                 }
-                if probe(&client, &model, timing.timeout).await {
+                if probe(&client, &model, timing.timeout).await.is_ok() {
                     if missed >= MISSES {
                         eprintln!("{}: the model server answers again", clock());
                     }
@@ -96,15 +96,19 @@ impl Health {
     }
 }
 
-/// Whether the server answers a request for one token within `timeout`.
-pub async fn probe(client: &Client, model: &str, timeout: Duration) -> bool {
+/// Whether the server answers a request for one token within `timeout`, and if not, why.
+pub async fn probe(client: &Client, model: &str, timeout: Duration) -> Result<(), String> {
     let request = ChatRequest {
         model: model.to_owned(),
         messages: vec![Message::user("Say OK.")],
         max_tokens: Some(1),
         ..ChatRequest::default()
     };
-    matches!(tokio::time::timeout(timeout, client.chat(&request, |_| {})).await, Ok(Ok(_)))
+    match tokio::time::timeout(timeout, client.chat(&request, |_| {})).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!("no reply in {} s", timeout.as_secs())),
+    }
 }
 
 /// The time of day, UTC, for the run's log.
@@ -162,7 +166,7 @@ mod tests {
     async fn a_server_that_stops_answering_is_found_down_and_then_up_again() {
         let answering = Arc::new(AtomicBool::new(true));
         let client = server(Arc::clone(&answering)).await;
-        assert!(probe(&client, "m", Duration::from_secs(5)).await);
+        assert_eq!(probe(&client, "m", Duration::from_secs(5)).await, Ok(()));
 
         let health = Health::watch(client, "m".into(), quick());
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -184,6 +188,7 @@ mod tests {
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         drop(listener);
         let client = Client::new(&url, None, None).unwrap();
-        assert!(!probe(&client, "m", Duration::from_secs(5)).await);
+        let error = probe(&client, "m", Duration::from_secs(5)).await.unwrap_err();
+        assert!(error.starts_with(&format!("request to {url}/chat/completions failed")), "{error}");
     }
 }

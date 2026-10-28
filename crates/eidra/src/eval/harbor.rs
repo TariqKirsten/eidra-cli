@@ -753,7 +753,7 @@ const FETCH_RETRIES: [Duration; 4] = [
     Duration::from_secs(480),
 ];
 
-/// The task's images, made once per run. Fetching them again after the network failed it.
+/// The task's images, made once per run, and fetched again when the network failed the fetch.
 async fn images_for(context: &RunContext, task: &Task, config: &Config) -> Result<Images> {
     let mut made = context.images.lock().await;
     if let Some(images) = made.get(task.id()) {

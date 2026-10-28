@@ -422,8 +422,8 @@ async fn run_suite(mut args: RunArgs) -> Result<i32> {
     // agents would without the relay.
     let client = eidra_llm::Client::new(&profile.base_url, api_key, None)?;
     let timing = health::Timing::default();
-    if !health::probe(&client, &profile.model, timing.timeout).await {
-        bail!("the model server at {} does not answer", profile.base_url);
+    if let Err(why) = health::probe(&client, &profile.model, timing.timeout).await {
+        bail!("the model server does not answer a request for one token: {why}");
     }
     let health = health::Health::watch(client, profile.model.clone(), timing);
 
