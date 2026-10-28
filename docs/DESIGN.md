@@ -898,6 +898,40 @@ task can show. Underneath:
 Next: the check at `finish`, measured against v2 itself, two attempts per task, so that a change
 is compared with the same harness.
 
+### 16.6 v3: the check at `finish` (2026-10-28)
+
+The same 16 tasks, two attempts each, as v2 ran, with the binary of 0b92964 (branch
+`harness-v3`). Against v2:
+- an unattended run's first `finish` is sent back once if tests of the commit it began at are
+  altered or removed, however that was done (§9);
+- and once if no other tool has run yet (§16.2);
+- the edit note names each changed test once a session, asks why it changed, and no longer
+  counts a test put back as committed (§9);
+- a missed `edit` shows where `old` stopped matching and the file's lines there (§5).
+
+Before the run, live runs of `rename-api` in a git copy on the host settled the notes' wording
+(§9): the task asks for its tests to change too, and the first wordings had the model put the old
+test back. v2 and the final wording both passed it 3 of 3.
+
+**Cut short at 9 of 32 attempts:** an hour into the run, the second R9700 dropped off the PCIe
+bus (`amdgpu 0000:30:00.0: device lost from bus!` at 01:11; radiance logged `no queue has
+advanced`). From then on radiance took requests and never answered them: the two attempts running
+waited out their 50 minutes, and the eval went on starting attempts into the dead server, the
+next eleven failing at once when a short network outage stopped their images being pulled. The
+eval was stopped there. On the nine attempts before it, against v2's ten of the same five tasks:
+- **6 of 9 passed, against 7 of 10:** nanobot-4048, nanobot-4274 and codex-lb-744 2/2 each, as
+  in v2; nanobot-4129 0/2 (v2 1/2), with no note of v3 in either; agno-8148 0/1 (v2 0/2).
+- **The check at `finish` fired once**, in nanobot-4274: the model put the test file back with
+  `git checkout`, fixed the code instead, and passed. The check of a `finish` before anything ran
+  never fired, nor did the edit note.
+- **Missed edits:** 3, each followed by an `edit` that went on from the message, against 2 of v2's
+  5 on these tasks.
+- **Cost:** 12.2 minutes, 46K generated tokens and 0.67 tool errors per attempt, against 14.6,
+  49K and 0.90.
+
+Too few attempts to show a difference in passes either way; the mechanisms work. The rest of the
+run waits for the card.
+
 ## 17. Open questions
 
 - **Keep or drop reasoning in history?** Both cost the same in cache (§3.1). Keeping it is the
