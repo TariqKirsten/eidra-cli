@@ -182,9 +182,10 @@ pub fn print(manifest: &Manifest, attempts: &[Attempt]) {
         "  medians per attempt; cached is the prompt share the cache supplied; errors are tool errors per attempt"
     );
     if lost > 0 {
+        let (attempts, are) = if lost == 1 { ("attempt", "is") } else { ("attempts", "are") };
         println!(
-            "  {lost} attempts lost to something outside the agent are left out; `eidra eval run \
-             --resume` runs them again"
+            "  {lost} {attempts} lost to something outside the agent {are} left out; `eidra eval \
+             run --resume` runs them again"
         );
     }
 }
