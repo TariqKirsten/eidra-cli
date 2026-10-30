@@ -37,7 +37,8 @@ enum Command {
     Probe(probe::ProbeArgs),
     /// Send one request of a recorded session again, with its recorded seed or new ones
     Replay(replay::ReplayArgs),
-    /// Forward a Unix socket to the model server, for an agent in a container with no network
+    /// Forward to the model server: a Unix socket, for an agent in a container with no network, or
+    /// TLS on a port (--listen), for eidra on another machine
     Relay(relay::RelayArgs),
     /// List this directory's sessions, to go on with one with --continue or --resume
     Sessions(sessions::SessionsArgs),

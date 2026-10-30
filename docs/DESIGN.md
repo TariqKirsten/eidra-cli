@@ -640,6 +640,11 @@ Reference: codex-rs `tui`.
     `~/.eidra/tls` with the key readable by its owner alone, and prints its pin; `openssl x509
     -fingerprint -sha256` prints the same, and either form is taken. A client that has not finished
     its handshake after 10 s is dropped.
+  - **On the development machine** (2026-10-30, the user's choice of the relay over TLS in
+    llama-swap): `eidra-tls.service` runs it, started and stopped with llama-swap (`WantedBy=` and
+    `PartOf=llama-swap.service`), so `~/radiance/radiance.sh start` and `stop` take it along, and
+    `status` shows its pin. llama-swap now listens on `127.0.0.1:8000` only, so plain http no longer
+    reaches the network.
   - Tried live on 2026-10-30, with `eidra exec` through the relay at 192.168.1.210:8443 to
     radiance: TLS 1.3 with AES-256-GCM. A warm request found 98% of its prompt cached and its first
     token after 0.1 s, as over plain http, and the same ran from the image. A wrong pin is refused

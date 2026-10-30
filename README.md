@@ -163,21 +163,27 @@ On the model's machine:
 The relay forwards to the profile's server, `127.0.0.1:8000`, which stays as it is for everything
 local. Its certificate is made on first use in `~/.eidra/tls`, and
 `openssl x509 -in ~/.eidra/tls/cert.pem -noout -fingerprint -sha256` prints the same pin. To keep it
-running, make it a user service, `~/.config/systemd/user/eidra-tls.service`:
+running, make it a user service that starts and stops with llama-swap,
+`~/.config/systemd/user/eidra-tls.service`:
 
     [Unit]
-    Description=eidra relay: TLS in front of the model server
+    Description=eidra relay: TLS on port 8443 in front of llama-swap
+    PartOf=llama-swap.service
     After=llama-swap.service
 
     [Service]
     ExecStart=%h/.local/bin/eidra relay --listen 0.0.0.0:8443
     Restart=on-failure
+    RestartSec=5
 
     [Install]
-    WantedBy=default.target
+    WantedBy=llama-swap.service
 
-then `systemctl --user enable --now eidra-tls`, and `journalctl --user -u eidra-tls` shows the pin.
-Let the port in from your LAN, and forward it on your router to reach it from elsewhere:
+then `systemctl --user enable --now eidra-tls`; `journalctl --user -u eidra-tls` shows the pin, and
+so does `~/radiance/radiance.sh status`, whose `start` and `stop` now take the relay along. With
+the relay in place, llama-swap can listen on `127.0.0.1:8000` only (`-listen` in its unit), so that
+nothing crosses the network unencrypted. Let the relay's port in from your LAN, and forward it on
+your router to reach it from elsewhere:
 
     sudo ufw allow from 192.168.1.0/24 to any port 8443 proto tcp
 
