@@ -10,6 +10,7 @@ mod home;
 pub mod media;
 mod profile;
 mod session;
+pub mod skills;
 mod text;
 mod tools;
 

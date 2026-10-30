@@ -160,6 +160,9 @@ pub async fn run(args: ExecArgs) -> Result<i32> {
         headless: true,
         confirm: args.agent.confirm.clone(),
         model_socket: args.model_socket.clone(),
+        // Used only by a profile that gives unattended runs the skill tool, which the built-in
+        // one does not.
+        skills: eidra_core::skills::dir(),
     };
     let mut agent = match args.agent.session_to_resume(&options.workspace, true)? {
         Some(log) => Agent::resume(profile, options, &log)?,

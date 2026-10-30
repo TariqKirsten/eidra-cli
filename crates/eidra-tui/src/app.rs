@@ -28,6 +28,7 @@ use crossterm::execute;
 use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
 use eidra_core::checkpoint::{Checkpoints, Undone};
 use eidra_core::display::{clip, compact, describe_call, duration, summarise, thousands};
+use eidra_core::skills::{self, Skill};
 use eidra_core::{
     Agent, AgentOptions, Approval, Background, Decision, Event, Frontend, Interrupter, Log,
     Outcome, Profile, Report, RequestStats, text_of,
@@ -42,6 +43,7 @@ use crate::attach;
 use crate::editor::Editor;
 use crate::markdown;
 use crate::screen::Screen;
+use crate::slash;
 use crate::style::{self, Line, Style, theme};
 use crate::wrap::{wrap, wrap_all};
 
@@ -57,6 +59,8 @@ pub struct Options {
     pub checkpoints: Option<PathBuf>,
     /// The log of a session to go on with, instead of starting one.
     pub resume: Option<PathBuf>,
+    /// Where skills are: `~/.agents/skills`, or none (docs/DESIGN.md §11.1).
+    pub skills: Option<PathBuf>,
 }
 
 /// Requests one turn may make before the turn goes back to the user.
@@ -92,16 +96,35 @@ const HELP: &[(&str, &str)] = &[
     ("ctrl+t", "show reasoning in full, or as one line"),
     ("!command", "run a command in the workspace; the agent sees it with your next message"),
     ("@path, tab", "attach a file to the message; tab completes the path"),
-    ("/compact [what]", "go on from a summary of the conversation, keeping what you name"),
-    ("/undo", "put back the files the last turn changed; again for the turn before"),
-    ("/diff [all]", "what changed since the last turn began, or since the session's first"),
-    ("/new", "start a new session"),
-    ("/tasks", "list the subagents working in the background"),
-    ("/stop [n]", "stop them, or the nth; the agent gets their reports"),
-    ("/reasoning", "the same as ctrl+t"),
-    ("/quit, /exit", "quit"),
-    ("/help", "this list"),
+    (
+        "/",
+        "the commands and skills that fit what you type: up and down choose, tab completes, enter runs, esc closes",
+    ),
+    ("/name [what]", "run a skill: send what you type, with the skill's instructions after it"),
 ];
+
+/// eidra's own commands, for /help and the list under the input box: the name, what may follow
+/// it, and what it does. A skill of the same name gives way to them.
+const COMMANDS: &[(&str, &str, &str)] = &[
+    ("compact", "[what]", "go on from a summary of the conversation, keeping what you name"),
+    ("undo", "", "put back the files the last turn changed; again for the turn before"),
+    ("diff", "[all]", "what changed since the last turn began, or since the session's first"),
+    ("new", "", "start a new session"),
+    ("skills", "", "list the skills in ~/.agents/skills, which /name runs"),
+    ("tasks", "", "list the subagents working in the background"),
+    (
+        "stop",
+        "[n]",
+        "stop the subagents in the background, or the nth; the agent gets their reports",
+    ),
+    ("reasoning", "", "show reasoning in full, or as one line, as ctrl+t does"),
+    ("quit", "", "quit"),
+    ("exit", "", "quit"),
+    ("help", "", "this list"),
+];
+
+/// Rows the list under the input box shows at most.
+const MENU_ROWS: usize = 8;
 
 /// Runs an interactive session in the terminal until the user quits.
 pub async fn run(mut options: Options) -> Result<()> {
@@ -137,6 +160,7 @@ fn agent_options(options: &Options) -> AgentOptions {
         headless: false,
         confirm: options.confirm.clone(),
         model_socket: None,
+        skills: options.skills.clone(),
     }
 }
 
@@ -264,6 +288,19 @@ enum Block {
     Notice,
 }
 
+/// The list of commands and skills under the input box (slash.rs), while it holds a `/name`
+/// being typed.
+#[derive(Default)]
+struct Menu {
+    /// eidra's commands and the skills the user can invoke, read when the list opened.
+    entries: Vec<slash::Entry>,
+    /// What was typed after the slash, which the choice belongs to; None while it is closed.
+    query: Option<String>,
+    selected: usize,
+    /// Esc closed it; it opens again once the query changes.
+    dismissed: bool,
+}
+
 /// What to do when the running turn ends.
 #[derive(PartialEq, Eq)]
 enum After {
@@ -301,6 +338,7 @@ struct App<W: Write> {
     command: Option<(String, Instant)>,
     /// The files an `@path` could go on to, shown under the input box after a Tab.
     completions: Vec<String>,
+    menu: Menu,
     /// Counts the sessions started, so that a task reports only to its own.
     session: u64,
     /// The last request's numbers, for the status line.
@@ -342,6 +380,7 @@ impl<W: Write> App<W> {
             job: None,
             command: None,
             completions: Vec::new(),
+            menu: Menu::default(),
             session: 0,
             stats: None,
             show_reasoning: false,
@@ -430,12 +469,33 @@ impl<W: Write> App<W> {
         let session = self.agent.as_ref().map_or("", Agent::session_id);
         let second = format!("session {session} · /help for keys and commands");
         let third = self.instructions_line();
-        let lines = vec![
+        let mut lines = vec![
             Line::styled(first, theme::BOLD),
             Line::styled(second, theme::DIM),
             Line::styled(third, theme::DIM),
         ];
+        if let Some(skills) = self.skills_line() {
+            lines.push(Line::styled(skills, theme::DIM));
+        }
         self.commit(Block::Info, lines);
+    }
+
+    /// What the header says of skills: how many there are, and how many folders were left out.
+    /// Nothing without a skills directory.
+    fn skills_line(&self) -> Option<String> {
+        let dir = self.options.skills.as_ref()?;
+        let found = skills::find(dir);
+        let mut line = match found.skills.len() {
+            0 => format!("skills: none in {}", home_relative(dir)),
+            n => format!("skills: {n} in {}", home_relative(dir)),
+        };
+        if !found.skipped.is_empty() {
+            line.push_str(&format!(", {} left out", found.skipped.len()));
+        }
+        if !found.skills.is_empty() || !found.skipped.is_empty() {
+            line.push_str(" · /skills lists them");
+        }
+        Some(line)
     }
 
     /// Which AGENTS.md files the session's system prompt holds, so that the user can see theirs
@@ -658,6 +718,11 @@ impl<W: Write> App<W> {
                 // for the model. (The subagent reaches the loop before its call's result does.)
                 let started = name == "task" && self.tasks.iter().any(|task| task.id == id);
                 if (name != "todo" || is_error) && !(started && !is_error) {
+                    // A skill's instructions are for the model; their length says enough here.
+                    let output = match name.as_str() {
+                        "skill" if !is_error => format!("loaded, {} lines", output.lines().count()),
+                        _ => output,
+                    };
                     let lines = result_lines(None, &output, is_error, self.width());
                     self.commit(Block::Tools, lines);
                 }
@@ -810,8 +875,7 @@ impl<W: Write> App<W> {
         let go_on = normal || (send_now && interrupted);
         if go_on && self.job.is_none() {
             // What was queued, after the reports that came in meanwhile.
-            let queued = mem::take(&mut self.queued).join("\n\n");
-            self.send(queued);
+            self.send_queued();
         } else if !go_on {
             self.return_queued();
         }
@@ -839,6 +903,7 @@ impl<W: Write> App<W> {
             TerminalEvent::Resize(width, height) => self.screen.resize(width, height),
             _ => return,
         }
+        self.update_menu();
         self.dirty = true;
         self.urgent = true;
     }
@@ -863,6 +928,9 @@ impl<W: Write> App<W> {
                 self.answer(decision);
                 return;
             }
+        }
+        if self.menu_key(key) {
+            return;
         }
         match key.code {
             KeyCode::Esc => self.interrupt(),
@@ -900,6 +968,111 @@ impl<W: Write> App<W> {
                 self.editor.key(key);
             }
         }
+    }
+
+    /// What follows the slash of a `/name` being typed in the input box, up to the caret: what
+    /// the list under it narrows to. None when the box holds anything else, while it shows the
+    /// history, and while a command waits for approval.
+    fn menu_query(&self) -> Option<&str> {
+        if self.approving() || self.editor.browsing() {
+            return None;
+        }
+        let query = self.editor.before_caret().strip_prefix('/')?;
+        query.chars().all(|c| c.is_ascii_alphanumeric() || c == '-').then_some(query)
+    }
+
+    /// After a key: the list opens with the commands and the skills there are now, and its choice
+    /// goes back to the top when the query changes.
+    fn update_menu(&mut self) {
+        let Some(query) = self.menu_query().map(str::to_owned) else {
+            self.menu = Menu::default();
+            return;
+        };
+        if self.menu.query.is_none() {
+            let commands = COMMANDS.iter().map(|(name, hint, description)| slash::Entry {
+                name: (*name).to_owned(),
+                hint: (*hint).to_owned(),
+                description: (*description).to_owned(),
+            });
+            let skills = self.user_skills().into_iter().map(|skill| slash::Entry {
+                name: skill.name,
+                hint: skill.hint,
+                description: skill.description,
+            });
+            self.menu.entries = commands.chain(skills).collect();
+        }
+        if self.menu.query.as_deref() != Some(query.as_str()) {
+            self.menu.selected = 0;
+            self.menu.dismissed = false;
+            self.menu.query = Some(query);
+        }
+    }
+
+    /// The commands and skills the list shows, the best first; none while it is closed.
+    fn menu_found(&self) -> Vec<&slash::Entry> {
+        match (&self.menu.query, self.menu_query()) {
+            (Some(query), Some(now)) if query == now && !self.menu.dismissed => {
+                slash::search(&self.menu.entries, query)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The list's keys, while it shows: Up and Down (or Ctrl+P and Ctrl+N) choose, Tab completes,
+    /// Enter runs and Esc closes it. Says whether the key was one of them.
+    fn menu_key(&mut self, key: KeyEvent) -> bool {
+        let found: Vec<String> = self.menu_found().iter().map(|entry| entry.name.clone()).collect();
+        if found.is_empty() {
+            return false;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let other = key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+        let selected = self.menu.selected.min(found.len() - 1);
+        match key.code {
+            KeyCode::Up => self.menu.selected = (selected + found.len() - 1) % found.len(),
+            KeyCode::Char('p') if ctrl => {
+                self.menu.selected = (selected + found.len() - 1) % found.len();
+            }
+            KeyCode::Down => self.menu.selected = (selected + 1) % found.len(),
+            KeyCode::Char('n') if ctrl => self.menu.selected = (selected + 1) % found.len(),
+            KeyCode::Tab if !ctrl && !other => self.choose(&found[selected], true),
+            KeyCode::Enter if !other => {
+                self.choose(&found[selected], false);
+                if ctrl { self.submit_now() } else { self.submit() }
+            }
+            KeyCode::Esc => self.menu.dismissed = true,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Puts the chosen name in place of the `/name` being typed: followed by a space to complete
+    /// it, for what goes after it, or as it is, to run it.
+    fn choose(&mut self, name: &str, complete: bool) {
+        let text = self.editor.text();
+        let rest = text.find(char::is_whitespace).map_or("", |i| text[i..].trim_start());
+        let mut chosen = format!("/{name}");
+        if complete || !rest.is_empty() {
+            chosen.push(' ');
+        }
+        chosen.push_str(rest);
+        self.editor.set(chosen);
+    }
+
+    /// The skills the user can invoke with `/name` now, but for any named as one of eidra's own
+    /// commands.
+    fn user_skills(&self) -> Vec<Skill> {
+        let Some(dir) = &self.options.skills else {
+            return Vec::new();
+        };
+        let found = skills::find(dir).skills.into_iter();
+        found.filter(|skill| skill.user && !is_command(&skill.name)).collect()
+    }
+
+    /// The skill a message invokes, if it starts with a skill's `/name`.
+    fn invoked_skill(&self, text: &str) -> Option<Skill> {
+        let name = command(text)?.strip_prefix('/')?;
+        self.user_skills().into_iter().find(|skill| skill.name == name)
     }
 
     /// Completes the `@path` before the caret, if there is one there.
@@ -988,7 +1161,8 @@ impl<W: Write> App<W> {
         if text.is_empty() {
             return;
         }
-        if let Some(command) = command(text) {
+        // A skill's /name is a message, which the skill's instructions follow.
+        if let Some(command) = command(text).filter(|_| self.invoked_skill(text).is_none()) {
             let rest = text[command.len()..].trim().to_owned();
             self.command(command, &rest);
         } else if let Some(command) = text.strip_prefix('!') {
@@ -1004,7 +1178,8 @@ impl<W: Write> App<W> {
     /// before it as soon as the turn has stopped. Otherwise, and for commands, the same as Enter.
     fn submit_now(&mut self) {
         let typed = self.editor.text().trim();
-        let commanded = command(typed).is_some() || typed.starts_with('!');
+        let commanded = (command(typed).is_some() && self.invoked_skill(typed).is_none())
+            || typed.starts_with('!');
         self.submit();
         if self.turn.is_some() && !commanded && !self.queued.is_empty() {
             self.send_now = true;
@@ -1015,10 +1190,13 @@ impl<W: Write> App<W> {
     fn command(&mut self, command: &str, rest: &str) {
         match command {
             "/help" => {
-                let lines = HELP
-                    .iter()
-                    .map(|(key, what)| Line::plain(format!("  {key:<16}")).with(what, theme::DIM))
-                    .collect();
+                let row = |key: &str, what: &str| {
+                    Line::plain(format!("  {key:<16}")).with(what, theme::DIM)
+                };
+                let mut lines: Vec<Line> = HELP.iter().map(|(key, what)| row(key, what)).collect();
+                for (name, hint, what) in COMMANDS {
+                    lines.push(row(format!("/{name} {hint}").trim_end(), what));
+                }
                 self.commit(Block::Info, lines);
             }
             "/quit" | "/exit" => self.request_quit(),
@@ -1030,6 +1208,7 @@ impl<W: Write> App<W> {
                 self.interrupt();
             }
             "/new" => self.new_session(),
+            "/skills" => self.list_skills(),
             "/tasks" => self.list_tasks(),
             "/stop" => self.stop_tasks(rest),
             "/compact" => self.compact_conversation(rest),
@@ -1056,12 +1235,56 @@ impl<W: Write> App<W> {
                 self.agent = Some(agent);
                 self.stats = None;
                 self.info(&format!("new session · log {}", home_relative(&self.log)));
-                // AGENTS.md is read again for it, and may have changed.
+                // AGENTS.md and the skills are read again for it, and may have changed.
                 let instructions = self.instructions_line();
                 self.info(&instructions);
+                if let Some(skills) = self.skills_line() {
+                    self.info(&skills);
+                }
             }
             Err(e) => self.error(&format!("no new session: {}", causes(&e))),
         }
+    }
+
+    /// Lists the skills, each with what it is for, and the folders left out, with why.
+    fn list_skills(&mut self) {
+        let Some(dir) = self.options.skills.clone() else {
+            self.info("there are no skills: with no home directory there is no ~/.agents/skills");
+            return;
+        };
+        let place = home_relative(&dir);
+        let found = skills::find(&dir);
+        if found.skills.is_empty() && found.skipped.is_empty() {
+            self.info(&format!("no skills in {place}: a skill is a folder there with a SKILL.md"));
+            return;
+        }
+        let width = self.width();
+        let head = format!("skills in {place}; /name runs one");
+        let mut lines = vec![Line::styled(head, theme::BOLD)];
+        let column = found.skills.iter().map(|skill| skill.name.len()).max().unwrap_or(0).min(28);
+        for skill in &found.skills {
+            let mut about = Vec::new();
+            if is_command(&skill.name) {
+                about.push(format!("/{} is eidra's own command", skill.name));
+            } else if !skill.user {
+                about.push("for the agent only".to_owned());
+            }
+            if !skill.model {
+                about.push("yours to run: the agent is not told of it".to_owned());
+            }
+            let about = match about.is_empty() {
+                true => String::new(),
+                false => format!("({}) ", about.join("; ")),
+            };
+            let what =
+                clip(&format!("{about}{}", skill.description), width.saturating_sub(column + 6));
+            lines.push(Line::plain(format!("  {:<column$}  ", skill.name)).with(&what, theme::DIM));
+        }
+        for why in &found.skipped {
+            let head = Line::styled("  left out: ", theme::NOTICE);
+            lines.extend(hanging(head, why, theme::NOTICE, width));
+        }
+        self.commit(Block::Info, lines);
     }
 
     fn list_tasks(&mut self) {
@@ -1229,8 +1452,7 @@ impl<W: Write> App<W> {
         self.check_quit();
         if !self.quitting && self.turn.is_none() {
             // Messages and reports that waited for it.
-            let queued = mem::take(&mut self.queued).join("\n\n");
-            self.send(queued);
+            self.send_queued();
         }
     }
 
@@ -1304,9 +1526,31 @@ impl<W: Write> App<W> {
     /// Sends a message, after the reports of background subagents that have ended, and starts
     /// the agent's turn.
     fn send(&mut self, text: String) {
+        self.send_all(vec![text]);
+    }
+
+    /// Sends what was queued while the agent worked, as one message.
+    fn send_queued(&mut self) {
+        let queued = mem::take(&mut self.queued);
+        self.send_all(queued);
+    }
+
+    /// Sends messages as one, as `send` does. A message that starts with a skill's `/name`
+    /// brings the skill's instructions, with what follows the name (docs/DESIGN.md §11.1).
+    fn send_all(&mut self, messages: Vec<String>) {
+        let messages: Vec<String> = messages.into_iter().filter(|m| !m.is_empty()).collect();
+        let text = messages.join("\n\n");
         if text.is_empty() && self.reports.is_empty() {
             return;
         }
+        let invoked: Vec<(Skill, String)> = messages
+            .iter()
+            .filter_map(|message| {
+                let skill = self.invoked_skill(message)?;
+                let after = message.split_once(char::is_whitespace).map_or("", |(_, rest)| rest);
+                Some((skill, after.trim().to_owned()))
+            })
+            .collect();
         let Some(mut agent) = self.agent.take() else {
             return;
         };
@@ -1314,10 +1558,21 @@ impl<W: Write> App<W> {
             if text.is_empty() { "(reports of background tasks)".into() } else { text.clone() };
         let mut images = Vec::new();
         let mut files = Vec::new();
+        let mut instructions = Vec::new();
         if !text.is_empty() {
             let user = Line::styled("› ", theme::USER);
             let mut lines = hanging(user, &text, Style::PLAIN, self.width());
             let mut attached = Vec::new();
+            for (skill, after) in &invoked {
+                attached.push(match agent.invoke_skill(&skill.name, after) {
+                    Ok((text, lines)) => {
+                        instructions.push(text);
+                        let plural = if lines == 1 { "" } else { "s" };
+                        Ok(format!("skill {}: {lines} line{plural} of instructions", skill.name))
+                    }
+                    Err(why) => Err(format!("skill {} not loaded: {why}", skill.name)),
+                });
+            }
             for attachment in attach::attachments(&text, &self.workspace) {
                 attached.push(match attachment.image {
                     Ok(image) => {
@@ -1354,7 +1609,9 @@ impl<W: Write> App<W> {
         if !text.is_empty() {
             parts.push(text);
         }
-        // Files the message mentions follow it, so that it reads as the user wrote it.
+        // Skills it invokes and files it mentions follow it, so that it reads as the user wrote
+        // it.
+        parts.extend(instructions);
         parts.extend(files);
         if let Err(e) = agent.push_user_with(&parts.join("\n\n"), images) {
             self.agent = Some(agent);
@@ -1430,6 +1687,11 @@ impl<W: Write> App<W> {
         };
         let approving = self.approving();
         bottom.extend(self.editor.render(width, (height / 2).max(1), !approving, placeholder));
+        let found = self.menu_found();
+        if !found.is_empty() {
+            let selected = self.menu.selected.min(found.len() - 1);
+            bottom.extend(slash::render(&found, selected, (height / 3).clamp(1, MENU_ROWS), width));
+        }
         if !self.completions.is_empty() {
             let names = clip(&self.completions.join("  "), width.saturating_sub(3));
             bottom.push(Line::styled(format!("  {names}"), theme::DIM));
@@ -1574,6 +1836,11 @@ async fn next_report(tasks: &mut [Task]) -> (usize, Report) {
         Poll::Pending
     })
     .await
+}
+
+/// Whether `name` is one of eidra's own commands, which a skill of that name gives way to.
+fn is_command(name: &str) -> bool {
+    COMMANDS.iter().any(|(command, ..)| *command == name)
 }
 
 /// `/name`, with or without more after it: a command, unless it looks like a path.
@@ -1750,9 +2017,27 @@ mod tests {
 
     impl Test {
         fn new() -> Self {
+            Self::build(None)
+        }
+
+        /// The same, with a skills directory of its own, holding these folders and their
+        /// SKILL.md.
+        fn with_skills(skills: &[(&str, &str)]) -> Self {
+            Self::build(Some(skills))
+        }
+
+        fn build(skills: Option<&[(&str, &str)]>) -> Self {
             static N: AtomicUsize = AtomicUsize::new(0);
             let n = N.fetch_add(1, Ordering::SeqCst);
             let dir = std::env::temp_dir().join(format!("eidra-tui-{}-{n}", std::process::id()));
+            let skills = skills.map(|skills| {
+                let root = dir.join("skills");
+                for (folder, text) in skills {
+                    std::fs::create_dir_all(root.join(folder)).unwrap();
+                    std::fs::write(root.join(folder).join("SKILL.md"), text).unwrap();
+                }
+                root
+            });
             let options = Options {
                 profile: Profile::builtin().unwrap(),
                 workspace: dir.join("work"),
@@ -1760,6 +2045,7 @@ mod tests {
                 confirm: Vec::new(),
                 checkpoints: Some(dir.join("checkpoints")),
                 resume: None,
+                skills,
             };
             std::fs::create_dir_all(&options.workspace).unwrap();
             let agent = start(&options).unwrap();
@@ -1819,6 +2105,23 @@ mod tests {
 
         fn key(&mut self, code: KeyCode) {
             self.app.key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+
+        /// A key as the terminal sends it, with what follows each one.
+        fn press(&mut self, code: KeyCode) {
+            self.app.terminal_event(TerminalEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+
+        /// Types `text` key by key.
+        fn typed(&mut self, text: &str) {
+            for ch in text.chars() {
+                self.press(KeyCode::Char(ch));
+            }
+        }
+
+        /// The rows of the list under the input box.
+        fn menu(&mut self) -> Vec<String> {
+            self.live().into_iter().filter(|row| row.starts_with("  /")).collect()
         }
     }
 
@@ -2358,5 +2661,141 @@ mod tests {
         let lines = hanging(Line::plain("› "), "one two three\nfour", Style::PLAIN, 9);
         let texts: Vec<String> = lines.iter().map(Line::text).collect();
         assert_eq!(texts, ["› one two", "  three", "  four"]);
+    }
+
+    fn skill(name: &str, description: &str, instructions: &str) -> String {
+        format!("---\nname: {name}\ndescription: {description}\n---\n{instructions}\n")
+    }
+
+    fn greet() -> Test {
+        Test::with_skills(&[
+            ("greet", &skill("greet", "Greets people by name.", "Say hello to $ARGUMENTS.")),
+            // Named as one of eidra's own commands, which it gives way to.
+            ("diff", &skill("diff", "A skill of the same name.", "Not this.")),
+        ])
+    }
+
+    #[test]
+    fn a_slash_lists_the_commands_and_skills_that_fit_what_is_typed() {
+        let mut t = greet();
+        assert!(t.menu().is_empty());
+        t.typed("/");
+        let rows = t.menu();
+        assert!(rows.iter().any(|row| row.starts_with("  /compact [what]")), "{rows:#?}");
+        assert!(rows[0].starts_with("  /compact") && rows.len() == 7, "{rows:#?}");
+        assert_eq!(rows.iter().filter(|row| row.starts_with("  /diff ")).count(), 1);
+        assert!(!rows.iter().any(|row| row.contains("A skill of the same name")), "{rows:#?}");
+        t.typed("gr");
+        let rows = t.menu();
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert!(rows[0].starts_with("  /greet") && rows[0].ends_with("Greets people by name."));
+        // Letters that fit nothing close it, and taking them back opens it again.
+        t.typed("zz");
+        assert!(t.menu().is_empty());
+        t.press(KeyCode::Backspace);
+        t.press(KeyCode::Backspace);
+        assert_eq!(t.menu().len(), 1);
+        // Esc closes it without interrupting anything, until the query changes.
+        t.press(KeyCode::Esc);
+        assert!(t.menu().is_empty());
+        t.press(KeyCode::Backspace);
+        assert!(!t.menu().is_empty());
+        // A space ends the name, and the list goes.
+        t.app.editor.clear();
+        t.typed("/greet ");
+        assert!(t.menu().is_empty());
+    }
+
+    #[test]
+    fn up_and_down_choose_and_tab_completes() {
+        let mut t = greet();
+        t.typed("/");
+        t.press(KeyCode::Down);
+        assert_eq!(t.app.menu.selected, 1);
+        t.press(KeyCode::Tab);
+        assert_eq!(t.app.editor.text(), "/diff ");
+        assert!(t.menu().is_empty());
+        // Up from the top goes round to the last.
+        t.app.editor.clear();
+        t.typed("/");
+        t.press(KeyCode::Up);
+        t.press(KeyCode::Tab);
+        assert_eq!(t.app.editor.text(), "/undo ");
+        // The history is walked as before, with no list over it.
+        t.app.editor.clear();
+        t.submit("/reasoning");
+        t.press(KeyCode::Up);
+        assert_eq!(t.app.editor.text(), "/reasoning");
+        assert!(t.menu().is_empty());
+    }
+
+    #[test]
+    fn enter_runs_the_chosen_command() {
+        let mut t = greet();
+        t.typed("/hel");
+        t.press(KeyCode::Enter);
+        assert!(t.finished().iter().any(|row| row.contains("tab completes, enter runs")));
+        assert!(t.app.editor.is_empty() && t.menu().is_empty());
+        t.typed("/skil");
+        t.press(KeyCode::Enter);
+        let rows = t.finished();
+        assert!(rows.iter().any(|row| row.starts_with("skills in ")), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.starts_with("  greet ")), "{rows:#?}");
+        let diff = rows.iter().find(|row| row.starts_with("  diff ")).unwrap();
+        assert!(diff.contains("(/diff is eidra's own command)"), "{diff}");
+    }
+
+    #[test]
+    fn a_skills_name_sends_the_message_with_its_instructions() {
+        let mut t = greet();
+        t.typed("/gr");
+        t.press(KeyCode::Tab);
+        t.typed("Ada and Grace");
+        t.press(KeyCode::Enter);
+        assert!(t.app.turn.is_some());
+        let message = t.last_message();
+        let dir = t.dir.join("skills/greet");
+        let expected = format!(
+            "/greet Ada and Grace\n\n[The skill greet. Its files are in {}, and paths in it are \
+             relative to that folder. Follow its instructions:]\n\nSay hello to Ada and Grace.",
+            dir.display()
+        );
+        assert_eq!(message, expected);
+        let rows = t.finished();
+        assert_eq!(
+            rows[rows.len() - 2..],
+            ["› /greet Ada and Grace", "  ⎿ skill greet: 1 line of instructions"]
+        );
+    }
+
+    #[test]
+    fn a_skill_sent_while_the_agent_works_waits_with_the_rest() {
+        let mut t = greet();
+        let agent = t.begin();
+        t.submit("/greet Bob");
+        assert_eq!(t.app.queued, ["/greet Bob"]);
+        t.submit("and then stop");
+        t.app.turn_ended(agent, Ok(Outcome::Replied));
+        let message = t.last_message();
+        assert!(
+            message.starts_with("/greet Bob\n\nand then stop\n\n[The skill greet."),
+            "{message}"
+        );
+        assert!(message.ends_with("Say hello to Bob."), "{message}");
+    }
+
+    #[test]
+    fn the_header_counts_the_skills_and_a_loaded_skill_shows_its_length() {
+        let mut t = greet();
+        let line = t.app.skills_line().unwrap();
+        let dir = home_relative(&t.dir.join("skills"));
+        assert_eq!(line, format!("skills: 2 in {dir} · /skills lists them"));
+        assert!(Test::new().app.skills_line().is_none());
+        t.begin();
+        t.events(vec![
+            call("1", "skill", r#"{"name": "greet"}"#),
+            result("1", "skill", "[The skill greet.]\n\nSay hello."),
+        ]);
+        assert_eq!(t.finished(), ["● skill greet", "  ⎿ loaded, 3 lines"]);
     }
 }

@@ -63,6 +63,7 @@ What it mounts and passes in:
 | the current directory | the same path, as the working directory | the agent's workspace; paths read the same inside and out |
 | `~/.eidra` | the same path, with `EIDRA_HOME` | your `AGENTS.md`, session logs and checkpoints, kept after the container is gone |
 | `~/.cache/uv` | the same path, with `UV_CACHE_DIR` | Python packages are downloaded once |
+| `~/.agents/skills` (made if missing), and the folders absolute links in it lead to | `/home/eidra/.agents/skills`, and the same paths, read-only | your skills, which the agent uses but cannot change |
 | `~/.gitconfig`, if there is one | `/home/eidra/.gitconfig`, read-only | your name and email on the agent's commits |
 | `/etc/localtime` | the same path, read-only | your time zone |
 | `$EIDRA_PROFILE`, if set | the same path, read-only | a profile of your own |
@@ -74,6 +75,7 @@ What it mounts and passes in:
 | `EIDRA_PROFILE` | a profile directory instead of the built-in one |
 | `EIDRA_HOME` | eidra's own directory instead of `~/.eidra` |
 | `EIDRA_IMAGE` | the image `scripts/eidra-docker` runs (default `eidra`) |
+| `EIDRA_SKILLS` | the skills directory `scripts/eidra-docker` mounts (default `~/.agents/skills`) |
 | `TERM`, `COLORTERM` | your terminal's, for colours and keys |
 
 In the TUI, Docker's keys for detaching from a container are ctrl+^ then ctrl+q, not its default
@@ -91,6 +93,7 @@ The same thing without the script:
       -v "$PWD:$PWD" -w "$PWD" \
       -v "$HOME/.eidra:$HOME/.eidra" -e "EIDRA_HOME=$HOME/.eidra" \
       -v "$HOME/.cache/uv:$HOME/.cache/uv" -e "UV_CACHE_DIR=$HOME/.cache/uv" \
+      -v "$HOME/.agents/skills:/home/eidra/.agents/skills:ro" \
       -e RADIANCE_API_KEY \
       eidra
 
@@ -117,9 +120,12 @@ profile (`notepad $PROFILE`):
 
     function eidra {
       $name = Split-Path -Leaf $PWD
+      $skills = "$env:USERPROFILE\.agents\skills"
+      New-Item -ItemType Directory -Force $skills | Out-Null
       docker run --rm -it `
         -v "${PWD}:/workspace/${name}:ro" -w "/workspace/${name}" `
         -v eidra-data:/home/eidra/.eidra `
+        -v "${skills}:/home/eidra/.agents/skills:ro" `
         -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e COLORTERM=truecolor -e TZ=Africa/Johannesburg `
         --detach-keys "ctrl-^,ctrl-q" `
         eidra @args
@@ -134,6 +140,7 @@ Where it differs from the Linux wrapper:
   each project's sessions apart.
 - eidra's directory is a Docker volume, `eidra-data`, so sessions and checkpoints outlive the
   container; `docker volume rm eidra-data` deletes them.
+- Your skills are in `%USERPROFILE%\.agents\skills`, read-only in the container.
 - There is no `--network host`: the container reaches the model server at `EIDRA_BASE_URL`, on your
   network or over a VPN such as Tailscale.
 - It runs as the container's root user, so git accepts the repository Windows mounts into it.
@@ -152,12 +159,23 @@ terminal's own scrollback; at the bottom are the reply streaming in, the input b
   instead of as one line.
 - `@path` attaches a file to the message: an image as an image, a text file as `read` shows it.
   Tab completes the path.
+- `/` opens a list of the commands and your skills under the input box, which narrows as you type
+  (`/dc` finds `diagnose-crash`); Up and Down choose, Tab completes, Enter runs, Esc closes it.
 - `!command` runs a command in the project; you see its output, and the agent gets it with your
   next message.
 - A command on the confirm list asks first: y runs it once, a for the rest of the session, n not.
 - `/help`, `/new` (a new session), `/compact` (go on from a summary of the conversation; words
   after it say what to keep), `/tasks` and `/stop` (subagents in the background), `/undo` and
-  `/diff` (below), `/reasoning`, `/quit`.
+  `/diff` (below), `/skills` (below), `/reasoning`, `/quit`.
+
+Skills are folders in `~/.agents/skills`, the directory Claude Code, Codex and other agents share,
+each holding a `SKILL.md`: frontmatter with a `name` and a `description` of when to use it, then
+instructions, often with scripts or other files beside them. eidra makes the directory if it is not
+there. The agent sees each skill's name and description, and loads a skill's instructions when a
+task fits it. `/name what to do` runs one yourself: your message goes with the skill's
+instructions, and `$ARGUMENTS` in them becomes what you typed after the name. `/skills` lists them,
+and says why any folder was left out. A skill with `disable-model-invocation: true` is yours alone
+to run; one with `user-invocable: false`, the agent's alone. Unattended runs go without skills.
 
 Ask the agent to do something in the background, such as "start a subagent to build a calculator
 while we chat", and a subagent works on it while you go on talking; its report comes back to the

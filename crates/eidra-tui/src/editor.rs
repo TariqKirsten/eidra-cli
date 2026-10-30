@@ -50,6 +50,11 @@ impl Editor {
         self.text.is_empty()
     }
 
+    /// It shows an entry of the history, rather than what is being written.
+    pub fn browsing(&self) -> bool {
+        self.browsing.is_some()
+    }
+
     pub fn clear(&mut self) {
         self.set(String::new());
     }

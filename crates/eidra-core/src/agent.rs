@@ -25,8 +25,9 @@ use crate::event::{Approval, Decision, Event, Frontend, RequestStats};
 use crate::home::eidra_home;
 use crate::media;
 use crate::profile::Profile;
-use crate::session::{Header, Session};
-use crate::text::{fnv1a, utc_datetime};
+use crate::session::{Header, Session, text_of};
+use crate::skills::{self, Skill, Skills};
+use crate::text::{fnv1a, truncate_middle, utc_datetime};
 use crate::tools::{self, ToolOutput, Toolbox};
 
 pub struct AgentOptions {
@@ -41,6 +42,8 @@ pub struct AgentOptions {
     pub confirm: Vec<String>,
     /// A Unix socket that reaches the model server, for an agent with no network of its own.
     pub model_socket: Option<PathBuf>,
+    /// Where skills are (docs/DESIGN.md §11.1): `~/.agents/skills`, or none.
+    pub skills: Option<PathBuf>,
 }
 
 /// How a run ended.
@@ -86,6 +89,8 @@ pub struct Agent {
     extra_confirm: Vec<String>,
     model_socket: Option<PathBuf>,
     date: String,
+    /// Where skills are, for the user to invoke and for a compaction to load again.
+    skills: Option<PathBuf>,
     interrupt: Arc<watch::Sender<bool>>,
     /// A run was stopped before the model replied. The next message says so: otherwise the
     /// model takes up the request it was stopped on again.
@@ -169,7 +174,19 @@ impl Agent {
         let client = Client::new(&profile.base_url, api_key, options.model_socket.as_deref())?;
 
         let subagent = matches!(role, Role::Subagent { .. });
-        let definitions = tools::definitions(&profile, options.headless, subagent)?;
+        let mut definitions = tools::definitions(&profile, options.headless, subagent)?;
+        // The skills the model may load, if the session has `skill`. With none, the tool goes,
+        // and the system prompt says nothing of skills (§11.1).
+        let found = match &options.skills {
+            Some(dir) if definitions.iter().any(|tool| tool.function.name == "skill") => {
+                skills::find(dir)
+            }
+            _ => Skills::default(),
+        };
+        let listing = found.listing();
+        if listing.is_empty() {
+            definitions.retain(|tool| tool.function.name != "skill");
+        }
         let (parent, task) = match role {
             Role::Main => (None, None),
             Role::Subagent { parent, task } => (Some(parent), Some(task)),
@@ -190,7 +207,8 @@ impl Agent {
             task,
         };
         let mut session = Session::create(&options.session_root, header)?;
-        let tools = Toolbox::new(&profile, &workspace, session.dir(), definitions)?;
+        let tools =
+            Toolbox::new(&profile, &workspace, session.dir(), definitions, options.skills.clone())?;
 
         let mode = if subagent {
             &profile.prompts.subagent
@@ -202,11 +220,17 @@ impl Agent {
         // Reaching the model through a socket means there is no network otherwise (§13).
         let network =
             if options.model_socket.is_some() { &profile.prompts.no_network[..] } else { "" };
+        let listed = match listing.is_empty() {
+            true => String::new(),
+            false => profile.prompts.skills.replace("{skills}", &listing),
+        };
         let system = profile.system_prompt(&[
             ("workspace", &workspace.display().to_string()),
             ("date", &date),
             ("mode", &format!("{mode}{network}")),
             ("agents", &agents_md(&workspace)),
+            // Last, so that nothing in a skill's description is taken for another variable.
+            ("skills", &listed),
         ]);
         session.push(Message::system(system), None)?;
 
@@ -225,6 +249,7 @@ impl Agent {
             extra_confirm: options.confirm,
             model_socket: options.model_socket,
             date,
+            skills: options.skills,
             interrupt: Arc::new(watch::channel(false).0),
             unanswered: false,
             background: Arc::new(AtomicUsize::new(0)),
@@ -263,7 +288,13 @@ impl Agent {
             .and_then(|name| std::env::var(name).ok())
             .filter(|key| !key.is_empty());
         let client = Client::new(&profile.base_url, api_key, options.model_socket.as_deref())?;
-        let tools = Toolbox::new(&profile, &workspace, session.dir(), header.tools.clone())?;
+        let tools = Toolbox::new(
+            &profile,
+            &workspace,
+            session.dir(),
+            header.tools.clone(),
+            options.skills.clone(),
+        )?;
 
         // The last reply, and whether the turn it belongs to ended: with a reply that calls
         // nothing, or with finish.
@@ -314,6 +345,7 @@ impl Agent {
             session_root: options.session_root,
             extra_confirm: options.confirm,
             model_socket: options.model_socket,
+            skills: options.skills,
             interrupt: Arc::new(watch::channel(false).0),
             unanswered,
             background: Arc::new(AtomicUsize::new(0)),
@@ -330,6 +362,57 @@ impl Agent {
         let listing = self.tools.read_mentioned(path)?;
         let template = &self.profile.prompts.attached_file;
         Ok(template.replace("{path}", path).replace("{content}", listing.trim_end()))
+    }
+
+    /// A skill the user invoked with `/name`, as text to follow their message: its instructions,
+    /// with `$ARGUMENTS` replaced by what they typed after the name, in the profile's `skill`
+    /// wrapping. Also how many lines its instructions have.
+    pub fn invoke_skill(&self, name: &str, arguments: &str) -> Result<(String, usize), String> {
+        let found = skills::find(self.skills.as_deref().ok_or("there are no skills")?);
+        let skill = found
+            .get(name)
+            .filter(|skill| skill.user)
+            .ok_or_else(|| format!("there is no skill called {name}"))?;
+        let instructions = skill.instructions()?.replace("$ARGUMENTS", arguments.trim());
+        Ok((self.wrap_skill(skill, &instructions), instructions.lines().count()))
+    }
+
+    /// A skill's instructions in the profile's `skill` wrapping, cut to `[tools] output_limit` as
+    /// a tool's result is, with where to read the rest.
+    fn wrap_skill(&self, skill: &Skill, instructions: &str) -> String {
+        let note = format!("; the whole skill is in {}", skill.dir.join("SKILL.md").display());
+        let instructions = truncate_middle(instructions, self.profile.tools.output_limit, &note);
+        skill.wrapped(&self.profile.prompts.skill, &instructions)
+    }
+
+    /// The skills whose instructions the conversation holds, from `skill` or because the user
+    /// invoked them, as they are on disk now.
+    fn loaded_skills(&self) -> Vec<(Skill, String)> {
+        let Some(dir) = &self.skills else {
+            return Vec::new();
+        };
+        let texts: Vec<String> = self
+            .session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } | Message::Tool { content, .. } => Some(text_of(content)),
+                _ => None,
+            })
+            .collect();
+        let template = &self.profile.prompts.skill;
+        skills::find(dir)
+            .skills
+            .into_iter()
+            .filter(|skill| {
+                let heading = skill.heading(template);
+                texts.iter().any(|text| text.contains(&heading))
+            })
+            .filter_map(|skill| {
+                let instructions = skill.instructions().ok()?;
+                Some((skill, instructions))
+            })
+            .collect()
     }
 
     /// The time an unattended run has, from now. Near its end, and near the end of a run's
@@ -381,6 +464,7 @@ impl Agent {
             headless: true,
             confirm: self.extra_confirm.clone(),
             model_socket: self.model_socket.clone(),
+            skills: self.skills.clone(),
         };
         let role = Role::Subagent {
             parent: self.session.header().id.clone(),
@@ -719,21 +803,36 @@ impl Agent {
             return Ok(None);
         }
         let system = self.session.messages().first().cloned().context("no system prompt")?;
-        let first = self
+        let mut first = self
             .profile
             .prompts
             .compacted
             .replace("{tokens}", &thousands(tokens))
             .replace("{summary}", summary);
+        // The skills the conversation had loaded come again after the summary, which cannot hold
+        // their instructions (§11.1).
+        let kept = self.loaded_skills();
+        for (skill, instructions) in &kept {
+            first.push_str("\n\n");
+            first.push_str(&self.wrap_skill(skill, instructions));
+        }
         self.session.compact(tokens, summary, Some(&stats), vec![system, Message::user(first)])?;
         self.used = 0;
         // A reply cut short before is in the summary, or nowhere: the next message need not say so.
         self.unanswered = false;
         // The results that carried nested AGENTS.md files are gone: they come again when needed.
         self.tools.forget_nested();
+        let again = match kept.as_slice() {
+            [] => String::new(),
+            [(skill, _)] => format!(", and the skill {} loaded again", skill.name),
+            kept => {
+                let names: Vec<&str> = kept.iter().map(|(skill, _)| skill.name.as_str()).collect();
+                format!(", and the skills {} loaded again", names.join(", "))
+            }
+        };
         frontend.event(Event::Notice {
             text: format!(
-                "compacted: the conversation goes on from a summary of {} tokens",
+                "compacted: the conversation goes on from a summary of {} tokens{again}",
                 thousands(stats.completion_tokens.unwrap_or(0))
             ),
         });

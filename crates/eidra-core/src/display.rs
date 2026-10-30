@@ -106,6 +106,7 @@ pub fn describe_call(name: &str, arguments: &str) -> String {
                 if background { "  (background)" } else { "" }
             )
         }
+        "skill" => format!("skill {}", text("name")),
         "todo" | "finish" => name.to_owned(),
         _ => format!("{name} {}", clip(arguments, 160)),
     }

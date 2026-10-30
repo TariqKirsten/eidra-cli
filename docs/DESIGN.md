@@ -409,6 +409,52 @@ pixels.
   directory come outermost first, each cut at 8,000 characters. The prompt grows only for the
   parts of the project the agent works in.
 
+### 11.1 Skills (2026-10-30)
+
+The user asked for skills in the Agent Skills format, from the directory agents share, and for a
+`/` list like Claude Code's to run them (§12). A skill is a folder with a `SKILL.md`: YAML
+frontmatter with a `name` and a `description` of what it is for and when to use it, then its
+instructions. The folder's other files, such as scripts, references and templates, are for the
+agent to read or run with its own tools when the instructions say so.
+
+- **Where:** `~/.agents/skills`, a folder per skill, links followed, so the skills Claude Code,
+  Codex and others read are eidra's too. An interactive session makes the directory if it is not
+  there. A folder is left out, and `/skills` says why, if it has no `SKILL.md` or no description,
+  if its name is not letters, digits and hyphens, or if another skill has its name. A description
+  is cut at the format's 1,024 characters.
+- **Frontmatter:** eidra reads `name`, `description`, `argument-hint`, `disable-model-invocation`
+  and `user-invocable`, and passes over the rest; `allowed-tools` means nothing where commands run
+  freely (§7). The reader takes the YAML frontmatter is written in (plain, quoted and block values
+  on one line or several, comments, nested maps and lists passed over), and leniently: a plain
+  value may hold `: `. All 52 `SKILL.md` files on the development machine read as intended.
+- **Only names and descriptions go into the prompt (R1, R5, R6):**
+  - At session start the system prompt gets a line per skill the model may load, its name and its
+    description (`[prompts] skills`, at `{{skills}}`, after the mode and before AGENTS.md, so that
+    a subagent's prompt still starts as its parent's does), and the session gets the `skill` tool
+    (`[tools] interactive`). Both are frozen with the rest of the prompt. A skill added later can
+    be run with `/name` at once, but the model hears of it only in the next session. With no skill
+    for the model there is neither, and the prompt is what it was before skills.
+  - `skill` returns the instructions, `SKILL.md` after its frontmatter as it is on disk at the time,
+    in `[prompts] skill`'s wrapping, which names the folder that the instructions' relative paths
+    start from. Cut to `[tools] output_limit`, as any result is.
+  - `/name [what]` in the TUI sends the message as typed, with the skill's instructions after it,
+    `$ARGUMENTS` replaced by what follows the name, as an `@path` brings a file. One sent while the
+    agent works waits in the queue like any message.
+- **After a compaction** the skills the old conversation held come again after the summary, as they
+  are on disk: a summary cannot carry instructions hundreds of lines long. They are found by the
+  first line of their wrapping in tool results and user messages, so a resumed session finds them
+  too. They cost their length in the cold prefill a compaction pays anyway.
+- **Who may use one:** with `disable-model-invocation: true` a skill is the user's to run: it is
+  left out of the system prompt and `skill` refuses it. With `user-invocable: false` it is the
+  model's: it is not in the `/` list, and `/name` is not a command. A skill named as one of eidra's
+  own commands gives way to the command in the TUI; the model can still load it.
+- **Unattended runs and subagents go without,** since `skill` is an interactive tool like the
+  background `task`, so evals keep their prompt. A profile can add `skill` to `[tools] enabled` or
+  `[subagents] tools`.
+- **In the container,** `scripts/eidra-docker` mounts `~/.agents/skills` read-only (§13).
+- **Not measured yet:** whether Qwen3.8 loads a skill when a description fits a task, and leaves
+  them alone when none does, wants an eval.
+
 ## 12. TUI (M4)
 
 `eidra` with no command starts an interactive session in the current directory. It takes exec's
@@ -466,11 +512,21 @@ A step's reasoning, calls and results stay together; a blank line separates ever
 - Tab after an `@path` completes it from the workspace's files: all of it if one file fits (a
   directory gets its `/`), else as far as they agree, listing them under the input box. Anywhere
   else Tab is four spaces.
+- A `/` at the start of the input box opens a list under it of eidra's commands and the user's
+  skills (§11.1), as Claude Code does (2026-10-30). It narrows as the user types, best fit first:
+  the name itself, then names that start with what was typed, a later word that does (`/crash`
+  finds `diagnose-crash`), initials (`/dc`), names that hold it, names that hold its letters in
+  order, closest together first, and last, from three letters on, a word of the description. It
+  shows eight at most. Up and Down (or Ctrl+P and Ctrl+N) choose, Tab completes the name with a
+  space after it, Enter runs it, and Esc closes the list, until the next key changes what was
+  typed. Skills are read again each time it opens. It stays closed while the box shows the history,
+  so that Up goes on walking it past a `/command` sent earlier.
 - An approval takes y (once), a (this command, for the rest of the session) or n. Keys that arrive
   in the first 0.4 s are ignored, so that typing meant for the input box does not answer it.
 - Commands: `/help`, `/new`, `/compact [what]` (§8), `/tasks` and `/stop [n]` for background
-  tasks, `/undo` and `/diff [all]` (§14), `/reasoning`, `/quit` (or `/exit`). Quitting stops the
-  turn and the background tasks first, and waits for an undo under way.
+  tasks, `/undo` and `/diff [all]` (§14), `/skills` (§11.1), `/reasoning`, `/quit` (or `/exit`).
+  Quitting stops the turn and the background tasks first, and waits for an undo under way. Any
+  other `/name` is a skill's, if a skill has that name.
 
 **What a message brings along** (M8, 2026-10-27):
 - **`@path` to a text file** attaches it after the message, as `read` shows it, numbered lines
@@ -503,8 +559,10 @@ screen with a small terminal emulator:
 - `scripts/tui/offline.py` runs it against a fake server that streams scripted replies: typing and
   commands, a reply with the status line's numbers, tool calls, an approval, an interrupt, a queued
   message and one sent at once with Ctrl+Enter, a background task worked on during the chat, attachments, PDF pages, `/undo` and
-  `/diff`, `--continue`, `!` commands and `@` mentions, and SIGTERM. About 25 s, no GPU; run it
-  after any change to the TUI. `--docker IMAGE` runs the same in the image (§13).
+  `/diff`, `--continue`, `!` commands and `@` mentions, the `/` list and skills, and SIGTERM.
+  About 30 s, no GPU; run it after any change to the TUI. Each scenario has a home directory of
+  its own, so that the user's skills stay out of it. `--docker IMAGE` runs the same in the image
+  (§13).
 - `scripts/tui/smoke.py` does much the same against radiance, and checks that the model hears a
   `!` command and an `@` file, and that `--continue` goes on with the conversation: about 25 s of
   GPU (21 s on 2026-10-27). It refuses to run unless qwen-assistant is already loaded, since
@@ -531,7 +589,10 @@ Reference: codex-rs `tui`.
   same path so that paths read the same inside and out: the TUI with no arguments, or any eidra
   command. It mounts `~/.eidra` (the user's AGENTS.md, sessions and checkpoints), the uv cache,
   `~/.gitconfig` read-only, `/etc/localtime`, and `$EIDRA_PROFILE` if set, and passes `TERM` and
-  `COLORTERM`. Docker's detach keys become ctrl+^ ctrl+q: its default, ctrl+p ctrl+q, holds back
+  `COLORTERM`. The user's skills, `~/.agents/skills` (or `$EIDRA_SKILLS`), go in read-only at
+  `/home/eidra/.agents/skills`, made first if they are not there, so that the agent uses them but
+  does not change them. A skill that is an absolute link to a folder elsewhere, as Omarchy's are,
+  gets that folder mounted read-only at its own path, so that the link leads somewhere. Docker's detach keys become ctrl+^ ctrl+q: its default, ctrl+p ctrl+q, holds back
   every ctrl+p, which the TUI uses for the history. `scripts/tui/offline.py --docker eidra` runs
   the TUI's scenarios in the image through the wrapper; all eleven pass.
 - **Vacuum:** the agent gets no network at all except the model. Its container runs with

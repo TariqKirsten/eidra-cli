@@ -4,15 +4,17 @@
 # docker build -t eidra .
 #
 # The directory is mounted at the same path, so paths read the same inside and out, and so is
-# eidra's own directory, ~/.eidra: your AGENTS.md, session logs and checkpoints. uv's cache is the
-# host's ~/.cache/uv. Commands run as you, so files the agent writes are yours. The host's network
-# is shared, since radiance listens on the host's localhost.
+# eidra's own directory, ~/.eidra: your AGENTS.md, session logs and checkpoints. Your skills,
+# ~/.agents/skills, go in read-only. uv's cache is the host's ~/.cache/uv. Commands run as you, so
+# files the agent writes are yours. The host's network is shared, since radiance listens on the
+# host's localhost.
 set -euo pipefail
 
 image=${EIDRA_IMAGE:-eidra}
 eidra_home=${EIDRA_HOME:-$HOME/.eidra}
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/uv
-mkdir -p "$eidra_home" "$cache"
+skills=${EIDRA_SKILLS:-$HOME/.agents/skills}
+mkdir -p "$eidra_home" "$cache" "$skills"
 
 args=(
   --rm -i --network host
@@ -20,6 +22,8 @@ args=(
   -v "$PWD:$PWD" -w "$PWD"
   -v "$eidra_home:$eidra_home" -e "EIDRA_HOME=$eidra_home"
   -v "$cache:$cache" -e "UV_CACHE_DIR=$cache"
+  # The agent uses your skills but cannot change them.
+  -v "$skills:/home/eidra/.agents/skills:ro"
   -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e EIDRA_MODEL
   # The terminal as the host has it, for colours and keys.
   -e TERM -e COLORTERM
@@ -32,6 +36,14 @@ fi
 if [ -e /etc/localtime ]; then
   args+=(-v /etc/localtime:/etc/localtime:ro)
 fi
+# A skill that is a link to a folder elsewhere, as Omarchy's are, needs that folder too, at the
+# path the link names. (A relative link would lead elsewhere inside, and is left as it is.)
+for link in "$skills"/*; do
+  target=$(readlink "$link") || continue
+  if [[ $target == /* && -d $target ]]; then
+    args+=(-v "$target:$target:ro")
+  fi
+done
 # Your git identity, so the agent's commits are yours.
 if [ -f "$HOME/.gitconfig" ]; then
   args+=(-v "$HOME/.gitconfig:/home/eidra/.gitconfig:ro")

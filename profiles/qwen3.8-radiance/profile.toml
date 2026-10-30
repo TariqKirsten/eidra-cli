@@ -36,9 +36,10 @@ compact_at = 200000
 # evals show it helps (DESIGN.md §5.1).
 enabled = ["bash", "bash_output", "bash_kill", "read", "edit", "write", "glob", "grep", "todo"]
 # Added in interactive sessions only. There "task" can also start a subagent in the background,
-# and the user goes on talking to the agent while it works (DESIGN.md §5.1). Unattended runs, the
-# evals among them, go without.
-interactive = ["task"]
+# and the user goes on talking to the agent while it works (DESIGN.md §5.1). "skill" loads a skill
+# from ~/.agents/skills, and is left out when there is none for the model (DESIGN.md §11.1).
+# Unattended runs, the evals among them, go without.
+interactive = ["task", "skill"]
 # Characters of one tool result the model sees; longer output is cut in the middle and saved whole.
 output_limit = 30000
 
@@ -125,6 +126,20 @@ user_command = "[The user ran this command in the workspace: `{command}`. It {st
 # A text file the user's message mentions with @path, after the message: {path} is the path and
 # {content} the file as read shows it, numbered lines and all, so that it needs no read of its own.
 attached_file = "[The user attached {path}, shown as read shows it:]\n{content}"
+# Replaces {{skills}} in system.md when the session has the skill tool and ~/.agents/skills holds
+# skills for the model (DESIGN.md §11.1). {skills} is a line for each: its name, then its
+# description, which says when to use it. Only these are in the prompt; a skill's instructions come
+# when it is loaded.
+skills = """
+
+# Skills
+A skill holds instructions for a kind of task, and often scripts or other files for it. When a task fits one of these descriptions, load that skill with `skill` before you start on it, and follow its instructions:
+{skills}
+"""
+# A skill's instructions: the skill tool's result, and what follows the user's message when they
+# invoke a skill with /name. {name} is its name, {dir} its folder and {instructions} its SKILL.md
+# after the frontmatter. The folder is where the scripts and files its instructions name are.
+skill = "[The skill {name}. Its files are in {dir}, and paths in it are relative to that folder. Follow its instructions:]\n\n{instructions}"
 # Added to the result of an edit or write that altered tests of the project's last commit; {tests}
 # names them. In the July SWE-rebench baseline, three of six failures were the agent changing the
 # project's tests until its change passed them (DESIGN.md §16.5).

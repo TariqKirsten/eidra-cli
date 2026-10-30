@@ -22,6 +22,7 @@ use crate::confirm::ConfirmPolicy;
 use crate::event::{Event, Frontend};
 use crate::media;
 use crate::profile::Profile;
+use crate::skills;
 use crate::text::truncate_middle;
 
 /// What a tool call produced.
@@ -52,6 +53,9 @@ pub struct Toolbox {
     nested: agents::Nested,
     /// The note for a change to the project's tests (`[prompts] changed_tests`).
     changed_tests_note: String,
+    /// Where `skill` finds skills, and the wrapping it returns their instructions in.
+    skills: Option<PathBuf>,
+    skill_template: String,
 }
 
 enum Reply {
@@ -90,12 +94,14 @@ pub fn definitions(profile: &Profile, headless: bool, subagent: bool) -> Result<
 }
 
 impl Toolbox {
-    /// Tools for `definitions`; `session_dir` holds saved output and the shell's state.
+    /// Tools for `definitions`; `session_dir` holds saved output and the shell's state, and `skills`
+    /// the skills that `skill` loads.
     pub fn new(
         profile: &Profile,
         workspace: &Path,
         session_dir: &Path,
         definitions: Vec<Tool>,
+        skills: Option<PathBuf>,
     ) -> Result<Self> {
         Ok(Toolbox {
             workspace: workspace.to_path_buf(),
@@ -107,6 +113,8 @@ impl Toolbox {
             diagnostics: diagnostics::Diagnostics::new(workspace, profile.diagnostics.clone()),
             nested: agents::Nested::new(workspace),
             changed_tests_note: profile.prompts.changed_tests.clone(),
+            skills,
+            skill_template: profile.prompts.skill.clone(),
             shell: bash::Shell::new(
                 workspace,
                 &session_dir.join("shell"),
@@ -241,11 +249,29 @@ impl Toolbox {
                 frontend.event(Event::Todo { list: string(args, "list")?.to_owned() });
                 "The todo list is updated.".into()
             }
+            "skill" => self.skill(string(args, "name")?)?,
             "finish" => return Ok(Reply::Finish(string(args, "summary")?.to_owned())),
             // The agent runs `task` itself, since it starts another agent.
             _ => return Err(format!("{name} is not implemented")),
         };
         Ok(Reply::Text(text))
+    }
+
+    /// A skill's instructions, for the model to follow: a skill the system prompt lists, as it is
+    /// on disk now.
+    fn skill(&self, name: &str) -> Result<String, String> {
+        let found = skills::find(self.skills.as_deref().ok_or("there are no skills")?);
+        // Named as the user would invoke it, it is the same skill.
+        let name = name.trim().trim_start_matches('/');
+        let Some(skill) = found.get(name).filter(|skill| skill.model) else {
+            let names: Vec<&str> =
+                found.skills.iter().filter(|s| s.model).map(|s| s.name.as_str()).collect();
+            return Err(format!(
+                "there is no skill called {name}; the skills are {}",
+                names.join(", ")
+            ));
+        };
+        Ok(skill.wrapped(&self.skill_template, &skill.instructions()?))
     }
 
     /// Forgets which nested AGENTS.md files were given, after a compaction dropped the results
@@ -512,6 +538,14 @@ fn definition(name: &str, description: Option<&String>, interactive: bool) -> Re
             },
             &["description", "prompt"],
         ),
+        "skill" => (
+            "Load a skill: instructions for a kind of task, from the list of skills in the system \
+             prompt, whose descriptions say when to use each. Load it before you start on a task its \
+             description fits, then follow it. The result names the skill's folder, which the paths \
+             in its instructions are relative to.",
+            json!({"name": {"type": "string", "description": "The skill's name, as the list gives it."}}),
+            &["name"],
+        ),
         "finish" => (
             "End the task. Call it only when the task is complete and checked, with a short summary of \
              what you did and how you checked it.",
@@ -552,7 +586,9 @@ mod tests {
     #[test]
     fn every_builtin_tool_has_a_definition() {
         let profile = Profile::builtin().unwrap();
-        for name in profile.tools.enabled.iter().map(String::as_str).chain(["task", "finish"]) {
+        for name in
+            profile.tools.enabled.iter().map(String::as_str).chain(["task", "skill", "finish"])
+        {
             let tool = definition(name, None, false).unwrap();
             assert_eq!(tool.function.name, name);
             assert_eq!(tool.function.parameters["type"], "object");

@@ -11,6 +11,12 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         bail!("an interactive session needs a terminal; `eidra exec` runs a task unattended");
     }
     let workspace = args.workspace()?;
+    // Skills come from the directory agents share, made here if it is not there yet, so that
+    // there is somewhere to put them (docs/DESIGN.md §11.1).
+    let skills = eidra_core::skills::dir();
+    if let Some(dir) = &skills {
+        let _ = std::fs::create_dir_all(dir);
+    }
     eidra_tui::run(eidra_tui::Options {
         profile: args.profile()?,
         session_root: args.session_root(&workspace),
@@ -18,6 +24,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         checkpoints: Some(eidra_core::eidra_home(&workspace).join("checkpoints")),
         workspace,
         confirm: args.confirm.clone(),
+        skills,
     })
     .await
 }

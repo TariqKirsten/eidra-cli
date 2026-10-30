@@ -8,6 +8,7 @@ mod attach;
 mod editor;
 mod markdown;
 mod screen;
+mod slash;
 mod style;
 mod wrap;
 

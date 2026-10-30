@@ -53,6 +53,9 @@ class Case:
         self.dir = Path(tempfile.mkdtemp(prefix="eidra-tui-"))
         self.workspace = self.dir / "work"
         self.workspace.mkdir()
+        # A home of the scenario's own, so that ~/.agents/skills is its own too.
+        self.home = self.dir / "home"
+        self.home.mkdir()
         self.sessions = []
 
     def start(self, *args, server=None, cols=90, rows=24):
@@ -64,9 +67,11 @@ class Case:
             # The wrapper works in the current directory and keeps sessions in EIDRA_HOME.
             argv = [str(ROOT / "scripts/eidra-docker"), "--base-url", url, *args]
             env["EIDRA_IMAGE"] = self.image
+            env["EIDRA_SKILLS"] = str(self.home / ".agents/skills")
         else:
             argv = [str(self.binary), "-C", str(self.workspace), "--base-url", url]
             argv += ["--session-dir", str(self.dir / "sessions"), *args]
+            env["HOME"] = str(self.home)
         s = Session(argv, cols=cols, rows=rows, env=env, cwd=self.workspace)
         self.sessions.append(s)
         s.wait_for(idle, 10, "eidra to start")
@@ -431,6 +436,58 @@ def bang_and_mention(case):
         message = server.requests[0]["messages"][-1]["content"]
         assert message.startswith("[The user ran this command in the workspace: `echo hello"), message
         assert "what do @notes.txt say?" in message and message.endswith("1\tremember the milk")
+        quit_cleanly(s)
+
+
+@scenario
+def skills(case):
+    """~/.agents/skills is made if it is not there; a slash opens the list of commands and skills,
+    which narrows as you type; Tab completes a skill, whose instructions go with the message; the
+    model loads another with `skill`; /skills lists them."""
+    s = case.start()
+    skills = case.home / ".agents/skills"
+    assert skills.is_dir(), f"{skills} was not made"
+    assert s.contains("skills: none in ~/.agents/skills"), s.dump()
+    quit_cleanly(s)
+
+    for name, description, instructions in [
+        ("greet", "Greets people by name.", "Say hello to $ARGUMENTS."),
+        ("wave", "Waves at people.", "Wave with both hands.\nThen bow."),
+    ]:
+        (skills / name).mkdir()
+        text = f"---\nname: {name}\ndescription: {description}\n---\n{instructions}\n"
+        (skills / name / "SKILL.md").write_text(text)
+    replies = [reply(calls=[("skill", {"name": "wave"})]), reply(text="Waved, and said hello.")]
+    with Server(replies) as server:
+        s = case.start(server=server)
+        assert s.contains("skills: 2 in ~/.agents/skills · /skills lists them"), s.dump()
+        s.type("/")
+        s.wait_for(lambda s: s.on_screen("/compact [what]") and s.on_screen("/greet"), 5, "the list")
+        s.type("gr")
+        s.wait_for(lambda s: not s.on_screen("/compact"), 5, "the list to narrow")
+        assert s.on_screen("/greet  Greets people by name."), s.dump()
+        case.show(s, "after typing /gr")
+        s.type("\t")
+        # The list closes once the name is complete, with a space after it for what follows.
+        done = lambda s: s.on_screen("› /greet") and not s.on_screen("Greets people")
+        s.wait_for(done, 5, "the completion")
+        s.type("Ada\r")
+        s.wait_for(lambda s: s.contains("Waved, and said hello.") and idle(s), 10, "the reply")
+        case.show(s, "after the reply")
+        assert s.contains("⎿ skill greet: 1 line of instructions"), s.dump()
+        assert s.contains("● skill wave") and s.contains("⎿ loaded, 4 lines"), s.dump()
+        first = server.requests[0]
+        assert "skill" in {t["function"]["name"] for t in first["tools"]}, first["tools"]
+        system = first["messages"][0]["content"]
+        assert "- greet: Greets people by name.\n- wave: Waves at people.\n" in system, system
+        message = first["messages"][-1]["content"]
+        assert message.startswith("/greet Ada\n\n[The skill greet. Its files are in "), message
+        assert message.endswith("Follow its instructions:]\n\nSay hello to Ada."), message
+        loaded = server.requests[1]["messages"][-1]
+        assert loaded["role"] == "tool" and loaded["content"].endswith("Wave with both hands.\nThen bow."), loaded
+        s.type("/skills\r")
+        s.wait_for(lambda s: s.contains("skills in ~/.agents/skills; /name runs one"), 5, "/skills")
+        assert s.contains("  wave   Waves at people."), s.dump()
         quit_cleanly(s)
 
 

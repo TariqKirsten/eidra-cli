@@ -16,6 +16,7 @@ fn options(dir: &std::path::Path, headless: bool) -> AgentOptions {
         headless,
         confirm: vec![],
         model_socket: None,
+        skills: None,
     }
 }
 

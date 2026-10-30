@@ -187,6 +187,13 @@ pub struct Prompts {
     /// A text file the user's message mentions with `@path`, after the message; `{path}` and
     /// `{content}`, as `read` shows it, are replaced.
     pub attached_file: String,
+    /// Replaces `{{skills}}` in the system prompt when the session can load skills; `{skills}` is
+    /// a line for each, its name and its description (docs/DESIGN.md §11.1).
+    pub skills: String,
+    /// A skill's instructions, as the `skill` tool returns them and as they follow the user's
+    /// message when they invoke it with `/name`; `{name}`, `{dir}` and `{instructions}` are
+    /// replaced.
+    pub skill: String,
     /// Added to the result of an edit or write that altered tests of the project's last commit;
     /// `{tests}` names them.
     pub changed_tests: String,
