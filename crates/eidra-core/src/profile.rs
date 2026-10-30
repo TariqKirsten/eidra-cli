@@ -23,6 +23,10 @@ pub struct Profile {
     /// The environment variable that holds the API key.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// For an `https:` server with a certificate of its own, such as `eidra relay --listen` makes:
+    /// the certificate's SHA-256, the one certificate trusted (docs/DESIGN.md §13).
+    #[serde(default)]
+    pub tls_pin: Option<String>,
     pub request: RequestSettings,
     #[serde(default)]
     pub context: ContextSettings,

@@ -171,7 +171,8 @@ impl Agent {
             .as_deref()
             .and_then(|name| std::env::var(name).ok())
             .filter(|key| !key.is_empty());
-        let client = Client::new(&profile.base_url, api_key, options.model_socket.as_deref())?;
+        let socket = options.model_socket.as_deref();
+        let client = Client::new(&profile.base_url, api_key, socket, profile.tls_pin.as_deref())?;
 
         let subagent = matches!(role, Role::Subagent { .. });
         let mut definitions = tools::definitions(&profile, options.headless, subagent)?;
@@ -287,7 +288,8 @@ impl Agent {
             .as_deref()
             .and_then(|name| std::env::var(name).ok())
             .filter(|key| !key.is_empty());
-        let client = Client::new(&profile.base_url, api_key, options.model_socket.as_deref())?;
+        let socket = options.model_socket.as_deref();
+        let client = Client::new(&profile.base_url, api_key, socket, profile.tls_pin.as_deref())?;
         let tools = Toolbox::new(
             &profile,
             &workspace,

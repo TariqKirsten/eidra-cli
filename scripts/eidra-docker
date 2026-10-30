@@ -24,7 +24,7 @@ args=(
   -v "$cache:$cache" -e "UV_CACHE_DIR=$cache"
   # The agent uses your skills but cannot change them.
   -v "$skills:/home/eidra/.agents/skills:ro"
-  -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e EIDRA_MODEL
+  -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e EIDRA_MODEL -e EIDRA_TLS_PIN
   # The terminal as the host has it, for colours and keys.
   -e TERM -e COLORTERM
 )

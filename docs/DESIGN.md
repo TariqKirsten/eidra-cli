@@ -620,8 +620,30 @@ Reference: codex-rs `tui`.
     leak, so that a probe passing everywhere cannot pass for a sealed vacuum. The relay stays a
     pipe to one server, never a proxy: a request naming another host is still answered by the
     model server (tested in `relay.rs`).
-- **TLS:** none yet, because radiance is plain http on localhost. The first https server brings
-  rustls with the ring provider.
+- **TLS** (2026-10-30), so that eidra in a container at work reaches radiance at home with the
+  API key and the conversation encrypted, and nothing installed on the machine that runs it:
+  - eidra speaks https with rustls and ring, built into the static binary. reqwest is built with
+    `rustls-no-provider` and eidra makes ring the provider: reqwest's own, aws-lc-rs, needs cmake
+    and more of a C toolchain in the musl build.
+  - A server with a certificate of its own is trusted by a **pin**, the SHA-256 of that
+    certificate (`--tls-pin`, `EIDRA_TLS_PIN`, or the profile's `tls_pin`): that certificate and
+    no other, at whatever address the URL gives. So there is no domain or certificate authority to
+    set up, and the LAN address, a public one and a new DHCP lease all reach the same server. The
+    handshake is checked as ever, so the server must hold the certificate's key; its names and
+    dates are not looked at, since the pin is the trust. Without a pin, an https server needs a
+    certificate the system's authorities vouch for. A pin with a plain `http:` URL is refused, since
+    nothing would be encrypted.
+  - **The server's end** is `eidra relay --listen 0.0.0.0:8443`: TLS on that port, piped to the
+    profile's server (127.0.0.1:8000), so llama-swap, and everything that talks to it on port 8000,
+    stays as it is. llama-swap can take TLS itself (`-tls-cert-file`), but then every local client
+    would need https. The relay makes a self-signed ECDSA P-256 certificate on first use, in
+    `~/.eidra/tls` with the key readable by its owner alone, and prints its pin; `openssl x509
+    -fingerprint -sha256` prints the same, and either form is taken. A client that has not finished
+    its handshake after 10 s is dropped.
+  - Tried live on 2026-10-30, with `eidra exec` through the relay at 192.168.1.210:8443 to
+    radiance: TLS 1.3 with AES-256-GCM. A warm request found 98% of its prompt cached and its first
+    token after 0.1 s, as over plain http, and the same ran from the image. A wrong pin is refused
+    with the pin the server has.
 
 ## 14. Sessions, checkpoints, observability
 

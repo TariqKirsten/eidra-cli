@@ -59,6 +59,11 @@ pub struct AgentArgs {
     #[arg(long, env = "EIDRA_BASE_URL")]
     base_url: Option<String>,
 
+    /// For an https server with a certificate of its own: the certificate's SHA-256, which `eidra
+    /// relay --listen` prints. That certificate is then the one trusted, at any address
+    #[arg(long, env = "EIDRA_TLS_PIN", value_name = "SHA256")]
+    tls_pin: Option<String>,
+
     /// The model, instead of the profile's
     #[arg(long, env = "EIDRA_MODEL")]
     model: Option<String>,
@@ -90,6 +95,9 @@ impl AgentArgs {
         };
         if let Some(url) = &self.base_url {
             profile.base_url.clone_from(url);
+        }
+        if let Some(pin) = &self.tls_pin {
+            profile.tls_pin = Some(pin.clone());
         }
         if let Some(model) = &self.model {
             profile.model.clone_from(model);

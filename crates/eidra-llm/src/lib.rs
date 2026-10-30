@@ -7,6 +7,7 @@
 mod client;
 mod sse;
 mod stream;
+pub mod tls;
 mod types;
 
 pub use client::{Client, Error};

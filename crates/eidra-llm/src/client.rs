@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use crate::sse::SseDecoder;
 use crate::stream::{Chunk, StreamEvent, TurnAccumulator};
+use crate::tls;
 use crate::types::{AssistantTurn, ChatRequest};
 
 #[derive(Debug, thiserror::Error)]
@@ -34,21 +35,38 @@ pub struct Client {
 }
 
 impl Client {
-    /// `base_url` is the API root, such as `http://127.0.0.1:8000/v1`. Plain `http:` only for
-    /// now: the build carries no TLS.
+    /// `base_url` is the API root, such as `http://127.0.0.1:8000/v1` or an `https:` one.
     ///
     /// With `socket`, every connection goes through that Unix socket instead, and the URL's host
     /// only names the server. That is how an agent with no network reaches the model: a relay
     /// outside its container forwards the socket to the server (docs/DESIGN.md §13).
+    ///
+    /// With `pin`, the SHA-256 of an `https:` server's own certificate (what `eidra relay
+    /// --listen` prints), that certificate is the one trusted, whatever name or address the URL
+    /// gives. Without one, an `https:` server's certificate must be vouched for, for its name, by
+    /// an authority the system trusts. A pin for a plain `http:` URL is refused: what it was to
+    /// protect would cross the network unencrypted.
     pub fn new(
         base_url: &str,
         api_key: Option<String>,
         socket: Option<&Path>,
+        pin: Option<&str>,
     ) -> Result<Self, Error> {
         let base_url = base_url.trim_end_matches('/').to_owned();
         let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
         if let Some(socket) = socket {
             builder = builder.unix_socket(socket);
+        }
+        tls::use_ring();
+        if let Some(pin) = pin {
+            let unexpected = |detail| Error::Unexpected { url: base_url.clone(), detail };
+            if !base_url.starts_with("https://") {
+                let why = "a TLS pin is set, but the URL is not https://, so nothing would be \
+                           encrypted";
+                return Err(unexpected(why.to_owned()));
+            }
+            let pin = tls::parse_pin(pin).map_err(unexpected)?;
+            builder = builder.tls_backend_preconfigured(tls::pinned(pin));
         }
         let http =
             builder.build().map_err(|source| Error::Http { url: base_url.clone(), source })?;
@@ -206,8 +224,20 @@ mod tests {
 
     #[test]
     fn root_url_drops_v1() {
-        let client = Client::new("http://127.0.0.1:8000/v1/", None, None).unwrap();
+        let client = Client::new("http://127.0.0.1:8000/v1/", None, None, None).unwrap();
         assert_eq!(client.base_url(), "http://127.0.0.1:8000/v1");
         assert_eq!(client.root_url(), "http://127.0.0.1:8000");
+    }
+
+    #[test]
+    fn a_pin_needs_an_https_url_and_a_sha256() {
+        let pin = tls::pin_of(b"a certificate");
+        let plain = Client::new("http://192.168.1.210:8443/v1", None, None, Some(&pin));
+        assert!(plain.unwrap_err().to_string().contains("not https://"));
+        let bad = Client::new("https://192.168.1.210:8443/v1", None, None, Some("nope"));
+        assert!(bad.unwrap_err().to_string().contains("64 hex digits"));
+        assert!(Client::new("https://192.168.1.210:8443/v1", None, None, Some(&pin)).is_ok());
+        // Without a pin, https is checked against the authorities the system trusts.
+        assert!(Client::new("https://example.com/v1", None, None, None).is_ok());
     }
 }

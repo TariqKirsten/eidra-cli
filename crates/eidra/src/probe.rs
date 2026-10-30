@@ -34,6 +34,10 @@ pub struct ProbeArgs {
     #[arg(long, env = "EIDRA_MODEL_SOCKET", value_name = "PATH")]
     model_socket: Option<std::path::PathBuf>,
 
+    /// For an https server with a certificate of its own: the certificate's SHA-256
+    #[arg(long, env = "EIDRA_TLS_PIN", value_name = "SHA256")]
+    tls_pin: Option<String>,
+
     /// Model to request
     #[arg(long, env = "EIDRA_MODEL", default_value = "qwen3.8-flash-next")]
     model: String,
@@ -331,7 +335,8 @@ pub async fn run(args: ProbeArgs) -> Result<()> {
     if key.is_none() {
         eprintln!("note: ${} is not set, so no API key is sent", args.api_key_env);
     }
-    let client = Client::new(&args.base_url, key, args.model_socket.as_deref())?;
+    let client =
+        Client::new(&args.base_url, key, args.model_socket.as_deref(), args.tls_pin.as_deref())?;
     let models = client.models().await.context("listing the server's models")?;
     if !models.contains(&args.model) {
         eprintln!(

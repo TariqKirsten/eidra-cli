@@ -45,6 +45,11 @@ pub struct ReplayArgs {
     /// Reach the server through this Unix socket instead of the network (see `eidra relay`)
     #[arg(long, env = "EIDRA_MODEL_SOCKET", value_name = "PATH")]
     model_socket: Option<PathBuf>,
+
+    /// For an https server with a certificate of its own: the certificate's SHA-256 [default: the
+    /// profile's]
+    #[arg(long, env = "EIDRA_TLS_PIN", value_name = "SHA256")]
+    tls_pin: Option<String>,
 }
 
 pub async fn run(args: ReplayArgs) -> Result<()> {
@@ -104,7 +109,8 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
 
     let api_key = profile.api_key_env.as_deref().and_then(|name| std::env::var(name).ok());
     let api_key = api_key.filter(|key| !key.is_empty());
-    let client = Client::new(&header.base_url, api_key, args.model_socket.as_deref())?;
+    let pin = args.tls_pin.as_deref().or(profile.tls_pin.as_deref());
+    let client = Client::new(&header.base_url, api_key, args.model_socket.as_deref(), pin)?;
     let out = args.session.with_extension("").join("replays");
     fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
 

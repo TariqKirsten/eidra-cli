@@ -72,6 +72,7 @@ What it mounts and passes in:
 |---|---|
 | `RADIANCE_API_KEY` | the server's API key (the profile names the variable) |
 | `EIDRA_BASE_URL`, `EIDRA_MODEL` | another server or model than the profile's |
+| `EIDRA_TLS_PIN` | the pin of an https server's own certificate, which `eidra relay --listen` prints (below) |
 | `EIDRA_PROFILE` | a profile directory instead of the built-in one |
 | `EIDRA_HOME` | eidra's own directory instead of `~/.eidra` |
 | `EIDRA_IMAGE` | the image `scripts/eidra-docker` runs (default `eidra`) |
@@ -116,7 +117,8 @@ a clone of this repository (`docker build -t eidra .`), or copy one over:
 profile (`notepad $PROFILE`):
 
     $env:RADIANCE_API_KEY = "<key>"
-    $env:EIDRA_BASE_URL   = "http://<model-server>:8000/v1"
+    $env:EIDRA_BASE_URL   = "https://<model-server>:8443/v1"
+    $env:EIDRA_TLS_PIN    = "sha256:<the pin the relay printed>"
 
     function eidra {
       $name = Split-Path -Leaf $PWD
@@ -126,7 +128,7 @@ profile (`notepad $PROFILE`):
         -v "${PWD}:/workspace/${name}:ro" -w "/workspace/${name}" `
         -v eidra-data:/home/eidra/.eidra `
         -v "${skills}:/home/eidra/.agents/skills:ro" `
-        -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e COLORTERM=truecolor -e TZ=Africa/Johannesburg `
+        -e RADIANCE_API_KEY -e EIDRA_BASE_URL -e EIDRA_TLS_PIN -e COLORTERM=truecolor -e TZ=Africa/Johannesburg `
         --detach-keys "ctrl-^,ctrl-q" `
         eidra @args
     }
@@ -141,10 +143,52 @@ Where it differs from the Linux wrapper:
 - eidra's directory is a Docker volume, `eidra-data`, so sessions and checkpoints outlive the
   container; `docker volume rm eidra-data` deletes them.
 - Your skills are in `%USERPROFILE%\.agents\skills`, read-only in the container.
-- There is no `--network host`: the container reaches the model server at `EIDRA_BASE_URL`, on your
-  network or over a VPN such as Tailscale.
+- There is no `--network host`: the container reaches the model server at `EIDRA_BASE_URL`, over
+  TLS through eidra's relay on the model's machine (below), on your network or forwarded to it.
 - It runs as the container's root user, so git accepts the repository Windows mounts into it.
 - `TZ` is your time zone, for the dates the agent reads and writes.
+
+### Reaching the model over TLS
+
+Plain http sends the API key and every conversation across the network unencrypted. To reach the
+model from another machine, such as eidra in Docker at work, run eidra's TLS relay in front of it
+on the model's machine, and give the other eidra the relay's pin. Nothing is installed where the
+harness runs: TLS is built into eidra.
+
+On the model's machine:
+
+    scripts/cargo build --release && install -m 755 target/release/eidra ~/.local/bin/eidra
+    ~/.local/bin/eidra relay --listen 0.0.0.0:8443          # prints its pin
+
+The relay forwards to the profile's server, `127.0.0.1:8000`, which stays as it is for everything
+local. Its certificate is made on first use in `~/.eidra/tls`, and
+`openssl x509 -in ~/.eidra/tls/cert.pem -noout -fingerprint -sha256` prints the same pin. To keep it
+running, make it a user service, `~/.config/systemd/user/eidra-tls.service`:
+
+    [Unit]
+    Description=eidra relay: TLS in front of the model server
+    After=llama-swap.service
+
+    [Service]
+    ExecStart=%h/.local/bin/eidra relay --listen 0.0.0.0:8443
+    Restart=on-failure
+
+    [Install]
+    WantedBy=default.target
+
+then `systemctl --user enable --now eidra-tls`, and `journalctl --user -u eidra-tls` shows the pin.
+Let the port in from your LAN, and forward it on your router to reach it from elsewhere:
+
+    sudo ufw allow from 192.168.1.0/24 to any port 8443 proto tcp
+
+On the other machine:
+
+    export EIDRA_BASE_URL=https://192.168.1.210:8443/v1
+    export EIDRA_TLS_PIN=sha256:…                            # what the relay printed
+
+The pin is the trust: eidra accepts that certificate and no other, at whatever address it reaches
+it. So there is no domain name or certificate authority to set up, and a new address changes
+nothing. A pin given with a plain `http://` URL is refused.
 
 ## The interactive session
 
