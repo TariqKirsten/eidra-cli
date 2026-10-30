@@ -118,7 +118,8 @@ profile (`notepad $PROFILE`):
 
     $env:RADIANCE_API_KEY = "<key>"
     $env:EIDRA_BASE_URL   = "https://<model-server>:8443/v1"
-    $env:EIDRA_TLS_PIN    = "sha256:<the pin the relay printed>"
+    # The relay on mars, the model's machine (see "Reaching the model over TLS")
+    $env:EIDRA_TLS_PIN    = "sha256:bfbf5c49a0dc52dcb721a2b5f82e67c43d4fa5f7a186499a4bce515ce4baafb6"
 
     function eidra {
       $name = Split-Path -Leaf $PWD
@@ -190,7 +191,14 @@ your router to reach it from elsewhere:
 On the other machine:
 
     export EIDRA_BASE_URL=https://192.168.1.210:8443/v1
-    export EIDRA_TLS_PIN=sha256:…                            # what the relay printed
+    export EIDRA_TLS_PIN=sha256:bfbf5c49a0dc52dcb721a2b5f82e67c43d4fa5f7a186499a4bce515ce4baafb6
+
+That is the pin of the relay on mars, the machine radiance runs on, made on 2026-10-30. It changes
+only if `~/.eidra/tls` there is deleted and the relay makes a new certificate; `./radiance.sh
+status` always shows the current one. It need not be secret, since the relay hands its certificate
+to anyone who connects; the secrets are the relay's key, `~/.eidra/tls/key.pem`, and the API key.
+Take a pin from here or from the machine itself, though, not from a connection over the network it
+is meant to protect, where a man in the middle would show you his own.
 
 The pin is the trust: eidra accepts that certificate and no other, at whatever address it reaches
 it. So there is no domain name or certificate authority to set up, and a new address changes
