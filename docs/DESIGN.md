@@ -167,6 +167,29 @@ profiles/qwen3.8-radiance/
 
 Each eval run records a hash of the profile's contents. An experiment is a variant of a profile.
 
+**The system prompt's `# Writing` section** (2026-10-30, in the user's words): readable prose with
+one thought per sentence, ASD-STE100's clarity, no metaphors or jargon; code documentation only for
+what the code cannot show; historical derivation and obsoleted facts removed during edits. Qwen3.8
+had answered in dense, figurative prose. Measured with the same binary, the profile the only
+difference:
+- **Six writing probes** on the evals' inventory project, three runs per prompt: explain the
+  ordering, write a user guide, add a `--csv` option, update a README holding history, add a
+  changelog entry, add docstrings. All 36 runs finished, and every functional check passed under
+  both prompts: tests, untouched files, changelog history kept, docstrings written.
+- **A blind judge** (Claude, not told which prompt wrote what) scored the 52 texts from 1 to 5. One
+  thought per sentence went from 2.70 to 3.20, plain words from 3.15 to 3.36, literal from 4.04 to
+  4.28 and clarity from 3.30 to 3.60, with 40 metaphors found instead of 69. The new prompt was
+  better in 20 of 32 probe-and-measure comparisons and worse in 2. The user guide gained most: one
+  thought per sentence 3.0 to 4.7, metaphors per guide 9 to 4, words per sentence 15.2 to 12.9, and
+  sentences over 25 words 10% to 3%. The `--csv` code carried 1 comment line in three runs, against
+  6.
+- **What did not change:** the README's paragraph of history stayed under both prompts (0 of 3
+  removed): the model made the small, targeted edit that "How to work" asks for, and the history
+  sentence did not override it. Finish summaries that list checks stayed semicolon chains of 40 to
+  90 words under both.
+- **The local suite** passed 7/7 under both, in 12.0 min of agent time each, with 85K and 82K tokens
+  generated: one attempt per task, so its timings are noise.
+
 ## 5. Tools
 
 Guidelines for this model:
