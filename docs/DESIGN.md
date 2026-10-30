@@ -452,8 +452,14 @@ agent to read or run with its own tools when the instructions say so.
   background `task`, so evals keep their prompt. A profile can add `skill` to `[tools] enabled` or
   `[subagents] tools`.
 - **In the container,** `scripts/eidra-docker` mounts `~/.agents/skills` read-only (§13).
-- **Not measured yet:** whether Qwen3.8 loads a skill when a description fits a task, and leaves
-  them alone when none does, wants an eval.
+- **A first live check** (2026-10-30, in the image, five fresh sessions, 28 s in all): Qwen3.8 loaded
+  the fitting skill as its first call each time one fitted. For a test skill whose script prints a
+  stamp it could not guess, it ran the script from the skill's folder and wrote the stamp into the
+  changelog. It loaded the user's Omarchy skill for a question about window gaps, and hf-cli for a
+  download command. For `17 * 23` it loaded none. A `/shout` the model is not told of came back in
+  capitals. After each load, the next request found the conversation before it in the cache, and
+  computed only what was new. Five probes are not an eval: how often it misses a fitting skill, or
+  loads one that does not fit, still wants one.
 
 ## 12. TUI (M4)
 
