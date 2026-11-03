@@ -643,7 +643,7 @@ Reference: codex-rs `tui`.
     leak, so that a probe passing everywhere cannot pass for a sealed vacuum. The relay stays a
     pipe to one server, never a proxy: a request naming another host is still answered by the
     model server (tested in `relay.rs`).
-- **TLS** (2026-10-30), so that eidra in a container at work reaches radiance at home with the
+- **TLS** (2026-10-30), so that eidra in a container on another machine reaches radiance with the
   API key and the conversation encrypted, and nothing installed on the machine that runs it:
   - eidra speaks https with rustls and ring, built into the static binary. reqwest is built with
     `rustls-no-provider` and eidra makes ring the provider: reqwest's own, aws-lc-rs, needs cmake
