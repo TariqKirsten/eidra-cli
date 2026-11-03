@@ -1,6 +1,32 @@
+# Build output
 /target
 /dist
+**/*.rs.bk
+
+# Eval runs and downloaded Harbor datasets: large, and full of model output
 /evals/runs
 /evals/harbor
+
+# Python caches (scripts/tui and the eval tasks)
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Local settings and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# eidra's own directory, where it falls back to when HOME is not set
+.eidra/
+
+# Editors, OS files and agent tools
 /.claude
+.idea/
+.vscode/
+*.swp
+.DS_Store
