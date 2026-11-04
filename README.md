@@ -12,20 +12,6 @@ OpenAI chat-completions API. Its prompts, tools and request settings are tuned a
 against one model on my own hardware: Qwen3.8 Flash-Next, served by
 [radiance](https://codeberg.org/StillDeadcode/radiance).
 
-## Why I built it
-
-I run a coding model locally, on two Radeon AI PRO R9700 GPUs. On a local server, the speed of an
-agent depends on the prompt cache. When anything early in a prompt changes, the server computes
-everything after that point again. That costs 25–45 seconds for every 100K tokens.
-
-So Eidra follows one rule: each request is the previous prompt with the new turns appended, byte
-for byte. The system prompt, the tools and the reasoning effort are fixed for a session. Each reply
-goes back to the server exactly as it was streamed. In the first unattended run, 91% of 300K prompt
-tokens came from the cache. In the SWE-rebench baseline, 97–99% did.
-
-I also wanted to judge each change to the harness by numbers, not by impression. That is why Eidra
-has its own eval runner, which runs tasks in containers that can reach only the model.
-
 ## Key features
 
 - **Interactive TUI.** It draws inline, in the terminal's own scrollback. It streams the reply and
