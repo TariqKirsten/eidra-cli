@@ -14,13 +14,11 @@ against one model on my own hardware: Qwen3.8 Flash-Next, served by
 
 ## Why I built it
 
-I wanted control over my own harness, and to learn what it takes to build one. In Eidra, every
-prompt, tool and request setting is mine to read and change.
+I wanted control over my own harness, and to learn what it takes to build one.
 
 It is tuned for one model: Qwen3.8 Flash-Next, which I run locally on my own hardware (two Radeon
-AI PRO R9700 GPUs). The model's prompts, tool descriptions and request settings live in a profile.
-The eval runner measures each change against that model, so tuning is judged by numbers, not by
-impression.
+AI PRO R9700 GPUs). The model's prompts, tool descriptions and request settings live in a profile,
+and the eval runner measures each change against that model.
 
 Next, I want observability and tracing at the harness level. They make possible the experiment that
 Eidra is building towards, which I call recursive harness improvement: can the model, while it runs
