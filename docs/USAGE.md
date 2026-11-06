@@ -45,6 +45,7 @@ What it mounts and passes in:
 | `EIDRA_TLS_PIN` | the pin of an https server's own certificate, which `eidra relay --listen` prints (below) |
 | `EIDRA_PROFILE` | a profile directory instead of the built-in one |
 | `EIDRA_HOME` | eidra's own directory instead of `~/.eidra` |
+| `EIDRA_SESSION_DIR` | where session logs go instead of `~/.eidra/sessions` (`--session-dir`) |
 | `EIDRA_IMAGE` | the image `scripts/eidra-docker` runs (default `eidra`) |
 | `EIDRA_SKILLS` | the skills directory `scripts/eidra-docker` mounts (default `~/.agents/skills`) |
 | `TERM`, `COLORTERM` | your terminal's, for colours and keys |
@@ -77,7 +78,8 @@ the binary mounted into it, since it is static:
       -v "$PWD:$PWD" -w "$PWD" your-project-image eidra
 
 On the host, without a container, it is just `dist/eidra` (or `target/release/eidra`) in the
-project's directory.
+project's directory. With a Rust 1.99 toolchain, `cargo build --release --locked -p eidra` builds it
+without Docker.
 
 ### On Windows
 

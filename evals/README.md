@@ -1,7 +1,7 @@
 # evals
 
-Tasks that measure eidra against the model it is tuned for, so every change to the harness or
-the profile can be judged by numbers rather than by impression (docs/DESIGN.md §15).
+Tasks that measure each change to the harness or the profile against the model eidra is tuned for
+(docs/DESIGN.md §15).
 
     eidra eval validate                        # check the tasks themselves; uses no model
     eidra eval run --repeats 3                 # every task three times, recorded in evals/runs/
@@ -14,6 +14,21 @@ the profile can be judged by numbers rather than by impression (docs/DESIGN.md �
     eidra eval vacuum-check                     # check the sandbox itself, not the model
 
 ## How an attempt runs
+
+```mermaid
+flowchart LR
+    runner["eidra eval run"] -->|"copies workspace/, starts"| agent
+    subgraph sandbox["Task container, no network"]
+        agent["eidra exec"]
+    end
+    agent -->|"Unix socket"| relay["eidra relay"]
+    relay --> server[("Model server")]
+    runner -->|"then checks what the agent left"| checks
+    subgraph checkbox["Check container, no network"]
+        checks["hidden tests from check/"]
+    end
+    checks --> results[("results.jsonl<br/>session logs · events")]
+```
 
 1. The task's `workspace/` is copied to `evals/runs/<run>/<task>/<n>/work`.
 2. A container from the task's `image` runs `eidra exec` on the prompt, with that copy at `/work`.
@@ -34,7 +49,7 @@ has one line per attempt.
 The vacuum (docs/DESIGN.md §13) is what stops a task's agent from reaching anything but the
 model: no setting inside the container turns the network back on, because the network is not
 there. `eidra eval vacuum-check` tests that, standing in for the agent. It runs a probe in the
-same container an attempt gets and has it try every way out — DNS, the model server's own port,
+same container an attempt gets and has it try every way out: DNS, the model server's own port,
 the internet, making an interface or route, `unshare`/`nsenter`, a Docker socket, and pointing
 eidra's `--base-url` at the server over the network. The probe exits non-zero if any worked.
 
@@ -42,8 +57,8 @@ eidra's `--base-url` at the server over the network. The probe exits non-zero if
     eidra eval vacuum-check --mode none  # just the agent's --network none container
     eidra eval vacuum-check --out dir/   # keep the probe's per-mode logs
 
-It checks both shapes of vacuum — a suite task's `--network none` container, and a Harbor task's
-container disconnected from the bridge — and a `control` on the host's network, which *must*
+It checks both shapes of vacuum (a suite task's `--network none` container, and a Harbor task's
+container disconnected from the bridge) and a `control` on the host's network, which *must*
 find a way out: a probe that passed everywhere would prove nothing. The command exits non-zero
 if any vacuum leaked or the control did not, so it belongs in CI.
 
